@@ -67,6 +67,7 @@
 #include "attribute.hpp"
 #include "thread.hpp"
 #include "platform.hpp"
+#include "postgis.hpp"
 
 static int low_detail = 12;
 static int full_detail = -1;
@@ -98,6 +99,19 @@ long long extend_zooms_max = 0;
 int retain_points_multiplier = 1;
 std::vector<std::string> unidecode_data;
 size_t maximum_string_attribute_length = 0;
+
+// PostGIS configuration
+postgis_config postgis_cfg = {
+    "localhost",  // host
+    "5432",      // port
+    "",           // dbname
+    "",           // user
+    "",           // password
+    "",           // table
+    "geometry",   // geometry_column
+    ""            // where_clause
+};
+bool use_postgis = false;
 
 std::vector<order_field> order_by;
 bool order_reverse;
@@ -1425,6 +1439,89 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 	}
 
 	size_t nsources = sources.size();
+	// Handle PostGIS input if enabled
+	if (use_postgis) {
+		if (!quiet) {
+			fprintf(stderr, "Reading from PostGIS database: %s@%s:%s/%s\n", 
+				postgis_cfg.user.c_str(), postgis_cfg.host.c_str(), postgis_cfg.port.c_str(), postgis_cfg.dbname.c_str());
+		}
+
+		// Create a PostGISReader instance
+		PostGISReader reader(postgis_cfg);
+		if (!reader.connect()) {
+			fprintf(stderr, "Failed to connect to PostGIS database\n");
+			exit(EXIT_OPEN);
+		}
+
+		// Create a source for PostGIS data
+		source postgis_source;
+		postgis_source.layer = postgis_cfg.table.empty() ? "postgis" : postgis_cfg.table;
+		postgis_source.file = "postgis:" + postgis_cfg.host + ":" + postgis_cfg.port + ":" + postgis_cfg.dbname + ":" + postgis_cfg.table;
+		sources.push_back(postgis_source);
+
+		// Add to layermap
+		layermap_entry e = layermap_entry(sources.size() - 1);
+		e.description = "PostGIS layer";
+		layermap.insert(std::pair<std::string, layermap_entry>(postgis_source.layer, e));
+		layermaps.clear();
+		for (size_t l = 0; l < CPUS; l++) {
+			layermaps.push_back(layermap);
+		}
+
+		// Read features from PostGIS
+		std::vector<struct serialization_state> sst;
+		sst.resize(CPUS);
+
+		std::atomic<long long> layer_seq[CPUS];
+		double dist_sums[CPUS];
+		size_t dist_counts[CPUS];
+		double area_sums[CPUS];
+
+		for (size_t i = 0; i < CPUS; i++) {
+			layer_seq[i] = overall_offset;
+			dist_sums[i] = 0;
+			dist_counts[i] = 0;
+			area_sums[i] = 0;
+
+			sst[i].fname = "PostGIS";
+			sst[i].line = 0;
+			sst[i].layer_seq = &layer_seq[i];
+			sst[i].progress_seq = &progress_seq;
+			sst[i].readers = &readers;
+			sst[i].segment = i;
+			sst[i].initial_x = &initial_x[i];
+			sst[i].initial_y = &initial_y[i];
+			sst[i].initialized = &initialized[i];
+			sst[i].dist_sum = &dist_sums[i];
+			sst[i].dist_count = &dist_counts[i];
+			sst[i].area_sum = &area_sums[i];
+			sst[i].want_dist = guess_maxzoom;
+			sst[i].maxzoom = maxzoom;
+			sst[i].filters = prefilter != NULL || postfilter != NULL;
+			sst[i].uses_gamma = uses_gamma;
+			sst[i].layermap = &layermaps[i];
+			sst[i].exclude = exclude;
+			sst[i].include = include;
+			sst[i].exclude_all = exclude_all;
+			sst[i].basezoom = basezoom;
+			sst[i].attribute_types = attribute_types;
+		}
+
+		if (!reader.read_features(sst, sources.size() - 1, postgis_source.layer)) {
+			fprintf(stderr, "Failed to read features from PostGIS\n");
+			exit(EXIT_READ);
+		}
+
+		for (size_t i = 0; i < CPUS; i++) {
+			dist_sum += dist_sums[i];
+			dist_count += dist_counts[i];
+			area_sum += area_sums[i];
+		}
+
+		overall_offset = layer_seq[0];
+		checkdisk(&readers);
+	}
+
 	for (size_t source = 0; source < nsources; source++) {
 		std::string reading;
 		int fd;
@@ -3031,6 +3128,17 @@ int main(int argc, char **argv) {
 		{"layer", required_argument, 0, 'l'},
 		{"named-layer", required_argument, 0, 'L'},
 
+		{"PostGIS database connection", 0, 0, 0},
+		{"postgis", required_argument, 0, '~'},
+		{"postgis-host", required_argument, 0, '~'},
+		{"postgis-port", required_argument, 0, '~'},
+		{"postgis-dbname", required_argument, 0, '~'},
+		{"postgis-user", required_argument, 0, '~'},
+		{"postgis-password", required_argument, 0, '~'},
+		{"postgis-table", required_argument, 0, '~'},
+		{"postgis-geometry-column", required_argument, 0, '~'},
+		{"postgis-where", required_argument, 0, '~'},
+
 		{"Parallel processing of input", 0, 0, 0},
 		{"read-parallel", no_argument, 0, 'P'},
 
@@ -3307,6 +3415,50 @@ int main(int argc, char **argv) {
 				unidecode_data = read_unidecode(optarg);
 			} else if (strcmp(opt, "maximum-string-attribute-length") == 0) {
 				maximum_string_attribute_length = atoll_require(optarg, "Maximum string attribute length");
+			} else if (strcmp(opt, "postgis") == 0) {
+				// Format: host:port:dbname:user:password:table:geometry_column:where_clause
+				// Example: localhost:5432:gis:postgres:password:roads:geom:highway='motorway'
+				use_postgis = true;
+				std::string postgis_arg = optarg;
+				size_t pos = 0;
+				std::vector<std::string> parts;
+				while ((pos = postgis_arg.find(':')) != std::string::npos) {
+					parts.push_back(postgis_arg.substr(0, pos));
+					postgis_arg.erase(0, pos + 1);
+				}
+				parts.push_back(postgis_arg);
+				if (parts.size() >= 1) postgis_cfg.host = parts[0];
+				if (parts.size() >= 2) postgis_cfg.port = parts[1];
+				if (parts.size() >= 3) postgis_cfg.dbname = parts[2];
+				if (parts.size() >= 4) postgis_cfg.user = parts[3];
+				if (parts.size() >= 5) postgis_cfg.password = parts[4];
+				if (parts.size() >= 6) postgis_cfg.table = parts[5];
+				if (parts.size() >= 7) postgis_cfg.geometry_column = parts[6];
+				if (parts.size() >= 8) postgis_cfg.where_clause = parts[7];
+			} else if (strcmp(opt, "postgis-host") == 0) {
+				postgis_cfg.host = optarg;
+				use_postgis = true;
+			} else if (strcmp(opt, "postgis-port") == 0) {
+				postgis_cfg.port = optarg;
+				use_postgis = true;
+			} else if (strcmp(opt, "postgis-dbname") == 0) {
+				postgis_cfg.dbname = optarg;
+				use_postgis = true;
+			} else if (strcmp(opt, "postgis-user") == 0) {
+				postgis_cfg.user = optarg;
+				use_postgis = true;
+			} else if (strcmp(opt, "postgis-password") == 0) {
+				postgis_cfg.password = optarg;
+				use_postgis = true;
+			} else if (strcmp(opt, "postgis-table") == 0) {
+				postgis_cfg.table = optarg;
+				use_postgis = true;
+			} else if (strcmp(opt, "postgis-geometry-column") == 0) {
+				postgis_cfg.geometry_column = optarg;
+				use_postgis = true;
+			} else if (strcmp(opt, "postgis-where") == 0) {
+				postgis_cfg.where_clause = optarg;
+				use_postgis = true;
 			} else {
 				fprintf(stderr, "%s: Unrecognized option --%s\n", argv[0], opt);
 				exit(EXIT_ARGS);
