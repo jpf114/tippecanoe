@@ -11,9 +11,6 @@ struct postgis_config {
     std::string dbname;
     std::string user;
     std::string password;
-    std::string table;
-    std::string geometry_column;
-    std::string where_clause;
 };
 
 class PostGISReader {

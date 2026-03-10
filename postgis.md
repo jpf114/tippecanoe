@@ -32,9 +32,6 @@ struct postgis_config {
     std::string dbname;   // 数据库名称
     std::string user;     // 数据库用户
     std::string password; // 数据库密码
-    std::string table;    // 表名
-    std::string geometry_column; // 几何列名
-    std::string where_clause;    // 用于过滤的 WHERE 子句
 };
 ```
 
@@ -74,7 +71,7 @@ struct postgis_config {
 #### 单行配置
 
 ```bash
-tippecanoe -o output.mbtiles --postgis "host:port:dbname:user:password:table:geometry_column:where_clause"
+tippecanoe -o output.mbtiles --postgis "host:port:dbname:user:password" --postgis-sql "SELECT id, name, ST_AsText(geom) as wkt FROM table WHERE condition"
 ```
 
 #### 单独参数
@@ -86,9 +83,7 @@ tippecanoe -o output.mbtiles \
   --postgis-dbname gis \
   --postgis-user postgres \
   --postgis-password password \
-  --postgis-table roads \
-  --postgis-geometry-column geom \
-  --postgis-where "highway='motorway'"
+  --postgis-sql "SELECT id, name, ST_AsText(geom) as wkt FROM roads WHERE highway='motorway'"
 ```
 
 ### 选项详情
@@ -101,44 +96,53 @@ tippecanoe -o output.mbtiles \
 | `--postgis-dbname` | 数据库名称 | (必需) |
 | `--postgis-user` | 数据库用户 | (必需) |
 | `--postgis-password` | 数据库密码 | (必需) |
-| `--postgis-table` | 表名 | (必需) |
-| `--postgis-geometry-column` | 几何列名 | geometry |
-| `--postgis-where` | 用于过滤的 WHERE 子句 | (空) |
+| `--postgis-sql` | 自定义 SQL 查询语句 | (必需) |
 
-## 示例
+## 使用 --postgis-sql 选项直接输入 SQL 查询语句
 
-### 基本用法
+### 功能说明
 
-读取表中的所有要素：
+`--postgis-sql` 选项允许用户直接输入完整的 SQL 查询语句来从 PostGIS 数据库中获取地理空间数据。当使用此选项时，系统会直接执行用户提供的 SQL 查询。
 
-```bash
-tippecanoe -o cities.mbtiles --postgis "localhost:5432:gis:postgres:secret:cities:geom"
-```
-
-### 带过滤条件
-
-仅读取人口大于 100000 的城市：
+### 基本语法
 
 ```bash
-tippecanoe -o big_cities.mbtiles \
-  --postgis-host localhost \
-  --postgis-port 5432 \
-  --postgis-dbname gis \
-  --postgis-user postgres \
-  --postgis-password secret \
-  --postgis-table cities \
-  --postgis-geometry-column geom \
-  --postgis-where "population > 100000"
+tippecanoe --postgis-host=<主机名> --postgis-port=<端口> --postgis-dbname=<数据库名> --postgis-user=<用户名> --postgis-password=<密码> --postgis-sql="<SQL 查询语句>" -o <输出文件>.mbtiles
 ```
 
-### 带额外的 Tippecanoe 选项
+### 示例
 
-读取具有自定义缩放级别的道路：
+#### 1. 基本查询
 
 ```bash
-tippecanoe -o roads.mbtiles -z12 -Z8 \
-  --postgis "localhost:5432:gis:postgres:secret:roads:geom:highway IS NOT NULL"
+tippecanoe --postgis-host=localhost --postgis-port=5432 --postgis-dbname=gis --postgis-user=postgres --postgis-password=password --postgis-sql="SELECT id, name, ST_AsText(geom) as wkt FROM roads WHERE type='highway'" -o roads.mbtiles
 ```
+
+#### 2. 复杂查询
+
+```bash
+tippecanoe --postgis-host=localhost --postgis-port=5432 --postgis-dbname=gis --postgis-user=postgres --postgis-password=password --postgis-sql="SELECT b.id, b.name, ST_AsText(b.geom) as wkt FROM buildings b JOIN zones z ON ST_Intersects(b.geom, z.geom) WHERE z.type='residential'" -o residential_buildings.mbtiles
+```
+
+#### 3. 使用空间函数
+
+```bash
+tippecanoe --postgis-host=localhost --postgis-port=5432 --postgis-dbname=gis --postgis-user=postgres --postgis-password=password --postgis-sql="SELECT id, name, ST_AsText(ST_Simplify(geom, 0.001)) as wkt FROM countries" -o countries_simplified.mbtiles
+```
+
+### 注意事项
+
+1. **查询结果必须包含 WKT 格式的几何列**：系统会自动从查询结果的第二列获取 WKT 格式的几何数据。因此，您的查询语句中必须包含 `ST_AsText(geometry_column) as wkt` 或类似的表达式，并且确保它是查询结果的第二列。
+
+2. **连接参数仍然需要提供**：即使使用自定义 SQL 查询，您仍然需要提供数据库连接参数（主机、端口、数据库名、用户名、密码）。
+
+3. **查询性能**：对于大型数据库，建议在查询中添加适当的过滤条件，以避免返回过多数据。
+
+4. **SQL 语法**：请确保您的 SQL 查询语法正确，并且在命令行中正确转义特殊字符。
+
+### 错误处理
+
+如果 SQL 查询执行失败，系统会显示错误消息并退出。请检查您的 SQL 语法和数据库连接参数。
 
 ## 限制
 

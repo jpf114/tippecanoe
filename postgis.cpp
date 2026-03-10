@@ -61,10 +61,14 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
         }
     }
     
-    std::string query = "SELECT " + config.geometry_column + ", ST_AsText(" + config.geometry_column + ") as wkt";
-    query += " FROM " + config.table;
-    if (!config.where_clause.empty()) {
-        query += " WHERE " + config.where_clause;
+    std::string query;
+    // Check if a custom SQL query is provided
+    if (!postgis_sql.empty()) {
+        query = postgis_sql;
+    } else {
+        // Default query is not supported anymore, require postgis_sql
+        fprintf(stderr, "Error: --postgis-sql is required for PostGIS input\n");
+        return false;
     }
     
     PGresult *res = PQexec((PGconn *)conn, query.c_str());

@@ -106,12 +106,10 @@ postgis_config postgis_cfg = {
     "5432",      // port
     "",           // dbname
     "",           // user
-    "",           // password
-    "",           // table
-    "geometry",   // geometry_column
-    ""            // where_clause
+    ""            // password
 };
 bool use_postgis = false;
+std::string postgis_sql = ""; // Custom SQL query
 
 std::vector<order_field> order_by;
 bool order_reverse;
@@ -3135,9 +3133,8 @@ int main(int argc, char **argv) {
 		{"postgis-dbname", required_argument, 0, '~'},
 		{"postgis-user", required_argument, 0, '~'},
 		{"postgis-password", required_argument, 0, '~'},
-		{"postgis-table", required_argument, 0, '~'},
-		{"postgis-geometry-column", required_argument, 0, '~'},
-		{"postgis-where", required_argument, 0, '~'},
+
+		{"postgis-sql", required_argument, 0, '~'},
 
 		{"Parallel processing of input", 0, 0, 0},
 		{"read-parallel", no_argument, 0, 'P'},
@@ -3432,9 +3429,6 @@ int main(int argc, char **argv) {
 				if (parts.size() >= 3) postgis_cfg.dbname = parts[2];
 				if (parts.size() >= 4) postgis_cfg.user = parts[3];
 				if (parts.size() >= 5) postgis_cfg.password = parts[4];
-				if (parts.size() >= 6) postgis_cfg.table = parts[5];
-				if (parts.size() >= 7) postgis_cfg.geometry_column = parts[6];
-				if (parts.size() >= 8) postgis_cfg.where_clause = parts[7];
 			} else if (strcmp(opt, "postgis-host") == 0) {
 				postgis_cfg.host = optarg;
 				use_postgis = true;
@@ -3450,14 +3444,9 @@ int main(int argc, char **argv) {
 			} else if (strcmp(opt, "postgis-password") == 0) {
 				postgis_cfg.password = optarg;
 				use_postgis = true;
-			} else if (strcmp(opt, "postgis-table") == 0) {
-				postgis_cfg.table = optarg;
-				use_postgis = true;
-			} else if (strcmp(opt, "postgis-geometry-column") == 0) {
-				postgis_cfg.geometry_column = optarg;
-				use_postgis = true;
-			} else if (strcmp(opt, "postgis-where") == 0) {
-				postgis_cfg.where_clause = optarg;
+
+			} else if (strcmp(opt, "postgis-sql") == 0) {
+				postgis_sql = optarg;
 				use_postgis = true;
 			} else {
 				fprintf(stderr, "%s: Unrecognized option --%s\n", argv[0], opt);
