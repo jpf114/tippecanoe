@@ -41,7 +41,6 @@ public:
 
 protected:
     bool execute_query(const std::string &query);
-    bool parse_geometry(const std::string &wkt, struct serial_feature &f);
 
 private:
     postgis_config config;

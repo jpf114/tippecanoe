@@ -104,6 +104,9 @@ size_t maximum_string_attribute_length = 0;
 bool use_postgis = false;
 postgis_config postgis_cfg{};
 
+// Processing mode
+bool processing_db = false;
+
 std::vector<order_field> order_by;
 bool order_reverse;
 bool order_by_size = false;
@@ -1432,6 +1435,7 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 	size_t nsources = sources.size();
 	// Handle PostGIS input if enabled
 	if (use_postgis) {
+		processing_db = true;
 		if (!quiet) {
 			fprintf(stderr, "Reading from PostGIS database: %s@%s:%s/%s\n", 
 				postgis_cfg.user.c_str(), postgis_cfg.host.c_str(), postgis_cfg.port.c_str(), postgis_cfg.dbname.c_str());
@@ -1511,8 +1515,12 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 
 		overall_offset = layer_seq[0];
 		checkdisk(&readers);
+	} else {
+		processing_db = false;
 	}
 
+	// Skip file operations if processing database input
+if (!processing_db) {
 	for (size_t source = 0; source < nsources; source++) {
 		std::string reading;
 		int fd;
@@ -1942,6 +1950,7 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 			}
 		}
 	}
+}
 
 	int files_open_after_reading = open(get_null_device(), O_RDONLY | O_CLOEXEC);
 	if (files_open_after_reading < 0) {
@@ -3426,13 +3435,13 @@ int main(int argc, char **argv) {
 				if (parts.size() >= 8) {
 					// Construct SQL query from table, geometry_field, and where_clause
 					std::string where_clause = parts[7];
-					postgis_cfg.sql = "SELECT ST_AsText(" + postgis_cfg.geometry_field + ") as wkt, * FROM " + postgis_cfg.table;
+					postgis_cfg.sql = "SELECT ST_AsGeoJSON(" + postgis_cfg.geometry_field + ") as geojson, * FROM " + postgis_cfg.table;
 					if (!where_clause.empty()) {
 						postgis_cfg.sql += " WHERE " + where_clause;
 					}
 				} else if (parts.size() >= 6) {
 					// Construct SQL query from table and geometry_field
-					postgis_cfg.sql = "SELECT ST_AsText(" + postgis_cfg.geometry_field + ") as wkt, * FROM " + postgis_cfg.table;
+					postgis_cfg.sql = "SELECT ST_AsGeoJSON(" + postgis_cfg.geometry_field + ") as geojson, * FROM " + postgis_cfg.table;
 				}
 			} else if (strcmp(opt, "postgis-host") == 0) {
 				postgis_cfg.host = optarg;
