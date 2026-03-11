@@ -27,11 +27,14 @@
 
 ```cpp
 struct postgis_config {
-    std::string host;     // 数据库主机
-    std::string port;     // 数据库端口
-    std::string dbname;   // 数据库名称
-    std::string user;     // 数据库用户
-    std::string password; // 数据库密码
+    std::string host;           // 数据库主机
+    std::string port;           // 数据库端口
+    std::string dbname;         // 数据库名称
+    std::string user;           // 数据库用户
+    std::string password;       // 数据库密码
+    std::string table;          // 数据表名称
+    std::string sql;            // SQL查询语句
+    std::string geometry_field; // 几何字段名称
 };
 ```
 
@@ -71,7 +74,14 @@ struct postgis_config {
 #### 单行配置
 
 ```bash
-tippecanoe -o output.mbtiles --postgis "host:port:dbname:user:password" --postgis-sql "SELECT id, name, ST_AsText(geom) as wkt FROM table WHERE condition"
+# 基本连接
+ tippecanoe -o output.mbtiles --postgis "host:port:dbname:user:password" --postgis-sql "SELECT id, name, ST_AsText(geom) as wkt FROM table WHERE condition"
+
+# 带表名和几何字段
+ tippecanoe -o output.mbtiles --postgis "host:port:dbname:user:password:table:geometry_column"
+
+# 带表名、几何字段和条件
+ tippecanoe -o output.mbtiles --postgis "host:port:dbname:user:password:table:geometry_column:condition"
 ```
 
 #### 单独参数
@@ -84,19 +94,31 @@ tippecanoe -o output.mbtiles \
   --postgis-user postgres \
   --postgis-password password \
   --postgis-sql "SELECT id, name, ST_AsText(geom) as wkt FROM roads WHERE highway='motorway'"
+
+# 使用表名和几何字段（自动生成SQL）
+tippecanoe -o output.mbtiles \
+  --postgis-host localhost \
+  --postgis-port 5432 \
+  --postgis-dbname gis \
+  --postgis-user postgres \
+  --postgis-password password \
+  --postgis-table roads \
+  --postgis-geometry-field geom
 ```
 
 ### 选项详情
 
 | 选项 | 描述 | 默认值 |
 |--------|-------------|---------|
-| `--postgis` | 组合的 PostGIS 连接字符串 | N/A |
+| `--postgis` | 组合的 PostGIS 连接字符串，格式：host:port:dbname:user:password:table:geometry_column:condition | N/A |
 | `--postgis-host` | 数据库主机 | localhost |
 | `--postgis-port` | 数据库端口 | 5432 |
 | `--postgis-dbname` | 数据库名称 | (必需) |
 | `--postgis-user` | 数据库用户 | (必需) |
 | `--postgis-password` | 数据库密码 | (必需) |
-| `--postgis-sql` | 自定义 SQL 查询语句 | (必需) |
+| `--postgis-table` | 数据表名称 | (可选，与geometry-field一起使用时自动生成SQL) |
+| `--postgis-geometry-field` | 几何字段名称 | (可选，默认为"geometry"，与table一起使用时自动生成SQL) |
+| `--postgis-sql` | 自定义 SQL 查询语句 | (可选，当提供表名和几何字段时自动生成) |
 
 ## 使用 --postgis-sql 选项直接输入 SQL 查询语句
 
@@ -132,13 +154,21 @@ tippecanoe --postgis-host=localhost --postgis-port=5432 --postgis-dbname=gis --p
 
 ### 注意事项
 
-1. **查询结果必须包含 WKT 格式的几何列**：系统会自动从查询结果的第二列获取 WKT 格式的几何数据。因此，您的查询语句中必须包含 `ST_AsText(geometry_column) as wkt` 或类似的表达式，并且确保它是查询结果的第二列。
+1. **查询结果必须包含 WKT 格式的几何列**：系统会尝试以下方式查找几何列：
+   - 首先使用 `--postgis-geometry-field` 指定的列名
+   - 如果找不到，尝试查找名为 'wkt' 的列（自动生成的 SQL 中使用的别名）
+   - 如果仍然找不到，使用第二列作为 fallback
+   因此，您的查询语句中应该包含 `ST_AsText(geometry_column) as wkt` 或类似的表达式。
 
 2. **连接参数仍然需要提供**：即使使用自定义 SQL 查询，您仍然需要提供数据库连接参数（主机、端口、数据库名、用户名、密码）。
 
-3. **查询性能**：对于大型数据库，建议在查询中添加适当的过滤条件，以避免返回过多数据。
+3. **自动 SQL 生成**：当您在 `--postgis` 选项中提供表名和几何字段，或使用 `--postgis-table` 和 `--postgis-geometry-field` 选项时，系统会自动生成 SQL 查询语句：
+   - 基本格式：`SELECT ST_AsText(geometry_column) as wkt, * FROM table`
+   - 带条件：`SELECT ST_AsText(geometry_column) as wkt, * FROM table WHERE condition`
 
-4. **SQL 语法**：请确保您的 SQL 查询语法正确，并且在命令行中正确转义特殊字符。
+4. **查询性能**：对于大型数据库，建议在查询中添加适当的过滤条件，以避免返回过多数据。
+
+5. **SQL 语法**：请确保您的 SQL 语法正确，并且在命令行中正确转义特殊字符。
 
 ### 错误处理
 

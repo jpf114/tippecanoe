@@ -1,7 +1,7 @@
-PREFIX ?= /usr/local
+BUILDTYPE ?= Debug
+BUILD_INFO ?= ./build/$(BUILDTYPE)
+PREFIX ?= ./bin/$(BUILDTYPE)
 MANDIR ?= $(PREFIX)/share/man/man1/
-BUILDTYPE ?= Release
-BUILD_INFO ?=
 SHELL = /bin/sh
 
 
@@ -46,21 +46,24 @@ install: tippecanoe tippecanoe-enumerate tippecanoe-decode tile-join tippecanoe-
 	cp man/tippecanoe.1 $(MANDIR)/tippecanoe.1
 
 uninstall:
-	rm $(PREFIX)/bin/tippecanoe $(PREFIX)/bin/tippecanoe-enumerate $(PREFIX)/bin/tippecanoe-decode $(PREFIX)/bin/tile-join $(MANDIR)/tippecanoe.1 $(PREFIX)/bin/tippecanoe-json-tool
+	rm $(PREFIX)/bin/tippecanoe $(PREFIX)/bin/tippecanoe-enumerate $(PREFIX)/bin/tippecanoe-decode $(PREFIX)/bin/tile-join $(MANDIR)/tippecanoe.1 $(PREFIX)/bin/tippecanoe-json-tool $(PREFIX)/bin/tippecanoe-overzoom
 
 man/tippecanoe.1: README.md
 	md2man-roff README.md > man/tippecanoe.1
 
-PG=-I/usr/include/postgresql -L/usr/lib -lpq
+PG =
 
 H = $(wildcard *.h) $(wildcard *.hpp)
 C = $(wildcard *.c) $(wildcard *.cpp)
+
+PGIS_INCLUDE = -I/usr/include/postgresql
+PGIS_LIB = -L/usr/lib
 
 INCLUDES = -I/usr/local/include -I. -Iclipper2/include
 LIBS = -L/usr/local/lib
 
 tippecanoe: geojson.o jsonpull/jsonpull.o tile.o pool.o mbtiles.o geometry.o projection.o memfile.o mvt.o serial.o main.o platform.o text.o dirtiles.o pmtiles_file.o plugin.o read_json.o write_json.o geobuf.o flatgeobuf.o evaluator.o geocsv.o csv.o geojson-loop.o json_logger.o visvalingam.o compression.o clip.o sort.o attribute.o thread.o shared_borders.o postgis.o clipper2/src/clipper.engine.o
-	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lm -lz -lsqlite3 -lpthread
+	$(CXX) $(PG) $(LIBS) $(PGIS_LIB) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lm -lz -lsqlite3 -lpthread -lpq
 
 tippecanoe-enumerate: enumerate.o
 	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lsqlite3
@@ -83,10 +86,10 @@ tippecanoe-overzoom: overzoom.o mvt.o clip.o evaluator.o jsonpull/jsonpull.o tex
 -include $(wildcard *.d)
 
 %.o: %.c
-	$(CC) -MMD $(PG) $(INCLUDES) $(FINAL_FLAGS) $(CFLAGS) -c -o $@ $<
+	$(CC) -MMD $(PG) $(PGIS_INCLUDE) $(INCLUDES) $(FINAL_FLAGS) $(CFLAGS) -c -o $@ $<
 
 %.o: %.cpp
-	$(CXX) -MMD $(PG) $(INCLUDES) $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
+	$(CXX) -MMD $(PG) $(PGIS_INCLUDE) $(INCLUDES) $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
 
 clean:
 	rm -f ./tippecanoe ./tippecanoe-* ./tile-join ./unit *.o *.d */*.o */*.d tests/**/*.mbtiles tests/**/*.check

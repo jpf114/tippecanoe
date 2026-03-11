@@ -101,15 +101,8 @@ std::vector<std::string> unidecode_data;
 size_t maximum_string_attribute_length = 0;
 
 // PostGIS configuration
-postgis_config postgis_cfg = {
-    "localhost",  // host
-    "5432",      // port
-    "",           // dbname
-    "",           // user
-    ""            // password
-};
 bool use_postgis = false;
-std::string postgis_sql = ""; // Custom SQL query
+postgis_config postgis_cfg{};
 
 std::vector<order_field> order_by;
 bool order_reverse;
@@ -3133,7 +3126,8 @@ int main(int argc, char **argv) {
 		{"postgis-dbname", required_argument, 0, '~'},
 		{"postgis-user", required_argument, 0, '~'},
 		{"postgis-password", required_argument, 0, '~'},
-
+		{"postgis-table", required_argument, 0, '~'},
+		{"postgis-geometry-field", required_argument, 0, '~'},
 		{"postgis-sql", required_argument, 0, '~'},
 
 		{"Parallel processing of input", 0, 0, 0},
@@ -3413,8 +3407,6 @@ int main(int argc, char **argv) {
 			} else if (strcmp(opt, "maximum-string-attribute-length") == 0) {
 				maximum_string_attribute_length = atoll_require(optarg, "Maximum string attribute length");
 			} else if (strcmp(opt, "postgis") == 0) {
-				// Format: host:port:dbname:user:password:table:geometry_column:where_clause
-				// Example: localhost:5432:gis:postgres:password:roads:geom:highway='motorway'
 				use_postgis = true;
 				std::string postgis_arg = optarg;
 				size_t pos = 0;
@@ -3429,6 +3421,19 @@ int main(int argc, char **argv) {
 				if (parts.size() >= 3) postgis_cfg.dbname = parts[2];
 				if (parts.size() >= 4) postgis_cfg.user = parts[3];
 				if (parts.size() >= 5) postgis_cfg.password = parts[4];
+				if (parts.size() >= 6) postgis_cfg.table = parts[5];
+				if (parts.size() >= 7) postgis_cfg.geometry_field = parts[6];
+				if (parts.size() >= 8) {
+					// Construct SQL query from table, geometry_field, and where_clause
+					std::string where_clause = parts[7];
+					postgis_cfg.sql = "SELECT ST_AsText(" + postgis_cfg.geometry_field + ") as wkt, * FROM " + postgis_cfg.table;
+					if (!where_clause.empty()) {
+						postgis_cfg.sql += " WHERE " + where_clause;
+					}
+				} else if (parts.size() >= 6) {
+					// Construct SQL query from table and geometry_field
+					postgis_cfg.sql = "SELECT ST_AsText(" + postgis_cfg.geometry_field + ") as wkt, * FROM " + postgis_cfg.table;
+				}
 			} else if (strcmp(opt, "postgis-host") == 0) {
 				postgis_cfg.host = optarg;
 				use_postgis = true;
@@ -3444,9 +3449,14 @@ int main(int argc, char **argv) {
 			} else if (strcmp(opt, "postgis-password") == 0) {
 				postgis_cfg.password = optarg;
 				use_postgis = true;
-
+			} else if (strcmp(opt, "postgis-table") == 0) {
+				postgis_cfg.table = optarg;
+				use_postgis = true;
+			} else if (strcmp(opt, "postgis-geometry-field") == 0) {
+				postgis_cfg.geometry_field = optarg;
+				use_postgis = true;
 			} else if (strcmp(opt, "postgis-sql") == 0) {
-				postgis_sql = optarg;
+				postgis_cfg.sql = optarg;
 				use_postgis = true;
 			} else {
 				fprintf(stderr, "%s: Unrecognized option --%s\n", argv[0], opt);
