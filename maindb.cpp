@@ -49,7 +49,7 @@
 #include "pool.hpp"
 #include "projection.hpp"
 #include "memfile.hpp"
-#include "main.hpp"
+#include "maindb.hpp"
 #include "geojson.hpp"
 #include "geobuf.hpp"
 #include "flatgeobuf.hpp"
@@ -67,7 +67,6 @@
 #include "attribute.hpp"
 #include "thread.hpp"
 #include "platform.hpp"
-#include "postgis.hpp"
 
 static int low_detail = 12;
 static int full_detail = -1;
@@ -104,9 +103,6 @@ size_t maximum_string_attribute_length = 0;
 bool use_postgis = false;
 postgis_config postgis_cfg{};
 
-// Processing mode
-bool processing_db = false;
-
 std::vector<order_field> order_by;
 bool order_reverse;
 bool order_by_size = false;
@@ -116,9 +112,7 @@ int additional[256];
 
 struct source {
 	std::string layer = "";
-	std::string file = "";
 	std::string description = "";
-	std::string format = "";
 };
 
 size_t CPUS;
@@ -453,299 +447,7 @@ void *run_sort(void *v) {
 	return NULL;
 }
 
-void do_read_parallel(char *map, long long len, long long initial_offset, const char *reading, std::vector<struct reader> *readers, std::atomic<long long> *progress_seq, std::set<std::string> *exclude, std::set<std::string> *include, int exclude_all, int basezoom, int source, std::vector<std::map<std::string, layermap_entry> > *layermaps, int *initialized, unsigned *initial_x, unsigned *initial_y, int maxzoom, std::string layername, bool uses_gamma, std::unordered_map<std::string, int> const *attribute_types, int separator, double *dist_sum, size_t *dist_count, double *area_sum, bool want_dist, bool filters) {
-	long long segs[CPUS + 1];
-	segs[0] = 0;
-	segs[CPUS] = len;
 
-	for (size_t i = 1; i < CPUS; i++) {
-		segs[i] = len * i / CPUS;
-
-		while (segs[i] < len && map[segs[i]] != separator) {
-			segs[i]++;
-		}
-	}
-
-	double dist_sums[CPUS];
-	size_t dist_counts[CPUS];
-	double area_sums[CPUS];
-
-	std::atomic<long long> layer_seq[CPUS];
-	for (size_t i = 0; i < CPUS; i++) {
-		// To preserve feature ordering, unique id for each segment
-		// begins with that segment's offset into the input
-		layer_seq[i] = segs[i] + initial_offset;
-		dist_sums[i] = dist_counts[i] = 0;
-		area_sums[i] = 0;
-	}
-
-	std::vector<parse_json_args> pja;
-
-	std::vector<serialization_state> sst;
-	sst.resize(CPUS);
-
-	pthread_t pthreads[CPUS];
-	std::vector<std::set<serial_val> > file_subkeys;
-
-	for (size_t i = 0; i < CPUS; i++) {
-		file_subkeys.push_back(std::set<serial_val>());
-	}
-
-	for (size_t i = 0; i < CPUS; i++) {
-		sst[i].fname = reading;
-		sst[i].line = 0;
-		sst[i].layer_seq = &layer_seq[i];
-		sst[i].progress_seq = progress_seq;
-		sst[i].readers = readers;
-		sst[i].segment = i;
-		sst[i].initialized = &initialized[i];
-		sst[i].initial_x = &initial_x[i];
-		sst[i].initial_y = &initial_y[i];
-		sst[i].dist_sum = &(dist_sums[i]);
-		sst[i].area_sum = &(area_sums[i]);
-		sst[i].dist_count = &(dist_counts[i]);
-		sst[i].want_dist = want_dist;
-		sst[i].maxzoom = maxzoom;
-		sst[i].uses_gamma = uses_gamma;
-		sst[i].filters = filters;
-		sst[i].layermap = &(*layermaps)[i];
-		sst[i].exclude = exclude;
-		sst[i].include = include;
-		sst[i].exclude_all = exclude_all;
-		sst[i].basezoom = basezoom;
-		sst[i].attribute_types = attribute_types;
-
-		pja.push_back(parse_json_args(
-			json_begin_map(map + segs[i], segs[i + 1] - segs[i]),
-			source,
-			&layername,
-			&sst[i]));
-	}
-
-	for (size_t i = 0; i < CPUS; i++) {
-		if (thread_create(&pthreads[i], NULL, run_parse_json, &pja[i]) != 0) {
-			perror("pthread_create");
-			exit(EXIT_PTHREAD);
-		}
-	}
-
-	for (size_t i = 0; i < CPUS; i++) {
-		void *retval;
-
-		if (pthread_join(pthreads[i], &retval) != 0) {
-			perror("pthread_join 370");
-		}
-
-		*dist_sum += dist_sums[i];
-		*dist_count += dist_counts[i];
-		*area_sum += area_sums[i];
-
-		json_end_map(pja[i].jp);
-	}
-}
-
-static ssize_t read_stream(json_pull *j, char *buffer, size_t n);
-
-struct STREAM {
-	FILE *fp = NULL;
-	gzFile gz = NULL;
-
-	int fclose() {
-		int ret;
-
-		if (gz != NULL) {
-			ret = gzclose(gz);
-		} else {
-			ret = ::fclose(fp);
-		}
-
-		delete this;
-		return ret;
-	}
-
-	int peekc() {
-		if (gz != NULL) {
-			int c = gzgetc(gz);
-			if (c != EOF) {
-				gzungetc(c, gz);
-			}
-			return c;
-		} else {
-			int c = getc(fp);
-			if (c != EOF) {
-				ungetc(c, fp);
-			}
-			return c;
-		}
-	}
-
-	size_t read(char *out, size_t count) {
-		if (gz != NULL) {
-			int ret = gzread(gz, out, count);
-			if (ret < 0) {
-				fprintf(stderr, "%s: Error reading compressed data\n", *av);
-				exit(EXIT_READ);
-			}
-			return ret;
-		} else {
-			return ::fread(out, 1, count, fp);
-		}
-	}
-
-	json_pull *json_begin() {
-		return ::json_begin(read_stream, this);
-	}
-};
-
-static ssize_t read_stream(json_pull *j, char *buffer, size_t n) {
-	return ((STREAM *) j->source)->read(buffer, n);
-}
-
-STREAM *streamfdopen(int fd, const char *mode, std::string const &fname) {
-	STREAM *s = new STREAM;
-	s->fp = NULL;
-	s->gz = NULL;
-
-	if (fname.size() > 3 && fname.substr(fname.size() - 3) == std::string(".gz")) {
-		s->gz = gzdopen(fd, mode);
-		if (s->gz == NULL) {
-			fprintf(stderr, "%s: %s: Decompression error\n", *av, fname.c_str());
-			exit(EXIT_OPEN);
-		}
-	} else {
-		s->fp = fdopen(fd, mode);
-		if (s->fp == NULL) {
-			perror(fname.c_str());
-			exit(EXIT_OPEN);
-		}
-	}
-
-	return s;
-}
-
-STREAM *streamfpopen(FILE *fp) {
-	STREAM *s = new STREAM;
-	s->fp = fp;
-	s->gz = NULL;
-
-	return s;
-}
-
-struct read_parallel_arg {
-	int fd = 0;
-	STREAM *fp = NULL;
-	long long offset = 0;
-	long long len = 0;
-	std::atomic<int> *is_parsing = NULL;
-	int separator = 0;
-
-	const char *reading = NULL;
-	std::vector<struct reader> *readers = NULL;
-	std::atomic<long long> *progress_seq = NULL;
-	std::set<std::string> *exclude = NULL;
-	std::set<std::string> *include = NULL;
-	int exclude_all = 0;
-	int maxzoom = 0;
-	int basezoom = 0;
-	int source = 0;
-	std::vector<std::map<std::string, layermap_entry> > *layermaps = NULL;
-	int *initialized = NULL;
-	unsigned *initial_x = NULL;
-	unsigned *initial_y = NULL;
-	std::string layername = "";
-	bool uses_gamma = false;
-	std::unordered_map<std::string, int> const *attribute_types = NULL;
-	double *dist_sum = NULL;
-	size_t *dist_count = NULL;
-	double *area_sum = NULL;
-	bool want_dist = false;
-	bool filters = false;
-};
-
-void *run_read_parallel(void *v) {
-	struct read_parallel_arg *rpa = (struct read_parallel_arg *) v;
-
-	struct stat st;
-	if (fstat(rpa->fd, &st) != 0) {
-		perror("stat read temp");
-	}
-	if (rpa->len != st.st_size) {
-		fprintf(stderr, "wrong number of bytes in temporary: %lld vs %lld\n", rpa->len, (long long) st.st_size);
-	}
-	rpa->len = st.st_size;
-
-	char *map = (char *) mmap(NULL, rpa->len, PROT_READ, MAP_PRIVATE, rpa->fd, 0);
-	if (map == NULL || map == MAP_FAILED) {
-		perror("map intermediate input");
-		exit(EXIT_MEMORY);
-	}
-	madvise(map, rpa->len, MADV_RANDOM);  // sequential, but from several pointers at once
-
-	do_read_parallel(map, rpa->len, rpa->offset, rpa->reading, rpa->readers, rpa->progress_seq, rpa->exclude, rpa->include, rpa->exclude_all, rpa->basezoom, rpa->source, rpa->layermaps, rpa->initialized, rpa->initial_x, rpa->initial_y, rpa->maxzoom, rpa->layername, rpa->uses_gamma, rpa->attribute_types, rpa->separator, rpa->dist_sum, rpa->dist_count, rpa->area_sum, rpa->want_dist, rpa->filters);
-
-	madvise(map, rpa->len, MADV_DONTNEED);
-	if (munmap(map, rpa->len) != 0) {
-		perror("munmap source file");
-	}
-	if (rpa->fp->fclose() != 0) {
-		perror("close source file");
-		exit(EXIT_CLOSE);
-	}
-
-	*(rpa->is_parsing) = 0;
-	delete rpa;
-
-	return NULL;
-}
-
-void start_parsing(int fd, STREAM *fp, long long offset, long long len, std::atomic<int> *is_parsing, pthread_t *parallel_parser, bool &parser_created, const char *reading, std::vector<struct reader> *readers, std::atomic<long long> *progress_seq, std::set<std::string> *exclude, std::set<std::string> *include, int exclude_all, int basezoom, int source, std::vector<std::map<std::string, layermap_entry> > &layermaps, int *initialized, unsigned *initial_x, unsigned *initial_y, int maxzoom, std::string layername, bool uses_gamma, std::unordered_map<std::string, int> const *attribute_types, int separator, double *dist_sum, size_t *dist_count, double *area_sum, bool want_dist, bool filters) {
-	// This has to kick off an intermediate thread to start the parser threads,
-	// so the main thread can get back to reading the next input stage while
-	// the intermediate thread waits for the completion of the parser threads.
-
-	*is_parsing = 1;
-
-	struct read_parallel_arg *rpa = new struct read_parallel_arg;
-	if (rpa == NULL) {
-		perror("Out of memory");
-		exit(EXIT_MEMORY);
-	}
-
-	rpa->fd = fd;
-	rpa->fp = fp;
-	rpa->offset = offset;
-	rpa->len = len;
-	rpa->is_parsing = is_parsing;
-	rpa->separator = separator;
-
-	rpa->reading = reading;
-	rpa->readers = readers;
-	rpa->progress_seq = progress_seq;
-	rpa->exclude = exclude;
-	rpa->include = include;
-	rpa->exclude_all = exclude_all;
-	rpa->basezoom = basezoom;
-	rpa->source = source;
-	rpa->layermaps = &layermaps;
-	rpa->initialized = initialized;
-	rpa->initial_x = initial_x;
-	rpa->initial_y = initial_y;
-	rpa->maxzoom = maxzoom;
-	rpa->layername = layername;
-	rpa->uses_gamma = uses_gamma;
-	rpa->attribute_types = attribute_types;
-	rpa->dist_sum = dist_sum;
-	rpa->dist_count = dist_count;
-	rpa->area_sum = area_sum;
-	rpa->want_dist = want_dist;
-	rpa->filters = filters;
-
-	if (thread_create(parallel_parser, NULL, run_read_parallel, rpa) != 0) {
-		perror("pthread_create");
-		exit(EXIT_PTHREAD);
-	}
-	parser_created = true;
-}
 
 void radix1(int *geomfds_in, int *indexfds_in, int inputs, int prefix, int splits, long long mem, const char *tmpdir, long long *availfiles, FILE *geomfile, FILE *indexfile, std::atomic<long long> *geompos_out, long long *progress, long long *progress_max, long long *progress_reported, int maxzoom, int basezoom, double droprate, double gamma, struct drop_state *ds) {
 	// Arranged as bits to facilitate subdividing again if a subdivided file is still huge
@@ -1221,7 +923,7 @@ double round_droprate(double r) {
 	return std::round(r * 100000.0) / 100000.0;
 }
 
-std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzoom, int basezoom, double basezoom_marker_width, sqlite3 *outdb, const char *outdir, std::set<std::string> *exclude, std::set<std::string> *include, int exclude_all, json_object *filter, double droprate, int buffer, const char *tmpdir, double gamma, int read_parallel, int forcetable, const char *attribution, bool uses_gamma, long long *file_bbox, long long *file_bbox1, long long *file_bbox2, const char *prefilter, const char *postfilter, const char *description, bool guess_maxzoom, bool guess_cluster_maxzoom, std::unordered_map<std::string, int> const *attribute_types, const char *pgm, std::unordered_map<std::string, attribute_op> const *attribute_accum, std::map<std::string, std::string> const &attribute_descriptions, std::string const &commandline, int minimum_maxzoom) {
+std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzoom, int basezoom, double basezoom_marker_width, sqlite3 *outdb, const char *outdir, std::set<std::string> *exclude, std::set<std::string> *include, int exclude_all, json_object *filter, double droprate, int buffer, const char *tmpdir, double gamma, int forcetable, const char *attribution, bool uses_gamma, long long *file_bbox, long long *file_bbox1, long long *file_bbox2, const char *prefilter, const char *postfilter, const char *description, bool guess_maxzoom, bool guess_cluster_maxzoom, std::unordered_map<std::string, int> const *attribute_types, const char *pgm, std::unordered_map<std::string, attribute_op> const *attribute_accum, std::map<std::string, std::string> const &attribute_descriptions, std::string const &commandline, int minimum_maxzoom) {
 	int ret = EXIT_SUCCESS;
 
 	std::vector<struct reader> readers;
@@ -1345,72 +1047,7 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 		initialized[i] = initial_x[i] = initial_y[i] = 0;
 	}
 
-	size_t nlayers = sources.size();
-	for (size_t l = 0; l < nlayers; l++) {
-		if (sources[l].layer.size() == 0) {
-			const char *src;
-			if (sources[l].file.size() == 0) {
-				src = fname;
-			} else {
-				src = sources[l].file.c_str();
-			}
-
-			// Find the last component of the pathname
-			const char *ocp, *use = src;
-			for (ocp = src; *ocp; ocp++) {
-				if (*ocp == '/' && ocp[1] != '\0') {
-					use = ocp + 1;
-				}
-			}
-			std::string trunc = std::string(use);
-
-			std::vector<std::string> trim = {
-				".json",
-				".geojson",
-				".geobuf",
-				".mbtiles",
-				".pmtiles",
-				".csv",
-				".gz",
-			};
-
-			// Trim .json or .mbtiles from the name
-			bool again = true;
-			while (again) {
-				again = false;
-				for (size_t i = 0; i < trim.size(); i++) {
-					if (trunc.size() > trim[i].size() && trunc.substr(trunc.size() - trim[i].size()) == trim[i]) {
-						trunc = trunc.substr(0, trunc.size() - trim[i].size());
-						again = true;
-					}
-				}
-			}
-
-			// Trim out characters that can't be part of selector
-			std::string out;
-			for (size_t p = 0; p < trunc.size(); p++) {
-				if (isalpha(trunc[p]) || isdigit(trunc[p]) || trunc[p] == '_' || (trunc[p] & 0x80) != 0) {
-					out.append(trunc, p, 1);
-				}
-			}
-
-			sources[l].layer = out;
-			if (sources[l].layer.size() == 0 || check_utf8(out).size() != 0) {
-				sources[l].layer = "unknown" + std::to_string(l);
-			}
-
-			if (!quiet) {
-				fprintf(stderr, "For layer %d, using name \"%s\"\n", (int) l, sources[l].layer.c_str());
-			}
-		}
-	}
-
 	std::map<std::string, layermap_entry> layermap;
-	for (size_t l = 0; l < nlayers; l++) {
-		layermap_entry e = layermap_entry(l);
-		e.description = sources[l].description;
-		layermap.insert(std::pair<std::string, layermap_entry>(sources[l].layer, e));
-	}
 
 	std::vector<std::map<std::string, layermap_entry> > layermaps;
 	for (size_t l = 0; l < CPUS; l++) {
@@ -1432,525 +1069,119 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 		exit(EXIT_CLOSE);
 	}
 
-	size_t nsources = sources.size();
-	// Handle PostGIS input if enabled
-	if (use_postgis) {
-		processing_db = true;
-		if (!quiet) {
-			fprintf(stderr, "Reading from PostGIS database: %s@%s:%s/%s\n", 
-				postgis_cfg.user.c_str(), postgis_cfg.host.c_str(), postgis_cfg.port.c_str(), postgis_cfg.dbname.c_str());
-		}
-
-		// Create a PostGISReader instance
-		PostGISReader reader(postgis_cfg);
-		if (!reader.connect()) {
-			fprintf(stderr, "Failed to connect to PostGIS database\n");
-			exit(EXIT_OPEN);
-		}
-
-		// Create a source for PostGIS data
-		source postgis_source;
-		postgis_source.layer = postgis_cfg.table.empty() ? "postgis" : postgis_cfg.table;
-		postgis_source.file = "postgis:" + postgis_cfg.host + ":" + postgis_cfg.port + ":" + postgis_cfg.dbname + ":" + postgis_cfg.table;
-		sources.push_back(postgis_source);
-
-		// Add to layermap
-		layermap_entry e = layermap_entry(sources.size() - 1);
-		e.description = "PostGIS layer";
-		layermap.insert(std::pair<std::string, layermap_entry>(postgis_source.layer, e));
-		layermaps.clear();
-		for (size_t l = 0; l < CPUS; l++) {
-			layermaps.push_back(layermap);
-		}
-
-		// Read features from PostGIS
-		std::vector<struct serialization_state> sst;
-		sst.resize(CPUS);
-
-		std::atomic<long long> layer_seq[CPUS];
-		double dist_sums[CPUS];
-		size_t dist_counts[CPUS];
-		double area_sums[CPUS];
-
-		for (size_t i = 0; i < CPUS; i++) {
-			layer_seq[i] = overall_offset;
-			dist_sums[i] = 0;
-			dist_counts[i] = 0;
-			area_sums[i] = 0;
-
-			sst[i].fname = "PostGIS";
-			sst[i].line = 0;
-			sst[i].layer_seq = &layer_seq[i];
-			sst[i].progress_seq = &progress_seq;
-			sst[i].readers = &readers;
-			sst[i].segment = i;
-			sst[i].initial_x = &initial_x[i];
-			sst[i].initial_y = &initial_y[i];
-			sst[i].initialized = &initialized[i];
-			sst[i].dist_sum = &dist_sums[i];
-			sst[i].dist_count = &dist_counts[i];
-			sst[i].area_sum = &area_sums[i];
-			sst[i].want_dist = guess_maxzoom;
-			sst[i].maxzoom = maxzoom;
-			sst[i].filters = prefilter != NULL || postfilter != NULL;
-			sst[i].uses_gamma = uses_gamma;
-			sst[i].layermap = &layermaps[i];
-			sst[i].exclude = exclude;
-			sst[i].include = include;
-			sst[i].exclude_all = exclude_all;
-			sst[i].basezoom = basezoom;
-			sst[i].attribute_types = attribute_types;
-		}
-
-		if (!reader.read_features(sst, sources.size() - 1, postgis_source.layer)) {
-			fprintf(stderr, "Failed to read features from PostGIS\n");
-			exit(EXIT_READ);
-		}
-
-		for (size_t i = 0; i < CPUS; i++) {
-			dist_sum += dist_sums[i];
-			dist_count += dist_counts[i];
-			area_sum += area_sums[i];
-		}
-
-		overall_offset = layer_seq[0];
-		checkdisk(&readers);
-	} else {
-		processing_db = false;
+	// PostGIS configuration is required
+	if(!use_postgis) {
+		fprintf(stderr, "Error: PostGIS configuration is required\n");
+		exit(EXIT_ARGS);
 	}
 
-	// Skip file operations if processing database input
-if (!processing_db) {
-	for (size_t source = 0; source < nsources; source++) {
-		std::string reading;
-		int fd;
-
-		if (sources[source].file.size() == 0) {
-			reading = "standard input";
-			fd = 0;
-		} else {
-			reading = sources[source].file;
-			fd = open(sources[source].file.c_str(), O_RDONLY, O_CLOEXEC);
-			if (fd < 0) {
-				perror(sources[source].file.c_str());
-				continue;
-			}
-		}
-
-		auto a = layermap.find(sources[source].layer);
-		if (a == layermap.end()) {
-			fprintf(stderr, "Internal error: couldn't find layer %s", sources[source].layer.c_str());
-			exit(EXIT_IMPOSSIBLE);
-		}
-		size_t layer = a->second.id;
-
-		// geobuf
-		if (sources[source].format == "fgb" || (sources[source].file.size() > 4 && sources[source].file.substr(sources[source].file.size() - 4) == std::string(".fgb"))) {
-			struct stat st;
-			if (fstat(fd, &st) != 0) {
-				perror("fstat");
-				perror(sources[source].file.c_str());
-				exit(EXIT_STAT);
-			}
-
-			char *map = (char *) mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-			if (map == MAP_FAILED) {
-				fprintf(stderr, "%s: mmap: %s: %s\n", *av, reading.c_str(), strerror(errno));
-				exit(EXIT_MEMORY);
-			}
-
-			std::atomic<long long> layer_seq[CPUS];
-			double dist_sums[CPUS];
-			size_t dist_counts[CPUS];
-			double area_sums[CPUS];
-			std::vector<struct serialization_state> sst;
-			sst.resize(CPUS);
-
-			for (size_t i = 0; i < CPUS; i++) {
-				layer_seq[i] = overall_offset;
-				dist_sums[i] = 0;
-				dist_counts[i] = 0;
-				area_sums[i] = 0;
-
-				sst[i].fname = reading.c_str();
-				sst[i].line = 0;
-				sst[i].layer_seq = &layer_seq[i];
-				sst[i].progress_seq = &progress_seq;
-				sst[i].readers = &readers;
-				sst[i].segment = i;
-				sst[i].initial_x = &initial_x[i];
-				sst[i].initial_y = &initial_y[i];
-				sst[i].initialized = &initialized[i];
-				sst[i].dist_sum = &dist_sums[i];
-				sst[i].dist_count = &dist_counts[i];
-				sst[i].area_sum = &area_sums[i];
-				sst[i].want_dist = guess_maxzoom;
-				sst[i].maxzoom = maxzoom;
-				sst[i].filters = prefilter != NULL || postfilter != NULL;
-				sst[i].uses_gamma = uses_gamma;
-				sst[i].layermap = &layermaps[i];
-				sst[i].exclude = exclude;
-				sst[i].include = include;
-				sst[i].exclude_all = exclude_all;
-				sst[i].basezoom = basezoom;
-				sst[i].attribute_types = attribute_types;
-			}
-
-			parse_flatgeobuf(&sst, map, st.st_size, layer, sources[layer].layer);
-
-			for (size_t i = 0; i < CPUS; i++) {
-				dist_sum += dist_sums[i];
-				dist_count += dist_counts[i];
-				area_sum = area_sums[i];
-			}
-
-			if (munmap(map, st.st_size) != 0) {
-				perror("munmap source file");
-				exit(EXIT_MEMORY);
-			}
-			if (close(fd) != 0) {
-				perror("close");
-				exit(EXIT_CLOSE);
-			}
-
-			overall_offset = layer_seq[0];
-			checkdisk(&readers);
-			continue;
-		}
-
-		if (sources[source].format == "geobuf" || (sources[source].file.size() > 7 && sources[source].file.substr(sources[source].file.size() - 7) == std::string(".geobuf"))) {
-			struct stat st;
-			if (fstat(fd, &st) != 0) {
-				perror("fstat");
-				perror(sources[source].file.c_str());
-				exit(EXIT_STAT);
-			}
-
-			char *map = (char *) mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-			if (map == MAP_FAILED) {
-				fprintf(stderr, "%s: mmap: %s: %s\n", *av, reading.c_str(), strerror(errno));
-				exit(EXIT_MEMORY);
-			}
-
-			std::atomic<long long> layer_seq[CPUS];
-			double dist_sums[CPUS];
-			size_t dist_counts[CPUS];
-			double area_sums[CPUS];
-			std::vector<struct serialization_state> sst;
-			sst.resize(CPUS);
-
-			for (size_t i = 0; i < CPUS; i++) {
-				layer_seq[i] = overall_offset;
-				dist_sums[i] = 0;
-				dist_counts[i] = 0;
-				area_sums[i] = 0;
-
-				sst[i].fname = reading.c_str();
-				sst[i].line = 0;
-				sst[i].layer_seq = &layer_seq[i];
-				sst[i].progress_seq = &progress_seq;
-				sst[i].readers = &readers;
-				sst[i].segment = i;
-				sst[i].initial_x = &initial_x[i];
-				sst[i].initial_y = &initial_y[i];
-				sst[i].initialized = &initialized[i];
-				sst[i].dist_sum = &dist_sums[i];
-				sst[i].dist_count = &dist_counts[i];
-				sst[i].area_sum = &area_sums[i];
-				sst[i].want_dist = guess_maxzoom;
-				sst[i].maxzoom = maxzoom;
-				sst[i].filters = prefilter != NULL || postfilter != NULL;
-				sst[i].uses_gamma = uses_gamma;
-				sst[i].layermap = &layermaps[i];
-				sst[i].exclude = exclude;
-				sst[i].include = include;
-				sst[i].exclude_all = exclude_all;
-				sst[i].basezoom = basezoom;
-				sst[i].attribute_types = attribute_types;
-			}
-
-			parse_geobuf(&sst, map, st.st_size, layer, sources[layer].layer);
-
-			for (size_t i = 0; i < CPUS; i++) {
-				dist_sum += dist_sums[i];
-				dist_count += dist_counts[i];
-				area_sum += area_sums[i];
-			}
-
-			if (munmap(map, st.st_size) != 0) {
-				perror("munmap source file");
-				exit(EXIT_MEMORY);
-			}
-			if (close(fd) != 0) {
-				perror("close");
-				exit(EXIT_CLOSE);
-			}
-
-			overall_offset = layer_seq[0];
-			checkdisk(&readers);
-			continue;
-		}
-
-		if (sources[source].format == "csv" || (sources[source].file.size() > 4 && sources[source].file.substr(sources[source].file.size() - 4) == std::string(".csv"))) {
-			std::atomic<long long> layer_seq[CPUS];
-			double dist_sums[CPUS];
-			size_t dist_counts[CPUS];
-			double area_sums[CPUS];
-
-			std::vector<struct serialization_state> sst;
-			sst.resize(CPUS);
-
-			// XXX factor out this duplicated setup
-			for (size_t i = 0; i < CPUS; i++) {
-				layer_seq[i] = overall_offset;
-				dist_sums[i] = 0;
-				dist_counts[i] = 0;
-				area_sums[i] = 0;
-
-				sst[i].fname = reading.c_str();
-				sst[i].line = 0;
-				sst[i].layer_seq = &layer_seq[i];
-				sst[i].progress_seq = &progress_seq;
-				sst[i].readers = &readers;
-				sst[i].segment = i;
-				sst[i].initial_x = &initial_x[i];
-				sst[i].initial_y = &initial_y[i];
-				sst[i].initialized = &initialized[i];
-				sst[i].dist_sum = &dist_sums[i];
-				sst[i].dist_count = &dist_counts[i];
-				sst[i].area_sum = &area_sums[i];
-				sst[i].want_dist = guess_maxzoom;
-				sst[i].maxzoom = maxzoom;
-				sst[i].filters = prefilter != NULL || postfilter != NULL;
-				sst[i].uses_gamma = uses_gamma;
-				sst[i].layermap = &layermaps[i];
-				sst[i].exclude = exclude;
-				sst[i].include = include;
-				sst[i].exclude_all = exclude_all;
-				sst[i].basezoom = basezoom;
-				sst[i].attribute_types = attribute_types;
-			}
-
-			parse_geocsv(sst, sources[source].file, layer, sources[layer].layer);
-
-			if (close(fd) != 0) {
-				perror("close");
-				exit(EXIT_CLOSE);
-			}
-
-			overall_offset = layer_seq[0];
-			checkdisk(&readers);
-			continue;
-		}
-
-		struct stat st;
-		char *map = NULL;
-		off_t off = 0;
-
-		int read_parallel_this = read_parallel ? '\n' : 0;
-
-		if (!(sources[source].file.size() > 3 && sources[source].file.substr(sources[source].file.size() - 3) == std::string(".gz"))) {
-			if (fstat(fd, &st) == 0) {
-				off = lseek(fd, 0, SEEK_CUR);
-				if (off >= 0) {
-					map = (char *) mmap(NULL, st.st_size - off, PROT_READ, MAP_PRIVATE, fd, off);
-					// No error if MAP_FAILED because check is below
-					if (map != MAP_FAILED) {
-						madvise(map, st.st_size - off, MADV_RANDOM);  // sequential, but from several pointers at once
-					}
-				}
-			}
-		}
-
-		if (map != NULL && map != MAP_FAILED && st.st_size - off > 0) {
-			if (map[0] == 0x1E) {
-				read_parallel_this = 0x1E;
-			}
-
-			if (!read_parallel_this) {
-				// Not a GeoJSON text sequence, so unmap and read serially
-
-				if (munmap(map, st.st_size - off) != 0) {
-					perror("munmap source file");
-					exit(EXIT_MEMORY);
-				}
-
-				map = NULL;
-			}
-		}
-
-		if (map != NULL && map != MAP_FAILED && read_parallel_this) {
-			do_read_parallel(map, st.st_size - off, overall_offset, reading.c_str(), &readers, &progress_seq, exclude, include, exclude_all, basezoom, layer, &layermaps, initialized, initial_x, initial_y, maxzoom, sources[layer].layer, uses_gamma, attribute_types, read_parallel_this, &dist_sum, &dist_count, &area_sum, guess_maxzoom, prefilter != NULL || postfilter != NULL);
-			overall_offset += st.st_size - off;
-			checkdisk(&readers);
-
-			if (munmap(map, st.st_size - off) != 0) {
-				perror("munmap source file");
-				exit(EXIT_MEMORY);
-			}
-
-			if (close(fd) != 0) {
-				perror("close input file");
-				exit(EXIT_CLOSE);
-			}
-		} else {
-			STREAM *fp = streamfdopen(fd, "r", sources[layer].file);
-			if (fp == NULL) {
-				perror(sources[layer].file.c_str());
-				if (close(fd) != 0) {
-					perror("close source file");
-					exit(EXIT_CLOSE);
-				}
-				continue;
-			}
-
-			int c = fp->peekc();
-			if (c == 0x1E) {
-				read_parallel_this = 0x1E;
-			}
-
-			if (read_parallel_this) {
-				// Serial reading of chunks that are then parsed in parallel
-
-				char readname[strlen(tmpdir) + strlen("/read.XXXXXXXX") + 1];
-				snprintf(readname, sizeof(readname), "%s%s", tmpdir, "/read.XXXXXXXX");
-				int readfd = mkstemp_cloexec(readname);
-				if (readfd < 0) {
-					perror(readname);
-					exit(EXIT_OPEN);
-				}
-				FILE *readfp = fdopen(readfd, "w");
-				if (readfp == NULL) {
-					perror(readname);
-					exit(EXIT_OPEN);
-				}
-				unlink(readname);
-
-				std::atomic<int> is_parsing(0);
-				long long ahead = 0;
-				long long initial_offset = overall_offset;
-				pthread_t parallel_parser;
-				bool parser_created = false;
-
-#define READ_BUF 2000
-#define PARSE_MIN 10000000
-#define PARSE_MAX (1LL * 1024 * 1024 * 1024)
-
-				char buf[READ_BUF];
-				int n;
-
-				while ((n = fp->read(buf, READ_BUF)) > 0) {
-					std::atomic<long long> readingpos;
-					fwrite_check(buf, sizeof(char), n, readfp, &readingpos, reading.c_str());
-					ahead += n;
-
-					if (buf[n - 1] == read_parallel_this && ahead > PARSE_MIN) {
-						// Don't let the streaming reader get too far ahead of the parsers.
-						// If the buffered input gets huge, even if the parsers are still running,
-						// wait for the parser thread instead of continuing to stream input.
-
-						if (is_parsing == 0 || ahead >= PARSE_MAX) {
-							if (parser_created) {
-								if (pthread_join(parallel_parser, NULL) != 0) {
-									perror("pthread_join 1088");
-									exit(EXIT_PTHREAD);
-								}
-								parser_created = false;
-							}
-
-							fflush(readfp);
-							start_parsing(readfd, streamfpopen(readfp), initial_offset, ahead, &is_parsing, &parallel_parser, parser_created, reading.c_str(), &readers, &progress_seq, exclude, include, exclude_all, basezoom, layer, layermaps, initialized, initial_x, initial_y, maxzoom, sources[layer].layer, gamma != 0, attribute_types, read_parallel_this, &dist_sum, &dist_count, &area_sum, guess_maxzoom, prefilter != NULL || postfilter != NULL);
-
-							initial_offset += ahead;
-							overall_offset += ahead;
-							checkdisk(&readers);
-							ahead = 0;
-
-							snprintf(readname, sizeof(readname), "%s%s", tmpdir, "/read.XXXXXXXX");
-							readfd = mkstemp_cloexec(readname);
-							if (readfd < 0) {
-								perror(readname);
-								exit(EXIT_OPEN);
-							}
-							readfp = fdopen(readfd, "w");
-							if (readfp == NULL) {
-								perror(readname);
-								exit(EXIT_OPEN);
-							}
-							unlink(readname);
-						}
-					}
-				}
-				if (n < 0) {
-					perror(reading.c_str());
-				}
-
-				if (parser_created) {
-					if (pthread_join(parallel_parser, NULL) != 0) {
-						perror("pthread_join 1122");
-						exit(EXIT_PTHREAD);
-					}
-					parser_created = false;
-				}
-
-				fflush(readfp);
-
-				if (ahead > 0) {
-					start_parsing(readfd, streamfpopen(readfp), initial_offset, ahead, &is_parsing, &parallel_parser, parser_created, reading.c_str(), &readers, &progress_seq, exclude, include, exclude_all, basezoom, layer, layermaps, initialized, initial_x, initial_y, maxzoom, sources[layer].layer, gamma != 0, attribute_types, read_parallel_this, &dist_sum, &dist_count, &area_sum, guess_maxzoom, prefilter != NULL || postfilter != NULL);
-
-					if (parser_created) {
-						if (pthread_join(parallel_parser, NULL) != 0) {
-							perror("pthread_join 1133");
-						}
-						parser_created = false;
-					}
-
-					overall_offset += ahead;
-					checkdisk(&readers);
-				}
-			} else {
-				// Plain serial reading
-
-				std::atomic<long long> layer_seq(overall_offset);
-				json_pull *jp = fp->json_begin();
-				struct serialization_state sst;
-
-				sst.fname = reading.c_str();
-				sst.line = 0;
-				sst.layer_seq = &layer_seq;
-				sst.progress_seq = &progress_seq;
-				sst.readers = &readers;
-				sst.segment = 0;
-				sst.initial_x = &initial_x[0];
-				sst.initial_y = &initial_y[0];
-				sst.initialized = &initialized[0];
-				sst.dist_sum = &dist_sum;
-				sst.dist_count = &dist_count;
-				sst.area_sum = &area_sum;
-				sst.want_dist = guess_maxzoom;
-				sst.maxzoom = maxzoom;
-				sst.filters = prefilter != NULL || postfilter != NULL;
-				sst.uses_gamma = uses_gamma;
-				sst.layermap = &layermaps[0];
-				sst.exclude = exclude;
-				sst.include = include;
-				sst.exclude_all = exclude_all;
-				sst.basezoom = basezoom;
-				sst.attribute_types = attribute_types;
-
-				parse_json(&sst, jp, layer, sources[layer].layer);
-				json_end(jp);
-				overall_offset = layer_seq;
-				checkdisk(&readers);
-			}
-
-			if (fp->fclose() != 0) {
-				perror("fclose input");
-				exit(EXIT_CLOSE);
-			}
-		}
+	// Validate PostGIS configuration
+	if (postgis_cfg.host.empty()) {
+		fprintf(stderr, "Error: PostGIS host is required\n");
+		exit(EXIT_ARGS);
 	}
-}
+	if (postgis_cfg.port.empty()) {
+		postgis_cfg.port = "5432"; // Default PostgreSQL port
+	}
+	if (postgis_cfg.dbname.empty()) {
+		fprintf(stderr, "Error: PostGIS database name is required\n");
+		exit(EXIT_ARGS);
+	}
+	if (postgis_cfg.user.empty()) {
+		fprintf(stderr, "Error: PostGIS user is required\n");
+		exit(EXIT_ARGS);
+	}
+	if (postgis_cfg.password.empty()) {
+		fprintf(stderr, "Error: PostGIS password is required\n");
+		exit(EXIT_ARGS);
+	}
+	if (postgis_cfg.table.empty() && postgis_cfg.sql.empty()) {
+		fprintf(stderr, "Error: Either PostGIS table or SQL query is required\n");
+		exit(EXIT_ARGS);
+	}
+	if (postgis_cfg.geometry_field.empty()) {
+		fprintf(stderr, "Error: PostGIS geometry field is required\n");
+		exit(EXIT_ARGS);
+	}
+
+	if (!quiet) {
+		fprintf(stderr, "Reading from PostGIS database: %s@%s:%s/%s\n", 
+			postgis_cfg.user.c_str(), postgis_cfg.host.c_str(), postgis_cfg.port.c_str(), postgis_cfg.dbname.c_str());
+	}
+
+	// Create a PostGISReader instance
+	PostGISReader reader(postgis_cfg);
+	if (!reader.connect()) {
+		fprintf(stderr, "Failed to connect to PostGIS database\n");
+		exit(EXIT_OPEN);
+	}
+
+	// Create a source for PostGIS data
+	source postgis_source;
+	postgis_source.layer = postgis_cfg.table.empty() ? "postgis" : postgis_cfg.table;
+	sources.push_back(postgis_source);
+
+	// Add to layermap
+	layermap_entry e = layermap_entry(sources.size() - 1);
+	e.description = "PostGIS layer";
+	layermap.insert(std::pair<std::string, layermap_entry>(postgis_source.layer, e));
+	layermaps.clear();
+	for (size_t l = 0; l < CPUS; l++) {
+		layermaps.push_back(layermap);
+	}
+
+	// Read features from PostGIS
+	std::vector<struct serialization_state> sst;
+	sst.resize(CPUS);
+
+	std::atomic<long long> layer_seq[CPUS];
+	double dist_sums[CPUS];
+	size_t dist_counts[CPUS];
+	double area_sums[CPUS];
+
+	for (size_t i = 0; i < CPUS; i++) {
+		layer_seq[i] = overall_offset;
+		dist_sums[i] = 0;
+		dist_counts[i] = 0;
+		area_sums[i] = 0;
+
+		sst[i].fname = "PostGIS";
+		sst[i].line = 0;
+		sst[i].layer_seq = &layer_seq[i];
+		sst[i].progress_seq = &progress_seq;
+		sst[i].readers = &readers;
+		sst[i].segment = i;
+		sst[i].initial_x = &initial_x[i];
+		sst[i].initial_y = &initial_y[i];
+		sst[i].initialized = &initialized[i];
+		sst[i].dist_sum = &dist_sums[i];
+		sst[i].dist_count = &dist_counts[i];
+		sst[i].area_sum = &area_sums[i];
+		sst[i].want_dist = guess_maxzoom;
+		sst[i].maxzoom = maxzoom;
+		sst[i].filters = prefilter != NULL || postfilter != NULL;
+		sst[i].uses_gamma = uses_gamma;
+		sst[i].layermap = &layermaps[i];
+		sst[i].exclude = exclude;
+		sst[i].include = include;
+		sst[i].exclude_all = exclude_all;
+		sst[i].basezoom = basezoom;
+		sst[i].attribute_types = attribute_types;
+	}
+
+	if (!reader.read_features(sst, sources.size() - 1, postgis_source.layer)) {
+		fprintf(stderr, "Failed to read features from PostGIS\n");
+		exit(EXIT_READ);
+	}
+
+	for (size_t i = 0; i < CPUS; i++) {
+		dist_sum += dist_sums[i];
+		dist_count += dist_counts[i];
+		area_sum += area_sums[i];
+	}
+
+	overall_offset = layer_seq[0];
+	checkdisk(&readers);
 
 	int files_open_after_reading = open(get_null_device(), O_RDONLY | O_CLOEXEC);
 	if (files_open_after_reading < 0) {
@@ -2919,7 +2150,7 @@ if (!processing_db) {
 		ai->second.maxzoom = maxzoom;
 	}
 
-	metadata m = make_metadata(fname, minzoom, maxzoom, minlat, minlon, maxlat, maxlon, minlat2, minlon2, maxlat2, maxlon2, midlat, midlon, attribution, merged_lm, true, description, !prevent[P_TILE_STATS], attribute_descriptions, "tippecanoe", commandline, strategies, basezoom, droprate, retain_points_multiplier);
+	metadata m = make_metadata(fname, minzoom, maxzoom, minlat, minlon, maxlat, maxlon, minlat2, minlon2, maxlat2, maxlon2, midlat, midlon, attribution, merged_lm, true, description, !prevent[P_TILE_STATS], attribute_descriptions, "tippecanoe-db", commandline, strategies, basezoom, droprate, retain_points_multiplier);
 	if (outdb != NULL) {
 		mbtiles_write_metadata(outdb, m, forcetable);
 	} else {
@@ -3019,48 +2250,9 @@ void set_attribute_value(const char *arg) {
 	set_attributes.insert(std::pair<std::string, serial_val>(name, val));
 }
 
-void parse_json_source(const char *arg, struct source &src) {
-	json_pull *jp = json_begin_string(arg);
-	json_object *o = json_read_tree(jp);
 
-	if (o == NULL) {
-		fprintf(stderr, "%s: -L%s: %s\n", *av, arg, jp->error);
-		exit(EXIT_JSON);
-	}
 
-	if (o->type != JSON_HASH) {
-		fprintf(stderr, "%s: -L%s: not a JSON object\n", *av, arg);
-		exit(EXIT_JSON);
-	}
-
-	json_object *fname = json_hash_get(o, "file");
-	if (fname == NULL || fname->type != JSON_STRING) {
-		fprintf(stderr, "%s: -L%s: requires \"file\": filename\n", *av, arg);
-		exit(EXIT_JSON);
-	}
-
-	src.file = std::string(fname->value.string.string);
-
-	json_object *layer = json_hash_get(o, "layer");
-	if (layer != NULL && layer->type == JSON_STRING) {
-		src.layer = std::string(layer->value.string.string);
-	}
-
-	json_object *description = json_hash_get(o, "description");
-	if (description != NULL && description->type == JSON_STRING) {
-		src.description = std::string(description->value.string.string);
-	}
-
-	json_object *format = json_hash_get(o, "format");
-	if (format != NULL && format->type == JSON_STRING) {
-		src.format = std::string(format->value.string.string);
-	}
-
-	json_free(o);
-	json_end(jp);
-}
-
-int main(int argc, char **argv) {
+int maindb(int argc, char **argv) {
 #ifdef MTRACE
 	mtrace();
 #endif
@@ -3068,13 +2260,11 @@ int main(int argc, char **argv) {
 	av = argv;
 	init_cpus();
 
-	extern int optind;
 	extern char *optarg;
 	int i;
 
 	char *name = NULL;
 	char *description = NULL;
-	char *layername = NULL;
 	char *out_mbtiles = NULL;
 	char *out_dir = NULL;
 	sqlite3 *outdb = NULL;
@@ -3101,7 +2291,6 @@ int main(int argc, char **argv) {
 	std::unordered_map<std::string, attribute_op> attribute_accum;
 	std::map<std::string, std::string> attribute_descriptions;
 	int exclude_all = 0;
-	int read_parallel = 0;
 	int files_open_at_start;
 	json_object *filter = NULL;
 
@@ -3124,10 +2313,6 @@ int main(int argc, char **argv) {
 		{"attribution", required_argument, 0, 'A'},
 		{"description", required_argument, 0, 'N'},
 
-		{"Input files and layer names", 0, 0, 0},
-		{"layer", required_argument, 0, 'l'},
-		{"named-layer", required_argument, 0, 'L'},
-
 		{"PostGIS database connection", 0, 0, 0},
 		{"postgis", required_argument, 0, '~'},
 		{"postgis-host", required_argument, 0, '~'},
@@ -3138,9 +2323,6 @@ int main(int argc, char **argv) {
 		{"postgis-table", required_argument, 0, '~'},
 		{"postgis-geometry-field", required_argument, 0, '~'},
 		{"postgis-sql", required_argument, 0, '~'},
-
-		{"Parallel processing of input", 0, 0, 0},
-		{"read-parallel", no_argument, 0, 'P'},
 
 		{"Projection of input", 0, 0, 0},
 		{"projection", required_argument, 0, 's'},
@@ -3169,7 +2351,6 @@ int main(int argc, char **argv) {
 		{"attribute-type", required_argument, 0, 'T'},
 		{"attribute-description", required_argument, 0, 'Y'},
 		{"accumulate-attribute", required_argument, 0, 'E'},
-		{"empty-csv-columns-are-null", no_argument, &prevent[P_EMPTY_CSV_COLUMNS], 1},
 		{"convert-stringified-ids-to-numbers", no_argument, &additional[A_CONVERT_NUMERIC_IDS], 1},
 		{"use-attribute-for-id", required_argument, 0, '~'},
 		{"single-precision", no_argument, &prevent[P_SINGLE_PRECISION], 1},
@@ -3472,30 +2653,9 @@ int main(int argc, char **argv) {
 			description = optarg;
 			break;
 
-		case 'l':
-			layername = optarg;
-			break;
-
 		case 'A':
-			attribution = optarg;
-			break;
-
-		case 'L': {
-			struct source src;
-			if (optarg[0] == '{') {
-				parse_json_source(optarg, src);
-			} else {
-				char *cp = strchr(optarg, ':');
-				if (cp == NULL || cp == optarg) {
-					fprintf(stderr, "%s: -L requires layername:file\n", argv[0]);
-					exit(EXIT_ARGS);
-				}
-				src.layer = std::string(optarg).substr(0, cp - optarg);
-				src.file = std::string(cp + 1);
-			}
-			sources.push_back(src);
-			break;
-		}
+		attribution = optarg;
+		break;
 
 		case 'z':
 			if (strcmp(optarg, "g") == 0) {
@@ -3742,10 +2902,6 @@ int main(int argc, char **argv) {
 			fprintf(stderr, "tippecanoe %s\n", version_str().c_str());
 			exit(EXIT_SUCCESS);
 
-		case 'P':
-			read_parallel = 1;
-			break;
-
 		case 's':
 			set_projection_or_exit(optarg);
 			break;
@@ -3787,7 +2943,7 @@ int main(int argc, char **argv) {
 				fprintf(stderr, "Unknown option -%c\n", i);
 			}
 			int width = 7 + strlen(argv[0]);
-			fprintf(stderr, "Usage: %s [options] [file.json ...]", argv[0]);
+			fprintf(stderr, "Usage: %s [options]", argv[0]);
 			for (size_t lo = 0; long_options_orig[lo].name != NULL && strlen(long_options_orig[lo].name) > 0; lo++) {
 				if (long_options_orig[lo].val == 0) {
 					fprintf(stderr, "\n  %s\n        ", long_options_orig[lo].name);
@@ -3951,34 +3107,14 @@ int main(int argc, char **argv) {
 
 	int ret = EXIT_SUCCESS;
 
-	for (i = optind; i < argc; i++) {
-		struct source src;
-		src.layer = "";
-		src.file = std::string(argv[i]);
-		sources.push_back(src);
-	}
-
-	if (sources.size() == 0) {
-		struct source src;
-		src.layer = "";
-		src.file = "";	// standard input
-		sources.push_back(src);
-	}
-
-	if (layername != NULL) {
-		for (size_t a = 0; a < sources.size(); a++) {
-			sources[a].layer = layername;
-		}
-	}
-
 	long long file_bbox[4] = {UINT_MAX, UINT_MAX, 0, 0};
 
 	long long file_bbox1[4] = {0xFFFFFFFF, 0xFFFFFFFF, 0, 0};	      // standard -180 to 180 world plane
 	long long file_bbox2[4] = {0x1FFFFFFFF, 0xFFFFFFFF, 0x100000000, 0};  // 0 to 360 world plane
 
 	auto input_ret = read_input(sources, name ? name : out_mbtiles ? out_mbtiles
-								       : out_dir,
-				    maxzoom, minzoom, basezoom, basezoom_marker_width, outdb, out_dir, &exclude, &include, exclude_all, filter, droprate, buffer, tmpdir, gamma, read_parallel, forcetable, attribution, gamma != 0, file_bbox, file_bbox1, file_bbox2, prefilter, postfilter, description, guess_maxzoom, guess_cluster_maxzoom, &attribute_types, argv[0], &attribute_accum, attribute_descriptions, commandline, minimum_maxzoom);
+					       : out_dir,
+		    maxzoom, minzoom, basezoom, basezoom_marker_width, outdb, out_dir, &exclude, &include, exclude_all, filter, droprate, buffer, tmpdir, gamma, forcetable, attribution, gamma != 0, file_bbox, file_bbox1, file_bbox2, prefilter, postfilter, description, guess_maxzoom, guess_cluster_maxzoom, &attribute_types, argv[0], &attribute_accum, attribute_descriptions, commandline, minimum_maxzoom);
 
 	ret = std::get<0>(input_ret);
 
@@ -4006,6 +3142,10 @@ int main(int argc, char **argv) {
 	}
 
 	return ret;
+}
+
+int main(int argc, char **argv) {
+	return maindb(argc, argv);
 }
 
 int mkstemp_cloexec(char *name) {

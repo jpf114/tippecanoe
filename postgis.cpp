@@ -21,8 +21,10 @@ PostGISReader::~PostGISReader()
 
 bool PostGISReader::connect()
 {
-    std::string conninfo = "host='" + config.host + "' port='" + config.port + "' dbname='" + config.dbname + "' user='" + config.user + "' password='" + config.password + "'";
-    conn = PQconnectdb(conninfo.c_str());
+    // Use PQconnectdbParams for safer connection string construction
+    const char *keywords[] = {"host", "port", "dbname", "user", "password", NULL};
+    const char *values[] = {config.host.c_str(), config.port.c_str(), config.dbname.c_str(), config.user.c_str(), config.password.c_str(), NULL};
+    conn = PQconnectdbParams(keywords, values, 0);
 
     if (PQstatus((PGconn *)conn) != CONNECTION_OK)
     {
@@ -52,6 +54,8 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
     {
         // Generate SQL query from table and geometry_field
         query = "SELECT ST_AsGeoJSON(" + config.geometry_field + ") as geojson, * FROM " + config.table;
+        // Replace the original geometry column with WKT format
+        // query = "SELECT ST_AsGeoJSON(" + config.geometry_field + ") as geojson, ST_AsText(" + config.geometry_field + ") as " + config.geometry_field + ", * FROM " + config.table;
     }
     else
     {
@@ -116,24 +120,13 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
     if (!geom_field_name || strlen(geom_field_name) == 0)
     {
         fprintf(stderr, "Error: Geometry column name does not exist or is empty (index %d)\n", geom_field_index);
+        PQclear(res);
         return false;
     }
     fprintf(stderr, "Using geometry column: %s (index %d)\n", geom_field_name, geom_field_index);
 
-    for (int i = 0; i < 3/*ntuples*/; i++)
+    for (int i = 0; i < ntuples; i++)
     {
-        struct serial_feature f;
-        f.layer = layer;
-        f.seq = i;
-        f.has_id = false;
-        f.id = 0;
-        f.tippecanoe_minzoom = -1;
-        f.tippecanoe_maxzoom = -1;
-        f.feature_minzoom = 0;
-
-        std::vector<std::shared_ptr<std::string>> full_keys;
-        std::vector<serial_val> full_values;
-
         // Build GeoJSON feature string
         std::string feature_str = "{";
         bool has_properties = false;
@@ -169,14 +162,17 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
                 {
                     if (field != geom_field_index)
                     {
-                        char *value = PQgetvalue(res, i, field);
                         const char *fieldname = PQfname(res, field);
-
-                        if (value == NULL || strlen(value) == 0)
+                        if (fieldname == NULL || strlen(fieldname) == 0 || strcmp(fieldname, config.geometry_field.c_str()) == 0)
                         {
                             continue;
                         }
 
+                        char *value = PQgetvalue(res, i, field);
+                        if (value == NULL || strlen(value) == 0)
+                        {
+                            continue;
+                        }
                         if (!first_property)
                         {
                             feature_str += ",";
@@ -206,6 +202,13 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
                                 escaped_value.replace(pos, 1, "\\\"");
                                 pos += 2;
                             }
+                            // Escape backslashes as well
+                            pos = 0;
+                            while ((pos = escaped_value.find('\\', pos)) != std::string::npos)
+                            {
+                                escaped_value.replace(pos, 1, "\\\\");
+                                pos += 2;
+                            }
                             feature_str += "\"" + escaped_value + "\"";
                         }
                     }
@@ -231,25 +234,26 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
         }
         geojson_collection += "]}";
 
-        fprintf(stderr, "GeoJSON FeatureCollection: %s\n", geojson_collection.c_str());
-        
         // Parse the GeoJSON FeatureCollection using existing GeoJSON parsing logic
         char *geojson_buffer = strdup(geojson_collection.c_str());
-        long long geojson_len = geojson_collection.length();
-
-        struct json_pull *jp = json_begin_map(geojson_buffer, geojson_len);
-        if (jp != NULL)
+        if (geojson_buffer)
         {
-            // Create a temporary serialization_state for parsing
-            struct serialization_state temp_sst = sst[0];
-            temp_sst.fname = "PostGIS";
-            temp_sst.line = 0;
-            
-            parse_json(&temp_sst, jp, layer, config.table.empty() ? "postgis" : config.table);
-            json_end_map(jp);
-        }
+            long long geojson_len = geojson_collection.length();
 
-        free(geojson_buffer);
+            struct json_pull *jp = json_begin_map(geojson_buffer, geojson_len);
+            if (jp != NULL)
+            {
+                // Create a temporary serialization_state for parsing
+                struct serialization_state temp_sst = sst[0];
+                temp_sst.fname = "PostGIS";
+                temp_sst.line = 0;
+
+                parse_json(&temp_sst, jp, layer, layername);
+                json_end_map(jp);
+            }
+
+            free(geojson_buffer);
+        }
     }
 
     PQclear(res);
@@ -259,6 +263,12 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
 //
 bool PostGISReader::execute_query(const std::string &query)
 {
+    if (!conn)
+    {
+        fprintf(stderr, "Error: Not connected to database\n");
+        return false;
+    }
+
     PGresult *res = PQexec((PGconn *)conn, query.c_str());
     if (PQresultStatus(res) != PGRES_TUPLES_OK)
     {
@@ -270,4 +280,3 @@ bool PostGISReader::execute_query(const std::string &query)
     PQclear(res);
     return true;
 }
-

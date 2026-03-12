@@ -1,7 +1,7 @@
 tippecanoe
 ==========
 
-Builds [vector tilesets](https://github.com/mapbox/vector-tile-spec/) from large (or small) collections of [GeoJSON](http://geojson.org/), [FlatGeobuf](https://github.com/flatgeobuf/flatgeobuf), or [CSV](https://en.wikipedia.org/wiki/Comma-separated_values) features,
+Builds [vector tilesets](https://github.com/mapbox/vector-tile-spec/) from large (or small) collections of [GeoJSON](http://geojson.org/), [FlatGeobuf](https://github.com/flatgeobuf/flatgeobuf), [CSV](https://en.wikipedia.org/wiki/Comma-separated_values) features, or directly from [PostGIS](https://postgis.net/) databases,
 [like these](MADE_WITH.md).
 
 This is the official home of Tippecanoe, developed and actively maintained by [Erica Fischer](https://github.com/e-n-f) at [Felt](https://felt.com). 
@@ -311,6 +311,7 @@ If your input is formatted as newline-delimited GeoJSON, use `-P` to make input 
  * _name_`.json.gz` or _name_`.geojson.gz`: Read the named gzipped GeoJSON input file into a layer called _name_.
  * _name_`.fgb`: Read the named FlatGeobuf input file into a layer called _name_.
  * _name_`.csv`: Read the named CSV input file into a layer called _name_.
+ * **PostGIS database**: Read spatial data directly from a PostGIS database using the `--postgis` option or related parameters. See [PostGIS support](#postgis-support) below for details.
  * `-l` _name_ or `--layer=`_name_: Use the specified layer name instead of deriving a name from the input filename or output tileset. If there are multiple input files
    specified, the files are all merged into the single named layer, even if they try to specify individual names with `-L`.
  * `-L` _name_`:`_file.json_ or `--named-layer=`_name_`:`_file.json_: Specify layer names for individual files. If your shell supports it, you can use a subshell redirect like `-L` _name_`:<(cat dir/*.json)` to specify a layer name for the output of streamed input.
@@ -693,12 +694,68 @@ have their probability diffused, so that some of them will be drawn as a square 
 this minimum size and others will not be drawn at all, preserving the total area that
 all of them should have had together.
 
-Features in the same tile that share the same type and attributes are coalesced
-together into a single geometry if you use `--coalesce`. You are strongly encouraged to use `-x` to exclude
-any unnecessary attributes to reduce wasted file size.
+## PostGIS Support
 
-If a tile is larger than 500K, it will try encoding that tile at progressively
-lower resolutions before failing if it still doesn't fit.
+Tippecanoe includes support for reading directly from PostGIS databases, allowing you to generate vector tilesets from spatial data stored in PostgreSQL/PostGIS without first exporting to intermediate files like GeoJSON.
+
+### Using PostGIS Input
+
+To use PostGIS as an input source, you need to provide database connection parameters and specify either a table name with geometry field or a custom SQL query.
+
+#### Basic Usage
+
+```bash
+# Using table and geometry field
+tippecanoe -o output.mbtiles \
+  --postgis-host localhost \
+  --postgis-port 5432 \
+  --postgis-dbname gis \
+  --postgis-user postgres \
+  --postgis-password password \
+  --postgis-table roads \
+  --postgis-geometry-field geom
+
+# Using custom SQL query
+tippecanoe -o output.mbtiles \
+  --postgis-host localhost \
+  --postgis-port 5432 \
+  --postgis-dbname gis \
+  --postgis-user postgres \
+  --postgis-password password \
+  --postgis-sql "SELECT id, name, ST_AsGeoJSON(geom) as geojson FROM roads WHERE type='highway'"
+
+# Using combined connection string
+tippecanoe -o output.mbtiles \
+  --postgis "localhost:5432:gis:postgres:password:roads:geom"
+```
+
+#### PostGIS Options
+
+| Option | Description |
+|--------|-------------|
+| `--postgis` | Combined PostGIS connection string in format: host:port:dbname:user:password:table:geometry_column[:sql] |
+| `--postgis-host` | Database host |
+| `--postgis-port` | Database port (default: 5432) |
+| `--postgis-dbname` | Database name |
+| `--postgis-user` | Database user |
+| `--postgis-password` | Database password |
+| `--postgis-table` | Table name (used with geometry-field to auto-generate SQL) |
+| `--postgis-geometry-field` | Geometry field name |
+| `--postgis-sql` | Custom SQL query (overrides table and geometry-field) |
+
+### tippecanoe-db
+
+Tippecanoe also provides a specialized executable `tippecanoe-db` that is optimized for working with PostGIS data. This executable includes all the same functionality as the main `tippecanoe` command but with additional optimizations for database operations.
+
+#### Usage
+
+```bash
+tippecanoe-db [options] -o output.mbtiles
+```
+
+The `tippecanoe-db` command supports the same PostGIS connection options as the main `tippecanoe` command, but is specifically designed to handle large datasets directly from the database.
+
+For more detailed information about PostGIS support and `tippecanoe-db`, see the [PostGIS documentation](postgis.md) and [tippecanoe-db documentation](tippecanoe-db.md).
 
 Development
 -----------
