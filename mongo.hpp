@@ -85,11 +85,8 @@ struct mongo_config {
     }
     
     // 解析 MongoDB 连接字符串
-    // 支持格式：
-    //   - 5 部分：host:port:dbname:user:password
-    //   - 6 部分：host:port:dbname:user:password:collection
-    //   - 7 部分：host:port:dbname:user:password:auth_source:collection
-    //   - 8 部分：host:port:dbname:user:password:auth_source:collection:drop
+    // 严格格式：host:port:dbname:user:password:auth_source:collection（必须 7 部分）
+    // 示例：localhost:27017:gis:user:pass:admin:china
     bool parse_connection_string(const std::string &conn_str) {
         std::vector<std::string> parts;
         std::string current;
@@ -106,8 +103,12 @@ struct mongo_config {
         }
         parts.push_back(current);  // 最后一部分
         
-        // 至少需要 host:port:dbname:user:password (5 部分)
-        if (parts.size() < 5) {
+        // 严格要求 7 部分
+        if (parts.size() != 7) {
+            fprintf(stderr, "Error: MongoDB connection string must have exactly 7 parts\n");
+            fprintf(stderr, "Format: host:port:dbname:user:password:auth_source:collection\n");
+            fprintf(stderr, "Example: localhost:27017:gis:user:pass:admin:china\n");
+            fprintf(stderr, "Got %zu parts: %s\n", parts.size(), conn_str.c_str());
             return false;
         }
         
@@ -117,36 +118,29 @@ struct mongo_config {
             try {
                 port = std::stoi(parts[1]);
             } catch (...) {
-                port = 27017;
+                fprintf(stderr, "Error: Invalid port number: %s\n", parts[1].c_str());
+                return false;
             }
+        } else {
+            port = 27017;
         }
         dbname = parts[2];
         username = parts[3];
         password = parts[4];
+        auth_source = parts[5];
+        collection = parts[6];
         
-        // 可选的 auth_source 和 collection
-        if (parts.size() >= 7 && !parts[5].empty() && !parts[6].empty()) {
-            // 7 部分格式：host:port:dbname:user:password:auth_source:collection
-            auth_source = parts[5];
-            collection = parts[6];
-        } else if (parts.size() >= 6 && !parts[5].empty()) {
-            // 6 部分格式：host:port:dbname:user:password:collection
-            collection = parts[5];
-            // auth_source 使用默认值 "admin"
+        // 始终自动 drop 集合
+        drop_collection_before_write = true;
+        
+        // 验证必填字段
+        if (dbname.empty() || username.empty() || auth_source.empty() || collection.empty()) {
+            fprintf(stderr, "Error: MongoDB connection string has empty required fields\n");
+            fprintf(stderr, "Format: host:port:dbname:user:password:auth_source:collection\n");
+            return false;
         }
         
-        // 可选的 drop 标志（第 8 部分）
-        // 8 部分格式：host:port:dbname:user:password:auth_source:collection:drop
-        if (parts.size() >= 8) {
-            std::string drop_str = parts[7];
-            // 支持 "drop"、"true"、"1"、"yes" 等值
-            if (drop_str == "drop" || drop_str == "true" || 
-                drop_str == "1" || drop_str == "yes") {
-                drop_collection_before_write = true;
-            }
-        }
-        
-        return !dbname.empty() && !username.empty();
+        return true;
     }
     
     // 生成 MongoDB 连接 URI（包含连接池、超时、写确认等配置）
@@ -229,6 +223,12 @@ public:
     
     // 销毁线程本地实例（在程序退出前调用）
     static void destroy_thread_local_instances();
+    
+    // 获取全局统计信息（所有 TLS 实例的总和）
+    static size_t get_global_total_tiles();
+    static size_t get_global_total_batches();
+    static size_t get_global_total_retries();
+    static size_t get_global_total_errors();
     
     // 初始化线程本地连接（每个工作线程调用）
     void initialize_thread();

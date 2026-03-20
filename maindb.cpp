@@ -2692,11 +2692,9 @@ int maindb(int argc, char **argv) {
 			} else if (strcmp(opt, "omongo") == 0) {
 				use_mongo = true;
 			} else if (strcmp(opt, "mongo") == 0) {
-				// 解析单行配置：host:port:dbname:user:password:collection
+				// 解析单行配置：host:port:dbname:user:password:auth_source:collection
 				if (!mongo_cfg.parse_connection_string(optarg)) {
-					fprintf(stderr, "Error: Invalid MongoDB connection string format\n");
-					fprintf(stderr, "Expected format: host:port:dbname:user:password[:collection]\n");
-					fprintf(stderr, "Example: localhost:27017:gis:admin:secret:tiles\n");
+					// parse_connection_string 已经输出详细错误信息
 					exit(EXIT_ARGS);
 				}
 				use_mongo = true;
@@ -3230,9 +3228,9 @@ int maindb(int argc, char **argv) {
 			fprintf(stderr, "Initializing MongoDB for tile output...\n");
 		}
 		MongoWriter::initialize_global();
-		mongo_writer = std::make_unique<MongoWriter>(mongo_cfg);
-		// 注意：不在这里调用 initialize_thread()
-		// 工作线程会在 run_thread() 中自行初始化线程本地实例
+		// 注意：不创建主线程的 mongo_writer 实例
+		// 工作线程会在 run_thread() 中通过 TLS 自动创建线程本地实例
+		// 避免内存泄漏和资源浪费
 	}
 
 	// 2. 调用 read_input() 读取 PostGIS 数据并写入瓦片
@@ -3267,29 +3265,28 @@ int maindb(int argc, char **argv) {
 	}
 
 	// 3. 检查 MongoDB 错误统计（在清理之前）
-	if (use_mongo && mongo_writer) {
-		size_t mongo_errors = mongo_writer->getTotalErrors();
+	// 注意：工作线程使用 TLS 实例，需要通过 destroy_thread_local_instances() 获取统计
+	if (use_mongo) {
+		// 先刷新所有 TLS 实例的缓冲区并汇总统计
+		MongoWriter::destroy_thread_local_instances();
+		
+		// 输出全局统计信息
+		if (!quiet) {
+			fprintf(stderr, "\nMongoDB 统计信息:\n");
+			fprintf(stderr, "  写入瓦片数：%zu\n", MongoWriter::get_global_total_tiles());
+			fprintf(stderr, "  批量写入次数：%zu\n", MongoWriter::get_global_total_batches());
+			fprintf(stderr, "  重试次数：%zu\n", MongoWriter::get_global_total_retries());
+			fprintf(stderr, "  错误次数：%zu\n", MongoWriter::get_global_total_errors());
+		}
+		
+		// 检查全局错误统计
+		size_t mongo_errors = MongoWriter::get_global_total_errors();
 		if (mongo_errors > 0) {
 			fprintf(stderr, "Error: MongoDB had %zu errors during write operations\n", mongo_errors);
 			if (ret == 0) {
 				ret = EXIT_MONGO;
 			}
 		}
-	}
-
-	// 4. 清理 MongoDB 资源（在返回之前）
-	if (use_mongo && mongo_writer) {
-		if (!quiet) {
-			fprintf(stderr, "\nMongoDB 统计信息:\n");
-			fprintf(stderr, "  写入瓦片数：%zu\n", mongo_writer->getTotalTilesWritten());
-			fprintf(stderr, "  批量写入次数：%zu\n", mongo_writer->getTotalBatchesWritten());
-			fprintf(stderr, "  重试次数：%zu\n", mongo_writer->getTotalRetries());
-			fprintf(stderr, "  错误次数：%zu\n", mongo_writer->getTotalErrors());
-		}
-		mongo_writer->flush_all();
-		mongo_writer->close();
-		mongo_writer.reset();
-		MongoWriter::destroy_thread_local_instances();
 	}
 
 	return ret;

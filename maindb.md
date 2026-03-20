@@ -2,31 +2,34 @@
 
 ## 概述
 
-`tippecanoe-db` 是 tippecanoe 项目的专用版本，用于从 **PostGIS 数据库**读取地理空间数据并生成 **MongoDB 矢量瓦片**。
+`tippecanoe-db` 是 tippecanoe 项目的专用版本，用于从 **PostGIS 数据库**读取地理空间数据并输出到 **MongoDB 数据库**和/或 **MBTiles 文件**。
 
-## 主要特性
+### 主要特性
+- **单一输入源**: 仅支持 PostGIS 数据库输入（强制要求）
+- **多目标输出**: 支持 MongoDB（强制）、MBTiles 文件（可选）
+- **高性能**: 批量写入、线程池、连接池优化
+- **高可靠**: 自动重试、写确认、异常安全
+- **坐标兼容**: MongoDB 使用 XYZ 坐标系，与 MBTiles 完全兼容
+- **自动清空集合**: 每次写入前自动清空 MongoDB 集合，确保数据一致性
 
-### 1. 数据输入
-- **仅支持 PostGIS 输入**（强制要求）
-- 支持表查询和自定义 SQL 查询
-- 支持多种几何类型（点、线、面）
+## 输入输出模式
 
-### 2. 数据输出
-- **强制 MongoDB 输出**（主要输出目标）
-- 可选 MBTiles 文件输出（通过 `-o` 参数）
-- 支持双写模式（同时输出到 MongoDB 和文件）
+### 输入（强制）
+- **PostGIS 数据库**: 唯一的输入源
+  - 支持表查询和自定义 SQL 查询
+  - 支持多种几何类型：点、线串、多边形、几何集合
+  - 通过 libpq 库直接连接 PostgreSQL/PostGIS
 
-### 3. 性能优化
-- **批量写入**：默认每 100 个瓦片批量插入
-- **连接池**：可配置连接池大小（默认 10）
-- **多线程**：并行处理瓦片生成
-- **线程安全**：每个线程独立的 MongoDB 客户端
-
-### 4. 数据可靠性
-- **写确认级别**：可配置 w:0/w:1/w:majority
-- **自动重试**：网络错误自动重试（默认 3 次）
-- **异常处理**：完善的错误处理和日志记录
-- **索引管理**：自动创建唯一索引防止重复
+### 输出（强制 + 可选）
+- **MongoDB**（强制）: 主要输出目标
+  - 批量写入，线程安全
+  - 自动索引管理
+  - 支持副本集和分片
+- **MBTiles**（可选）: 通过 `-o` 参数指定
+  - SQLite 文件格式
+  - 与 MongoDB 输出完全兼容
+- **PMTiles**（可选）: 通过 `-e` 参数指定目录
+  - 云优化瓦片格式
 
 ## 安装依赖
 
@@ -36,6 +39,18 @@
 # 包含 libmongocxx 和 libbsoncxx
 ```
 
+### PostgreSQL 客户端库
+```bash
+# Ubuntu/Debian
+sudo apt-get install libpq-dev
+
+# CentOS/RHEL
+sudo yum install postgresql-devel
+
+# macOS
+brew install postgresql
+```
+
 ### 编译
 ```bash
 make tippecanoe-db
@@ -43,14 +58,14 @@ make tippecanoe-db
 
 ## 命令行参数
 
-### PostGIS 输入参数
+### PostGIS 输入参数（必需）
 
 #### 单行配置（简化版）
 ```bash
 --postgis "host:port:dbname:user:password[:table:geometry_field]"
 ```
 
-**注意**：单行配置最多支持 7 个部分（host:port:dbname:user:password:table:geometry_field），**不支持 condition**。如需 WHERE 条件，请使用 `--postgis-sql` 参数。
+**注意**：单行配置最多支持 7 个部分（host:port:dbname:user:password:table:geometry_field）。如需 WHERE 条件，请使用 `--postgis-sql` 参数。
 
 **示例**：
 ```bash
@@ -69,13 +84,11 @@ make tippecanoe-db
 --postgis-password <pwd>      # 密码（必需）
 ```
 
-**可选参数（7 个）**：
+**可选参数（3 个）**：
 ```bash
 --postgis-table <table>              # 表名（与 geometry-field 一起使用时自动生成 SQL）
 --postgis-geometry-field <geom>      # 几何字段名 (默认：geometry)
 --postgis-sql <query>                # 自定义 SQL 查询（推荐，可包含 WHERE 条件）
---postgis-batch-size <N>             # 每批次处理要素数 (默认：1000)
---postgis-max-memory-mb <MB>         # 最大内存使用 MB (默认：512)
 ```
 
 **WHERE 条件实现方式**：
@@ -83,29 +96,55 @@ make tippecanoe-db
 # ✅ 推荐：使用 --postgis-sql
 --postgis-sql "SELECT id, name, ST_AsGeoJSON(geom) as geojson FROM buildings WHERE height > 50"
 
-# ❌ 不支持：单行配置中的 condition 部分会被忽略
+# ❌ 不支持：单行配置中的 condition 部分
 ```
 
-### MongoDB 输出参数
+### MongoDB 输出参数（必需）
 
-#### 单行配置（推荐）
+#### 单行配置（严格格式）
 ```bash
---mongo "host:port:dbname:user:password[:collection]"
+--mongo "host:port:dbname:user:password:auth_source:collection"
 ```
 
-**格式说明**：
+**注意**：必须严格提供 7 个部分，用冒号分隔。程序会自动在写入前清空集合。
+
+**格式说明**（必须 7 部分）：
 - `host`: MongoDB 主机名或 IP 地址（必需）
 - `port`: MongoDB 端口号（必需，默认 27017）
 - `dbname`: 数据库名称（必需）
 - `user`: 用户名（必需）
 - `password`: 密码（必需）
-- `collection`: Collection 名称（可选，默认 tiles）
+- `auth_source`: 认证源数据库（必需）
+- `collection`: Collection 名称（必需）
 
 **示例**：
 ```bash
---mongo "localhost:27017:gis:admin:secret:tiles"
---mongo "192.168.1.100:27017:mydb:user123:pass456:mycollection"
+# 标准 7 部分格式
+--mongo "localhost:27017:gis:user:pass:admin:china"
+
+# 测试环境
+--mongo "localhost:27017:test:test:test:admin:test_tiles"
+
+# 生产环境
+--mongo "mongodb.example.com:27017:production:admin:secret:admin:production_tiles"
 ```
+
+**错误示例**（会立即退出并报错）：
+```bash
+# ❌ 5 部分：缺少 auth_source 和 collection
+--mongo "localhost:27017:test:test:test:test"
+
+# ❌ 6 部分：缺少 collection
+--mongo "localhost:27017:test:test:test:test:admin"
+
+# ❌ 8 部分：多余的 drop 标志
+--mongo "localhost:27017:test:test:test:test:admin:china:drop"
+```
+
+**重要特性**：
+- 使用 `--mongo` 参数时，程序会**自动清空集合**后再写入新数据
+- 无需手动指定 `--mongo-drop-collection` 参数
+- 确保每次运行都是干净的数据集
 
 #### 单独参数
 
@@ -143,15 +182,18 @@ make tippecanoe-db
 --mongo-wtimeout <ms>         # 写确认超时 ms (默认：5000)
 ```
 
-**其他配置**（2 个）：
+**可选参数**（2 个）：
 ```bash
 --mongo-no-indexes            # 不自动创建索引（手动预创建时使用）
+--mongo-drop-collection       # 写入前清空集合（已自动启用，无需手动指定）
 ```
+
+**注意**：使用 `--mongo` 单行配置时，`drop_collection_before_write` 会自动设置为 `true`，因此通常不需要手动指定 `--mongo-drop-collection` 参数。
 
 ### 其他参数
 
 ```bash
-# 输出选项
+# 输出选项（可选）
 -o <file.mbtiles>             # 同时输出到 MBTiles 文件
 -e <directory>                # 同时输出到目录结构
 
@@ -175,36 +217,38 @@ make tippecanoe-db
 
 ## 使用示例
 
-### 1. 基本用法
+### 1. 基本用法（最小配置）
 ```bash
 ./tippecanoe-db \
-  --mongo "localhost:27017:gis:admin:secret:tiles" \
   --postgis "localhost:5432:gis:postgres:secret:buildings:geom" \
+  --mongo "localhost:27017:gis:postgres:secret:admin:tiles" \
   -z 14
 ```
+
+**注意**：MongoDB 连接字符串必须包含 7 个部分：host:port:dbname:user:password:auth_source:collection
 
 ### 2. 自定义 SQL 查询
 ```bash
 ./tippecanoe-db \
-  --mongo "localhost:27017:gis:admin:secret:tiles" \
   --postgis-host localhost \
   --postgis-port 5432 \
   --postgis-dbname gis \
   --postgis-user postgres \
   --postgis-password secret \
-  --postgis-sql "SELECT id, name, geom FROM buildings WHERE height > 10" \
+  --postgis-sql "SELECT id, name, ST_AsGeoJSON(geom) as geojson FROM buildings WHERE height > 10" \
   --postgis-geometry-field geom \
+  --mongo "localhost:27017:gis:postgres:secret:admin:tiles" \
   -z 16
 ```
 
 ### 3. 高性能配置
 ```bash
 ./tippecanoe-db \
-  --mongo "localhost:27017:gis:admin:secret:tiles" \
+  --postgis "localhost:5432:gis:postgres:secret:roads:geom" \
+  --mongo "localhost:27017:gis:postgres:secret:admin:tiles" \
   --mongo-batch-size 200 \
   --mongo-pool-size 20 \
   --mongo-write-concern=1 \
-  --postgis "localhost:5432:gis:postgres:secret:roads:geom" \
   -z 14 \
   --cluster-maxzoom 12
 ```
@@ -212,29 +256,39 @@ make tippecanoe-db
 ### 4. 高安全配置（金融数据）
 ```bash
 ./tippecanoe-db \
-  --mongo "localhost:27017:gis:admin:secret:tiles" \
+  --postgis "localhost:5432:gis:postgres:secret:parcels:geom" \
+  --mongo "localhost:27017:gis:postgres:secret:admin:tiles" \
   --mongo-write-concern=2 \
   --mongo-journal \
   --mongo-wtimeout=5000 \
-  --postgis "localhost:5432:gis:postgres:secret:parcels:geom" \
   -z 18
 ```
 
-### 5. 双写模式（MongoDB + 文件）
+### 5. 双写模式（MongoDB + MBTiles）
 ```bash
 ./tippecanoe-db \
-  --mongo "localhost:27017:gis:admin:secret:tiles" \
-  -o output.mbtiles \
   --postgis "localhost:5432:gis:postgres:secret:landuse:geom" \
+  --mongo "localhost:27017:gis:postgres:secret:admin:tiles" \
+  -o output.mbtiles \
   -z 14
 ```
 
-### 6. 禁用自动索引
+### 6. 自动清空集合（无需额外参数）
 ```bash
 ./tippecanoe-db \
-  --mongo "localhost:27017:gis:admin:secret:tiles" \
-  --mongo-no-indexes \
   --postgis "localhost:5432:gis:postgres:secret:points:geom" \
+  --mongo "localhost:27017:gis:admin:secret:tiles" \
+  -z 12
+```
+
+**注意**：使用 `--mongo` 参数时，程序会自动在写入前清空集合，无需在连接字符串中添加 `:drop` 标志。
+
+### 7. 禁用自动索引
+```bash
+./tippecanoe-db \
+  --postgis "localhost:5432:gis:postgres:secret:points:geom" \
+  --mongo "localhost:27017:gis:postgres:secret:admin:tiles" \
+  --mongo-no-indexes \
   -z 12
 ```
 
@@ -244,12 +298,14 @@ make tippecanoe-db
 ```javascript
 {
   _id: ObjectId,           // MongoDB 自动生成
-  x: <int>,                // 瓦片 X 坐标
-  y: <int>,                // 瓦片 Y 坐标（TMS 翻转）
+  x: <int>,                // 瓦片 X 坐标（XYZ 坐标系）
+  y: <int>,                // 瓦片 Y 坐标（XYZ 坐标系，不翻转）
   z: <int>,                // 缩放级别
   d: <Binary>              // PBF 瓦片数据
 }
 ```
+
+**重要**: 坐标系统使用 **XYZ（Google/OSM）**，与 MBTiles 完全兼容，**不做 Y 坐标翻转**。
 
 ### 索引策略
 
@@ -260,12 +316,14 @@ make tippecanoe-db
    ```
    - 防止重复瓦片写入
    - 错误码：11000（重复键）
+   - 确保数据一致性
 
 2. **zoom_level** (普通索引)
    ```javascript
    { z: 1 }
    ```
    - 加速按缩放级别查询
+   - 优化范围查询
 
 #### 手动创建索引（可选）
 ```javascript
@@ -274,6 +332,12 @@ db.tiles.createIndex({ z: 1, x: 1, y: 1 })
 
 // 统计查询优化
 db.tiles.createIndex({ z: 1, x: 1 })
+```
+
+#### 禁用自动索引
+```bash
+# 如果索引已存在，可以跳过创建
+./tippecanoe-db --mongo "..." --mongo-no-indexes ...
 ```
 
 ## 性能调优
@@ -325,8 +389,8 @@ MongoDB flush_batch failed: E11000 duplicate key error
 ```
 **解决**：
 - 正常情况，瓦片已存在
-- 程序会自动跳过
-- 如需覆盖，先清空集合
+- 程序会自动跳过（无序插入模式）
+- 如需覆盖，使用 `--mongo-drop-collection` 清空集合
 
 #### 4. PostGIS 连接失败
 ```
@@ -337,9 +401,27 @@ Connection to database failed: FATAL: password authentication failed
 - 确认 pg_hba.conf 配置
 - 验证用户权限
 
+#### 5. PostGIS 配置缺失
+```
+Error: PostGIS configuration is required
+Error: Either PostGIS table or SQL query is required
+```
+**解决**：
+- 必须提供 `--postgis` 参数或单独的 PostGIS 参数
+- 必须指定 `--postgis-table` 或 `--postgis-sql`
+
+#### 6. MongoDB 输出缺失
+```
+Error: MongoDB output is required. Use --omongo to enable MongoDB output
+```
+**解决**：
+- 必须提供 `--mongo` 参数或单独的 MongoDB 参数
+- MongoDB 输出是强制要求的
+
 ### 重试机制
 - 默认重试次数：3 次
-- 重试间隔：100ms × 重试次数
+- 重试间隔：100ms × 重试次数（指数退避）
+- 最大等待时间：5 秒
 - 失败后程序退出（EXIT_MONGO）
 
 ## 监控与日志
@@ -377,37 +459,47 @@ mongosh
 
 # 运行程序
 ./tippecanoe-db \
-  --mongo "localhost:27017:gis:admin:secret:tiles" \
+  --postgis "localhost:5432:gis:postgres:secret:buildings:geom" \
+  --mongo "localhost:27017:gis:postgres:secret:admin:tiles" \
   --mongo-no-indexes \
   --mongo-write-concern=1 \
   --mongo-pool-size=20 \
-  --postgis "localhost:5432:gis:postgres:secret:buildings:geom" \
   -z 14
 ```
 
-### 2. 批量处理
+### 2. 增量更新
 ```bash
-# 使用脚本批量处理多个表
-for table in buildings roads landuse; do
-  ./tippecanoe-db \
-    --mongo "localhost:27017:gis:admin:secret:tiles" \
-    --postgis "localhost:5432:gis:postgres:secret:${table}:geom" \
-    -z 14
-done
+# 方法 1: 自动清空集合（默认行为）
+./tippecanoe-db \
+  --postgis "localhost:5432:gis:postgres:secret:updated_buildings:geom" \
+  --mongo "localhost:27017:gis:admin:secret:tiles" \
+  -z 14
 ```
 
-### 3. 增量更新
+**注意**：程序默认会在每次写入前清空集合，因此重新运行命令会自动替换旧数据。
+
 ```bash
-# 先删除旧数据
+# 方法 2: 手动删除旧数据
 mongosh
 > use gis
 > db.tiles.deleteMany({z: {$gte: 10, $lte: 14}})
 
 # 重新生成
 ./tippecanoe-db \
-  --mongo "localhost:27017:gis:admin:secret:tiles" \
   --postgis "localhost:5432:gis:postgres:secret:updated_buildings:geom" \
+  --mongo "localhost:27017:gis:admin:secret:tiles" \
   -z 14
+```
+
+### 3. 批量处理多个表
+```bash
+# 使用脚本批量处理多个表
+for table in buildings roads landuse; do
+  ./tippecanoe-db \
+    --postgis "localhost:5432:gis:postgres:secret:${table}:geom" \
+    --mongo "localhost:27017:gis:postgres:secret:admin:tiles" \
+    -z 14
+done
 ```
 
 ## 故障排查
@@ -447,18 +539,19 @@ mongosh
 - `mongo.cpp` - MongoDB 写入器实现
 - `postgis.hpp` - PostGIS 读取器头文件
 - `postgis.cpp` - PostGIS 读取器实现
+- `tile-db.hpp` - MongoDB 瓦片数据库接口
 - `Makefile` - 构建配置
 
 ## 相关文档
 
-- [MONGO_OUTPUT.md](MONGO_OUTPUT.md) - MongoDB 输出功能详细说明
+- [mongo.md](mongo.md) - MongoDB 支持详细说明
 - [postgis.md](postgis.md) - PostGIS 参数配置说明
-- [MONGO_EVALUATION.md](MONGO_EVALUATION.md) - 实现评估报告
 
 ## 版本信息
 
 - **基于版本**: tippecanoe 最新源码
 - **MongoDB Driver**: mongocxx v3.x
+- **PostgreSQL Driver**: libpq
 - **C++ 标准**: C++17
 - **编译日期**: 见构建输出
 

@@ -2879,15 +2879,21 @@ long long write_tile(decompressor *geoms, std::atomic<long long> *geompos_in, ch
 						if (thread_mongo_writer) {
 							thread_mongo_writer->write_tile(z, tx, ty, compressed.data(), compressed.size());
 						} else {
-							fprintf(stderr, "Error: Failed to get MongoDB thread-local instance\n");
-							exit(EXIT_MONGO);
+							fprintf(stderr, "Warning: Failed to get MongoDB thread-local instance for tile %d/%u/%u\n", 
+							        z, tx, ty);
+							// 不退出，继续处理其他瓦片
 						}
 					} catch (const std::exception &e) {
-						fprintf(stderr, "Error: MongoDB write_tile failed: %s\n", e.what());
-						exit(EXIT_MONGO);
+						// MongoWriter 内部已处理错误和重试
+						// 这里只记录警告，不中断整个处理流程
+						fprintf(stderr, "Warning: MongoDB write failed for tile %d/%u/%u: %s\n", 
+						        z, tx, ty, e.what());
+						// 不退出，继续处理其他瓦片
+						// 错误统计由 MongoWriter 内部处理
 					} catch (...) {
-						fprintf(stderr, "Error: MongoDB write_tile failed with unknown error\n");
-						exit(EXIT_MONGO);
+						fprintf(stderr, "Warning: MongoDB write failed with unknown error for tile %d/%u/%u\n", 
+						        z, tx, ty);
+						// 不退出，继续处理其他瓦片
 					}
 				}
 

@@ -13,6 +13,12 @@ std::atomic_flag MongoWriter::collection_dropped = ATOMIC_FLAG_INIT;
 // 线程本地 MongoWriter 实例
 thread_local static std::unique_ptr<MongoWriter> tls_mongo_writer;
 
+// 全局统计信息（原子变量）
+static std::atomic<size_t> global_total_tiles{0};
+static std::atomic<size_t> global_total_batches{0};
+static std::atomic<size_t> global_total_retries{0};
+static std::atomic<size_t> global_total_errors{0};
+
 // 获取线程本地实例
 MongoWriter* MongoWriter::get_thread_local_instance(const mongo_config &cfg) {
     if (!tls_mongo_writer) {
@@ -20,6 +26,23 @@ MongoWriter* MongoWriter::get_thread_local_instance(const mongo_config &cfg) {
         tls_mongo_writer->initialize_thread();
     }
     return tls_mongo_writer.get();
+}
+
+// 获取全局统计信息
+size_t MongoWriter::get_global_total_tiles() {
+    return global_total_tiles.load();
+}
+
+size_t MongoWriter::get_global_total_batches() {
+    return global_total_batches.load();
+}
+
+size_t MongoWriter::get_global_total_retries() {
+    return global_total_retries.load();
+}
+
+size_t MongoWriter::get_global_total_errors() {
+    return global_total_errors.load();
 }
 
 // 销毁线程本地实例
@@ -30,6 +53,13 @@ void MongoWriter::destroy_thread_local_instances() {
     // 主线程应该在退出前调用此函数
     if (tls_mongo_writer) {
         tls_mongo_writer->flush_all();
+        
+        // 累加统计信息到全局变量
+        global_total_tiles += tls_mongo_writer->getTotalTilesWritten();
+        global_total_batches += tls_mongo_writer->getTotalBatchesWritten();
+        global_total_retries += tls_mongo_writer->getTotalRetries();
+        global_total_errors += tls_mongo_writer->getTotalErrors();
+        
         tls_mongo_writer->close();
         tls_mongo_writer.reset();
     }
@@ -196,15 +226,8 @@ void MongoWriter::flush_all() noexcept
         }
     }
     
-    // 输出统计信息
-    if (config.enable_progress_report && !quiet) {
-        fprintf(stderr, "MongoDB: 已写入 %zu 个瓦片，共 %zu 个批次\n", 
-                total_tiles_written.load(), total_batches_written.load());
-        if (total_retries.load() > 0) {
-            fprintf(stderr, "MongoDB: 重试 %zu 次，错误 %zu 次\n", 
-                    total_retries.load(), total_errors.load());
-        }
-    }
+    // 输出统计信息（仅在最后一次 flush_all 时输出）
+    // 注意：调用者应在程序退出前统一输出统计信息
 }
 
 void MongoWriter::close() noexcept
@@ -445,8 +468,8 @@ void MongoWriter::erase_zoom(int z)
         auto result = collection.delete_many(filter.view());
         
         if (!quiet) {
-            fprintf(stderr, "MongoDB: 删除了 z=%d 的 %lld 个瓦片\n", 
-                    z, result->deleted_count());
+            fprintf(stderr, "MongoDB: 删除了 z=%d 的 %d 个瓦片\n", 
+                    z, static_cast<int>(result->deleted_count()));
         }
     } catch (const std::exception &e) {
         if (!quiet) {
