@@ -45,7 +45,7 @@
 #include "jsonpull/jsonpull.h"
 #include "mbtiles.hpp"
 #include "pmtiles_file.hpp"
-#include "tile.hpp"
+#include "tile-db.hpp"  // 使用 MongoDB 版本
 #include "pool.hpp"
 #include "projection.hpp"
 #include "memfile.hpp"
@@ -67,6 +67,7 @@
 #include "attribute.hpp"
 #include "thread.hpp"
 #include "platform.hpp"
+#include "mongo.hpp"
 
 static int low_detail = 12;
 static int full_detail = -1;
@@ -102,6 +103,13 @@ size_t maximum_string_attribute_length = 0;
 // PostGIS configuration
 bool use_postgis = false;
 postgis_config postgis_cfg{};
+
+// MongoDB configuration
+bool use_mongo = false;
+mongo_config mongo_cfg{};
+
+// Global MongoWriter instance (will be initialized after argument parsing)
+std::unique_ptr<MongoWriter> mongo_writer;
 
 std::vector<order_field> order_by;
 bool order_reverse;
@@ -1103,6 +1111,31 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 		fprintf(stderr, "Error: PostGIS geometry field is required\n");
 		exit(EXIT_ARGS);
 	}
+
+	// MongoDB configuration validation (forced MongoDB output)
+	if (!use_mongo) {
+		fprintf(stderr, "Error: MongoDB output is required. Use --omongo to enable MongoDB output\n");
+		exit(EXIT_ARGS);
+	}
+
+	// Validate MongoDB configuration
+	if (mongo_cfg.dbname.empty()) {
+		fprintf(stderr, "Error: MongoDB database name is required\n");
+		exit(EXIT_ARGS);
+	}
+	if (mongo_cfg.batch_size < MIN_MONGO_BATCH_SIZE) {
+		mongo_cfg.batch_size = MIN_MONGO_BATCH_SIZE;
+	} else if (mongo_cfg.batch_size > MAX_MONGO_BATCH_SIZE) {
+		mongo_cfg.batch_size = MAX_MONGO_BATCH_SIZE;
+	}
+
+	if (!quiet) {
+		fprintf(stderr, "MongoDB output enabled: %s.%s (batch size: %zu)\n", 
+				mongo_cfg.dbname.c_str(), mongo_cfg.collection.c_str(), mongo_cfg.batch_size);
+	}
+
+	// 注意：MongoDB 的初始化和生命周期管理在 maindb() 函数中处理
+	// 这里只验证配置，不创建连接
 
 	if (!quiet) {
 		fprintf(stderr, "Reading from PostGIS database: %s@%s:%s/%s\n", 
@@ -2324,6 +2357,24 @@ int maindb(int argc, char **argv) {
 		{"postgis-geometry-field", required_argument, 0, '~'},
 		{"postgis-sql", required_argument, 0, '~'},
 
+		{"MongoDB output", 0, 0, 0},
+		{"mongo", required_argument, 0, '~'},
+		{"mongo-host", required_argument, 0, '~'},
+		{"mongo-port", required_argument, 0, '~'},
+		{"mongo-dbname", required_argument, 0, '~'},
+		{"mongo-collection", required_argument, 0, '~'},
+		{"mongo-username", required_argument, 0, '~'},
+		{"mongo-password", required_argument, 0, '~'},
+		{"mongo-auth-source", required_argument, 0, '~'},
+		{"mongo-batch-size", required_argument, 0, '~'},
+		{"mongo-pool-size", required_argument, 0, '~'},
+		{"mongo-timeout", required_argument, 0, '~'},
+		{"mongo-no-indexes", no_argument, 0, '~'},
+		{"mongo-write-concern", required_argument, 0, '~'},
+		{"mongo-journal", no_argument, 0, '~'},
+		{"mongo-wtimeout", required_argument, 0, '~'},
+		{"mongo-drop-collection", no_argument, 0, '~'},
+
 		{"Projection of input", 0, 0, 0},
 		{"projection", required_argument, 0, 's'},
 
@@ -2638,6 +2689,67 @@ int maindb(int argc, char **argv) {
 			} else if (strcmp(opt, "postgis-sql") == 0) {
 				postgis_cfg.sql = optarg;
 				use_postgis = true;
+			} else if (strcmp(opt, "omongo") == 0) {
+				use_mongo = true;
+			} else if (strcmp(opt, "mongo") == 0) {
+				// 解析单行配置：host:port:dbname:user:password:collection
+				if (!mongo_cfg.parse_connection_string(optarg)) {
+					fprintf(stderr, "Error: Invalid MongoDB connection string format\n");
+					fprintf(stderr, "Expected format: host:port:dbname:user:password[:collection]\n");
+					fprintf(stderr, "Example: localhost:27017:gis:admin:secret:tiles\n");
+					exit(EXIT_ARGS);
+				}
+				use_mongo = true;
+			} else if (strcmp(opt, "mongo-host") == 0) {
+				mongo_cfg.host = optarg;
+				use_mongo = true;
+			} else if (strcmp(opt, "mongo-port") == 0) {
+				mongo_cfg.port = atoi_require(optarg, "MongoDB port");
+				use_mongo = true;
+			} else if (strcmp(opt, "mongo-dbname") == 0) {
+				mongo_cfg.dbname = optarg;
+				use_mongo = true;
+			} else if (strcmp(opt, "mongo-collection") == 0) {
+				mongo_cfg.collection = optarg;
+				use_mongo = true;
+			} else if (strcmp(opt, "mongo-username") == 0) {
+				mongo_cfg.username = optarg;
+				use_mongo = true;
+			} else if (strcmp(opt, "mongo-password") == 0) {
+				mongo_cfg.password = optarg;
+				use_mongo = true;
+			} else if (strcmp(opt, "mongo-auth-source") == 0) {
+				mongo_cfg.auth_source = optarg;
+				use_mongo = true;
+			} else if (strcmp(opt, "mongo-batch-size") == 0) {
+				mongo_cfg.batch_size = atoi_require(optarg, "MongoDB batch size");
+				use_mongo = true;
+			} else if (strcmp(opt, "mongo-pool-size") == 0) {
+				mongo_cfg.connection_pool_size = atoi_require(optarg, "MongoDB connection pool size");
+				use_mongo = true;
+			} else if (strcmp(opt, "mongo-timeout") == 0) {
+				mongo_cfg.timeout_ms = atoi_require(optarg, "MongoDB timeout");
+				use_mongo = true;
+			} else if (strcmp(opt, "mongo-no-indexes") == 0) {
+				mongo_cfg.create_indexes = false;
+				use_mongo = true;
+			} else if (strcmp(opt, "mongo-write-concern") == 0) {
+				int wc_level = atoi_require(optarg, "MongoDB write concern level");
+				if (wc_level < 0 || wc_level > 2) {
+					fprintf(stderr, "Error: Invalid write concern level (must be 0, 1, or 2)\n");
+					exit(EXIT_ARGS);
+				}
+				mongo_cfg.write_concern_level = static_cast<WriteConcernLevel>(wc_level);
+				use_mongo = true;
+			} else if (strcmp(opt, "mongo-journal") == 0) {
+				mongo_cfg.journal = true;
+				use_mongo = true;
+			} else if (strcmp(opt, "mongo-wtimeout") == 0) {
+				mongo_cfg.wtimeout_ms = atoi_require(optarg, "MongoDB wtimeout");
+				use_mongo = true;
+			} else if (strcmp(opt, "mongo-drop-collection") == 0) {
+				mongo_cfg.drop_collection_before_write = true;
+				use_mongo = true;
 			} else {
 				fprintf(stderr, "%s: Unrecognized option --%s\n", argv[0], opt);
 				exit(EXIT_ARGS);
@@ -3080,8 +3192,8 @@ int maindb(int argc, char **argv) {
 		fprintf(stderr, "Forcing -g0 since -B or -r is not known\n");
 	}
 
-	if (out_mbtiles == NULL && out_dir == NULL) {
-		fprintf(stderr, "%s: must specify -o out.mbtiles or -e directory\n", argv[0]);
+	if (out_mbtiles == NULL && out_dir == NULL && !use_mongo) {
+		fprintf(stderr, "%s: must specify -o out.mbtiles or -e directory (or use --omongo for MongoDB output)\n", av[0]);
 		exit(EXIT_ARGS);
 	}
 
@@ -3112,6 +3224,19 @@ int maindb(int argc, char **argv) {
 	long long file_bbox1[4] = {0xFFFFFFFF, 0xFFFFFFFF, 0, 0};	      // standard -180 to 180 world plane
 	long long file_bbox2[4] = {0x1FFFFFFFF, 0xFFFFFFFF, 0x100000000, 0};  // 0 to 360 world plane
 
+	// 1. 初始化 MongoDB（在 read_input 之前，因为 read_input 会调用 traverse_zooms）
+	if (use_mongo) {
+		if (!quiet) {
+			fprintf(stderr, "Initializing MongoDB for tile output...\n");
+		}
+		MongoWriter::initialize_global();
+		mongo_writer = std::make_unique<MongoWriter>(mongo_cfg);
+		// 注意：不在这里调用 initialize_thread()
+		// 工作线程会在 run_thread() 中自行初始化线程本地实例
+	}
+
+	// 2. 调用 read_input() 读取 PostGIS 数据并写入瓦片
+	// read_input 内部会调用 traverse_zooms 进行瓦片写入
 	auto input_ret = read_input(sources, name ? name : out_mbtiles ? out_mbtiles
 					       : out_dir,
 		    maxzoom, minzoom, basezoom, basezoom_marker_width, outdb, out_dir, &exclude, &include, exclude_all, filter, droprate, buffer, tmpdir, gamma, forcetable, attribution, gamma != 0, file_bbox, file_bbox1, file_bbox2, prefilter, postfilter, description, guess_maxzoom, guess_cluster_maxzoom, &attribute_types, argv[0], &attribute_accum, attribute_descriptions, commandline, minimum_maxzoom);
@@ -3139,6 +3264,32 @@ int maindb(int argc, char **argv) {
 
 	if (filter != NULL) {
 		json_free(filter);
+	}
+
+	// 3. 检查 MongoDB 错误统计（在清理之前）
+	if (use_mongo && mongo_writer) {
+		size_t mongo_errors = mongo_writer->getTotalErrors();
+		if (mongo_errors > 0) {
+			fprintf(stderr, "Error: MongoDB had %zu errors during write operations\n", mongo_errors);
+			if (ret == 0) {
+				ret = EXIT_MONGO;
+			}
+		}
+	}
+
+	// 4. 清理 MongoDB 资源（在返回之前）
+	if (use_mongo && mongo_writer) {
+		if (!quiet) {
+			fprintf(stderr, "\nMongoDB 统计信息:\n");
+			fprintf(stderr, "  写入瓦片数：%zu\n", mongo_writer->getTotalTilesWritten());
+			fprintf(stderr, "  批量写入次数：%zu\n", mongo_writer->getTotalBatchesWritten());
+			fprintf(stderr, "  重试次数：%zu\n", mongo_writer->getTotalRetries());
+			fprintf(stderr, "  错误次数：%zu\n", mongo_writer->getTotalErrors());
+		}
+		mongo_writer->flush_all();
+		mongo_writer->close();
+		mongo_writer.reset();
+		MongoWriter::destroy_thread_local_instances();
 	}
 
 	return ret;

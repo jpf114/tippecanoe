@@ -51,3 +51,4 @@ tests/**/*.geobuf
 
 # Nodejs
 node_modules
+/bin
