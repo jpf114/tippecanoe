@@ -71,6 +71,92 @@ struct mongo_config {
 - **内存管理**：预分配缓冲区内存，提高性能
 - **异常安全**：析构函数和关键函数使用 `noexcept` 保证异常安全
 
+#### 核心 API 函数
+
+##### 1. 实例管理
+
+```cpp
+// 获取线程本地的 MongoWriter 实例（TLS 模式）
+// 参数：cfg - MongoDB 配置参数
+static MongoWriter* get_thread_local_instance(const mongo_config &cfg);
+
+// 销毁线程本地的 MongoWriter 实例（线程结束时调用）
+static void destroy_thread_local_instances();
+
+// 初始化全局 MongoDB 实例（只调用一次）
+static void initialize_global();
+```
+
+##### 2. 连接管理
+
+```cpp
+// 构造函数：验证配置，设置批次大小范围
+MongoWriter::MongoWriter(const mongo_config &cfg);
+
+// 析构函数：刷新数据，释放连接（noexcept）
+MongoWriter::~MongoWriter() noexcept;
+
+// 初始化线程本地连接：创建连接、清空集合、创建索引
+void MongoWriter::initialize_thread();
+
+// 关闭 MongoDB 连接（noexcept）
+void MongoWriter::close() noexcept;
+```
+
+##### 3. 数据写入
+
+```cpp
+// 写入单个瓦片数据
+// 参数：z - Zoom 级别，x/y - XYZ 坐标，data - 瓦片数据，len - 数据长度
+void MongoWriter::write_tile(int z, int x, int y, const char *data, size_t len);
+
+// 刷新所有待写入的数据（noexcept）
+void MongoWriter::flush_all() noexcept;
+
+// 刷新批量缓冲区（失败时自动重试）
+void MongoWriter::flush_batch();
+```
+
+##### 4. 重连机制
+
+```cpp
+// 重新连接 MongoDB（指数退避策略）
+// 等待时间：100ms * 2^retries，最大 5 秒
+void MongoWriter::reconnect();
+```
+
+##### 5. 索引管理
+
+```cpp
+// 创建 MongoDB 索引（如果需要）
+// 创建：唯一索引 (z,x,y) 和查询索引 (z)
+void MongoWriter::create_indexes_if_needed();
+```
+
+##### 6. 数据删除
+
+```cpp
+// 删除指定 Zoom 级别的所有瓦片
+// 参数：z - 要删除的 Zoom 级别
+void MongoWriter::erase_zoom(int z);
+```
+
+##### 7. 统计信息
+
+```cpp
+// 获取全局累计写入的瓦片总数
+static size_t get_global_total_tiles();
+
+// 获取全局累计写入的批次总数
+static size_t get_global_total_batches();
+
+// 获取全局累计重试次数
+static size_t get_global_total_retries();
+
+// 获取全局累计错误次数
+static size_t get_global_total_errors();
+```
+
 #### 瓦片数据结构
 
 MongoDB 中每个瓦片存储为一个文档：

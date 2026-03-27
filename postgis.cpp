@@ -8,9 +8,16 @@
 #include "serial.hpp"
 #include "geojson.hpp"
 
+/**
+ * @brief PostGIS 读取器构造函数
+ * 
+ * 初始化 PostGIS 读取器，配置数据库连接参数和性能优化参数
+ * 自动调整批次大小到合理范围内（MIN_BATCH_SIZE 到 MAX_BATCH_SIZE）
+ * 
+ * @param cfg PostGIS 配置结构，包含数据库连接信息和性能参数
+ */
 PostGISReader::PostGISReader(const postgis_config &cfg) : config(cfg), conn(NULL)
 {
-    // Validate and adjust batch size
     if (config.batch_size < MIN_BATCH_SIZE)
     {
         config.batch_size = MIN_BATCH_SIZE;
@@ -21,6 +28,11 @@ PostGISReader::PostGISReader(const postgis_config &cfg) : config(cfg), conn(NULL
     }
 }
 
+/**
+ * @brief PostGIS 读取器析构函数
+ * 
+ * 释放数据库连接资源，确保没有内存泄漏
+ */
 PostGISReader::~PostGISReader()
 {
     if (conn)
@@ -29,9 +41,15 @@ PostGISReader::~PostGISReader()
     }
 }
 
+/**
+ * @brief 连接到 PostgreSQL/PostGIS 数据库
+ * 
+ * 使用配置的连接参数建立数据库连接，设置 30 秒连接超时
+ * 
+ * @return bool 连接成功返回 true，失败返回 false
+ */
 bool PostGISReader::connect()
 {
-    // Use PQconnectdbParams for safer connection string construction
     const char *keywords[] = {"host", "port", "dbname", "user", "password", "connect_timeout", NULL};
     const char *values[] = {
         config.host.c_str(),
@@ -52,9 +70,15 @@ bool PostGISReader::connect()
     return true;
 }
 
+/**
+ * @brief 检查内存使用情况
+ * 
+ * 检查当前内存使用是否超过配置的最大限制
+ * 
+ * @return bool 内存使用正常返回 true，超出限制返回 false
+ */
 bool PostGISReader::check_memory_usage()
 {
-    // Estimate current memory usage (simplified)
     size_t estimated = current_memory_usage.load();
     size_t limit = config.max_memory_mb * 1024 * 1024;
     
@@ -67,6 +91,15 @@ bool PostGISReader::check_memory_usage()
     return true;
 }
 
+/**
+ * @brief 记录处理进度
+ * 
+ * 当启用进度报告时，显示当前处理阶段的进度信息
+ * 
+ * @param processed 已处理的要素数量
+ * @param total 总要素数量（如果为 0 则不显示百分比）
+ * @param stage 当前处理阶段的描述
+ */
 void PostGISReader::log_progress(size_t processed, size_t total, const char *stage)
 {
     if (!config.enable_progress_report)
@@ -83,6 +116,15 @@ void PostGISReader::log_progress(size_t processed, size_t total, const char *sta
     }
 }
 
+/**
+ * @brief 转义 JSON 字符串
+ * 
+ * 对字符串中的特殊字符进行 JSON 转义，确保生成的 JSON 格式正确
+ * 支持转义：双引号、反斜杠、换行符、回车符、制表符等
+ * 
+ * @param value 需要转义的原始字符串
+ * @return std::string 转义后的字符串
+ */
 std::string PostGISReader::escape_json_string(const char *value)
 {
     if (!value)
@@ -119,7 +161,6 @@ std::string PostGISReader::escape_json_string(const char *value)
             result += "\\t";
             break;
         default:
-            // Handle control characters
             if (c < 0x20)
             {
                 char buf[8];
@@ -137,28 +178,38 @@ std::string PostGISReader::escape_json_string(const char *value)
     return result;
 }
 
+/**
+ * @brief 处理单个要素
+ * 
+ * 从数据库查询结果中提取单个要素，构建 GeoJSON Feature 格式，
+ * 并调用解析器将其转换为 Tippecanoe 内部格式
+ * 
+ * @param res PostgreSQL 查询结果集
+ * @param row 当前处理的行号
+ * @param nfields 字段总数
+ * @param geom_field_index 几何字段的索引位置
+ * @param sst 序列化状态向量
+ * @param layer 当前图层索引
+ * @param layername 图层名称
+ */
 void PostGISReader::process_feature(PGresult *res, int row, int nfields, int geom_field_index,
                                     std::vector<struct serialization_state> &sst, size_t layer,
                                     const std::string &layername)
 {
-    // Reuse feature buffer to reduce allocations
     feature_buffer.clear();
-    feature_buffer.reserve(1024); // Initial reservation
+    feature_buffer.reserve(1024);
 
-    // Build GeoJSON feature
     feature_buffer += "{\"type\":\"Feature\",";
 
-    // Add geometry
     char *geom_value = PQgetvalue(res, row, geom_field_index);
     if (geom_value == NULL || strlen(geom_value) == 0)
     {
-        return; // Skip features without geometry
+        return;
     }
 
     feature_buffer += "\"geometry\":";
     feature_buffer += geom_value;
 
-    // Check for properties
     bool has_properties = false;
     for (int field = 0; field < nfields; field++)
     {
@@ -173,7 +224,6 @@ void PostGISReader::process_feature(PGresult *res, int row, int nfields, int geo
         }
     }
 
-    // Add properties if present
     if (has_properties)
     {
         feature_buffer += ",\"properties\":{";
@@ -210,17 +260,14 @@ void PostGISReader::process_feature(PGresult *res, int row, int nfields, int geo
 
                 if (type == 20 || type == 21 || type == 23 || type == 700 || type == 701)
                 {
-                    // Numeric type - no escaping needed
                     feature_buffer += value;
                 }
                 else if (type == 16)
                 {
-                    // Boolean type
                     feature_buffer += (strcmp(value, "t") == 0) ? "true" : "false";
                 }
                 else
                 {
-                    // String type - escape special characters
                     feature_buffer += "\"";
                     feature_buffer += escape_json_string(value);
                     feature_buffer += "\"";
@@ -232,7 +279,6 @@ void PostGISReader::process_feature(PGresult *res, int row, int nfields, int geo
 
     feature_buffer += "}";
 
-    // Parse the feature immediately (streaming approach)
     char *feature_buffer_copy = strdup(feature_buffer.c_str());
     if (feature_buffer_copy)
     {
@@ -249,13 +295,22 @@ void PostGISReader::process_feature(PGresult *res, int row, int nfields, int geo
         free(feature_buffer_copy);
     }
 
-    // Update statistics
     total_features_processed.fetch_add(1);
 
-    // Update memory tracking (rough estimate)
     current_memory_usage.fetch_add(feature_buffer.capacity());
 }
 
+/**
+ * @brief 处理一批数据
+ * 
+ * 遍历查询结果集，逐条处理每个要素，并监控内存使用情况
+ * 
+ * @param res PostgreSQL 查询结果集
+ * @param sst 序列化状态向量
+ * @param layer 当前图层索引
+ * @param layername 图层名称
+ * @param geom_field_index 几何字段的索引位置
+ */
 void PostGISReader::process_batch(PGresult *res, std::vector<struct serialization_state> &sst,
                                   size_t layer, const std::string &layername, int geom_field_index)
 {
@@ -266,20 +321,25 @@ void PostGISReader::process_batch(PGresult *res, std::vector<struct serializatio
     {
         process_feature(res, i, nfields, geom_field_index, sst, layer, layername);
 
-        // Periodically check memory usage
         if (i % 100 == 0 && !check_memory_usage())
         {
             fprintf(stderr, "Warning: Memory pressure detected at feature %d\n", i);
         }
     }
 
-    // Update batch statistics
     total_batches_processed.fetch_add(1);
 
-    // Log progress
     log_progress(total_features_processed.load(), 0, "Processing features");
 }
 
+/**
+ * @brief 执行 SQL 查询（带重试机制）
+ * 
+ * 执行 SQL 查询，失败时自动重试，最多重试 config.max_retries 次
+ * 
+ * @param query SQL 查询语句
+ * @return bool 执行成功返回 true，失败返回 false
+ */
 bool PostGISReader::execute_query_with_retry(const std::string &query)
 {
     int retries = 0;
@@ -294,13 +354,21 @@ bool PostGISReader::execute_query_with_retry(const std::string &query)
         if (retries < config.max_retries)
         {
             fprintf(stderr, "Retrying query (attempt %d/%d)...\n", retries + 1, config.max_retries);
-            usleep(1000000); // Wait 1 second before retry
+            usleep(1000000);
         }
     }
 
     return false;
 }
 
+/**
+ * @brief 执行 SQL 查询
+ * 
+ * 执行单个 SQL 查询，不自动重试
+ * 
+ * @param query SQL 查询语句
+ * @return bool 执行成功返回 true，失败返回 false
+ */
 bool PostGISReader::execute_query(const std::string &query)
 {
     if (!conn)
@@ -323,6 +391,18 @@ bool PostGISReader::execute_query(const std::string &query)
     return true;
 }
 
+/**
+ * @brief 读取地理空间要素的主函数
+ * 
+ * 从 PostGIS 数据库读取地理空间数据，支持自定义 SQL 查询或自动生成查询
+ * 支持游标模式（大数据集）和普通模式（小数据集）
+ * 自动检测几何字段，支持数据类型转换，实时监控进度
+ * 
+ * @param sst 序列化状态向量，用于存储瓦片数据
+ * @param layer 当前图层索引
+ * @param layername 图层名称
+ * @return bool 读取成功返回 true，失败返回 false
+ */
 bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, size_t layer, const std::string &layername)
 {
     if (!conn)
@@ -333,7 +413,6 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
         }
     }
 
-    // Build base query
     std::string base_query;
     if (!config.sql.empty())
     {
@@ -341,7 +420,7 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
     }
     else if (!config.table.empty() && !config.geometry_field.empty())
     {
-        base_query = "SELECT ST_AsGeoJSON(" + config.geometry_field + ") as geojson, * FROM " + config.table;
+        base_query = "SELECT ST_AsGeoJSON(ST_Transform(" + config.geometry_field + ", 4326)) as geojson, * FROM " + config.table;
     }
     else
     {
@@ -349,7 +428,6 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
         return false;
     }
 
-    // Determine total count for progress reporting
     size_t total_count = 0;
     if (config.enable_progress_report)
     {
@@ -362,23 +440,19 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
         PQclear(count_res);
     }
 
-    // Process data in batches using cursor if enabled
     if (config.use_cursor && total_count > config.batch_size)
     {
         fprintf(stderr, "Using cursor-based batch processing (batch size: %zu)\n", config.batch_size);
 
-        // Declare cursor
         std::string cursor_name = "postgis_cursor_" + std::to_string(getpid());
         std::string declare_query = "DECLARE " + cursor_name + " CURSOR FOR " + base_query;
 
         if (!execute_query(declare_query))
         {
             fprintf(stderr, "Failed to declare cursor, falling back to non-cursor mode\n");
-            // Fall back to non-cursor mode
             goto non_cursor_mode;
         }
 
-        // Fetch and process batches
         size_t offset = 0;
         while (true)
         {
@@ -396,10 +470,9 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
             if (ntuples == 0)
             {
                 PQclear(res);
-                break; // No more data
+                break;
             }
 
-            // Find geometry column
             int geom_field_index = -1;
             int nfields = PQnfields(res);
             for (int i = 0; i < nfields; i++)
@@ -415,7 +488,6 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
                 geom_field_index = 0;
             }
 
-            // Process this batch
             process_batch(res, sst, layer, layername, geom_field_index);
 
             offset += ntuples;
@@ -423,15 +495,13 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
 
             PQclear(res);
 
-            // Check memory and potentially pause
             if (!check_memory_usage())
             {
                 fprintf(stderr, "Memory pressure detected, pausing...\n");
-                usleep(100000); // Brief pause
+                usleep(100000);
             }
         }
 
-        // Close cursor
         std::string close_query = "CLOSE " + cursor_name;
         execute_query(close_query);
     }
@@ -440,7 +510,6 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
     non_cursor_mode:
         fprintf(stderr, "Using standard query mode\n");
 
-        // Execute query
         PGresult *res = PQexec((PGconn *)conn, base_query.c_str());
         if (PQresultStatus(res) != PGRES_TUPLES_OK)
         {
@@ -452,7 +521,6 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
         int ntuples = PQntuples(res);
         fprintf(stderr, "Processing %d features\n", ntuples);
 
-        // Find geometry column
         int geom_field_index = -1;
         int nfields = PQnfields(res);
         for (int i = 0; i < nfields; i++)
@@ -482,13 +550,11 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
             geom_field_index = 0;
         }
 
-        // Process all features
         process_batch(res, sst, layer, layername, geom_field_index);
 
         PQclear(res);
     }
 
-    // Final progress report
     log_progress(total_features_processed.load(), total_count, "Completed");
     fprintf(stderr, "Total features processed: %zu in %zu batches\n",
             total_features_processed.load(), total_batches_processed.load());

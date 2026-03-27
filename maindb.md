@@ -534,13 +534,68 @@ mongosh
 
 ## 文件清单
 
-- `maindb.cpp` - 主程序源代码
-- `mongo.hpp` - MongoDB 写入器头文件
-- `mongo.cpp` - MongoDB 写入器实现
-- `postgis.hpp` - PostGIS 读取器头文件
-- `postgis.cpp` - PostGIS 读取器实现
+- `maindb.cpp` - 主程序源代码，命令行参数解析，PostGIS 和 MongoDB 集成逻辑
+- `mongo.hpp` - MongoDB 写入器头文件，定义 mongo_config 结构和 MongoWriter 类
+- `mongo.cpp` - MongoDB 写入器实现，包含连接管理、批量写入、错误重试、索引创建等功能
+- `postgis.hpp` - PostGIS 读取器头文件，定义 postgis_config 结构和 PostGISReader 类
+- `postgis.cpp` - PostGIS 读取器实现，包含数据库连接、数据查询、流式处理、内存管理等功能
 - `tile-db.hpp` - MongoDB 瓦片数据库接口
 - `Makefile` - 构建配置
+
+## 核心 API 参考
+
+### PostGISReader 类（postgis.cpp）
+
+#### 构造函数
+```cpp
+PostGISReader::PostGISReader(const postgis_config &cfg);
+```
+初始化 PostGIS 读取器，配置数据库连接参数和性能优化参数。
+
+#### 主要方法
+```cpp
+bool PostGISReader::connect();
+bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
+                                   size_t layer, const std::string &layername);
+void PostGISReader::process_feature(PGresult *res, int row, int nfields, 
+                                     int geom_field_index, ...);
+void PostGISReader::process_batch(PGresult *res, ...);
+bool PostGISReader::execute_query(const std::string &query);
+bool PostGISReader::execute_query_with_retry(const std::string &query);
+bool PostGISReader::check_memory_usage();
+void PostGISReader::log_progress(size_t processed, size_t total, const char *stage);
+std::string PostGISReader::escape_json_string(const char *value);
+```
+
+### MongoWriter 类（mongo.cpp）
+
+#### 静态方法
+```cpp
+static MongoWriter* get_thread_local_instance(const mongo_config &cfg);
+static void destroy_thread_local_instances();
+static void initialize_global();
+static size_t get_global_total_tiles();
+static size_t get_global_total_batches();
+static size_t get_global_total_retries();
+static size_t get_global_total_errors();
+```
+
+#### 实例方法
+```cpp
+MongoWriter::MongoWriter(const mongo_config &cfg);
+MongoWriter::~MongoWriter() noexcept;
+
+void MongoWriter::initialize_thread();
+void MongoWriter::close() noexcept;
+
+void MongoWriter::write_tile(int z, int x, int y, const char *data, size_t len);
+void MongoWriter::flush_all() noexcept;
+void MongoWriter::flush_batch();
+
+void MongoWriter::reconnect();
+void MongoWriter::create_indexes_if_needed();
+void MongoWriter::erase_zoom(int z);
+```
 
 ## 相关文档
 

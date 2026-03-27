@@ -5,21 +5,29 @@
 #include <thread>
 #include "errors.hpp"
 
-// 静态成员初始化
+// 全局静态成员变量初始化
 std::unique_ptr<mongocxx::instance> MongoWriter::global_instance = nullptr;
 std::atomic_flag MongoWriter::initialized = ATOMIC_FLAG_INIT;
 std::atomic_flag MongoWriter::collection_dropped = ATOMIC_FLAG_INIT;
 
-// 线程本地 MongoWriter 实例
+// 线程本地存储的 MongoWriter 实例
 thread_local static std::unique_ptr<MongoWriter> tls_mongo_writer;
 
-// 全局统计信息（原子变量）
+// 全局统计信息（所有线程累计）
 static std::atomic<size_t> global_total_tiles{0};
 static std::atomic<size_t> global_total_batches{0};
 static std::atomic<size_t> global_total_retries{0};
 static std::atomic<size_t> global_total_errors{0};
 
-// 获取线程本地实例
+/**
+ * @brief 获取线程本地的 MongoWriter 实例
+ * 
+ * 使用线程本地存储（TLS）模式，每个线程独立的 MongoDB 连接和缓冲区
+ * 避免锁竞争，提高并发性能
+ * 
+ * @param cfg MongoDB 配置参数
+ * @return MongoWriter* 线程本地的 MongoWriter 实例指针
+ */
 MongoWriter* MongoWriter::get_thread_local_instance(const mongo_config &cfg) {
     if (!tls_mongo_writer) {
         tls_mongo_writer = std::make_unique<MongoWriter>(cfg);
@@ -28,33 +36,51 @@ MongoWriter* MongoWriter::get_thread_local_instance(const mongo_config &cfg) {
     return tls_mongo_writer.get();
 }
 
-// 获取全局统计信息
+/**
+ * @brief 获取全局累计写入的瓦片总数
+ * 
+ * @return size_t 全局累计写入的瓦片数量
+ */
 size_t MongoWriter::get_global_total_tiles() {
     return global_total_tiles.load();
 }
 
+/**
+ * @brief 获取全局累计写入的批次总数
+ * 
+ * @return size_t 全局累计写入的批次数量
+ */
 size_t MongoWriter::get_global_total_batches() {
     return global_total_batches.load();
 }
 
+/**
+ * @brief 获取全局累计重试次数
+ * 
+ * @return size_t 全局累计重试次数
+ */
 size_t MongoWriter::get_global_total_retries() {
     return global_total_retries.load();
 }
 
+/**
+ * @brief 获取全局累计错误次数
+ * 
+ * @return size_t 全局累计错误次数
+ */
 size_t MongoWriter::get_global_total_errors() {
     return global_total_errors.load();
 }
 
-// 销毁线程本地实例
+/**
+ * @brief 销毁线程本地的 MongoWriter 实例
+ * 
+ * 在线程结束时调用，刷新所有未写入的数据，更新全局统计信息，释放连接资源
+ */
 void MongoWriter::destroy_thread_local_instances() {
-    // TLS 对象会在线程结束时自动销毁
-    // 这个函数确保在当前线程显式销毁 TLS 对象
-    // 注意：必须在每个使用 MongoDB 的工作线程中调用
-    // 主线程应该在退出前调用此函数
     if (tls_mongo_writer) {
         tls_mongo_writer->flush_all();
         
-        // 累加统计信息到全局变量
         global_total_tiles += tls_mongo_writer->getTotalTilesWritten();
         global_total_batches += tls_mongo_writer->getTotalBatchesWritten();
         global_total_retries += tls_mongo_writer->getTotalRetries();
@@ -65,58 +91,73 @@ void MongoWriter::destroy_thread_local_instances() {
     }
 }
 
-// 外部 quiet 变量声明（来自 maindb.cpp，用于控制日志输出）
 extern int quiet;
 
+/**
+ * @brief MongoWriter 构造函数
+ * 
+ * 初始化 MongoDB 写入器，验证配置参数，设置批次大小范围
+ * 
+ * @param cfg MongoDB 配置结构，包含连接信息和性能参数
+ * @throws std::runtime_error 当数据库名为空时抛出异常
+ */
 MongoWriter::MongoWriter(const mongo_config &cfg)
     : config(cfg)
 {
-    // 验证配置参数
     if (config.dbname.empty()) {
         throw std::runtime_error("MongoDB database name is required");
     }
     
-    // 限制批量大小在合理范围内
     if (config.batch_size < MIN_MONGO_BATCH_SIZE) {
         config.batch_size = MIN_MONGO_BATCH_SIZE;
     } else if (config.batch_size > MAX_MONGO_BATCH_SIZE) {
         config.batch_size = MAX_MONGO_BATCH_SIZE;
     }
     
-    // 预分配缓冲区内存，提高性能
     batch_buffer.reserve(config.batch_size);
 }
 
+/**
+ * @brief MongoWriter 析构函数
+ * 
+ * 确保所有数据都被刷新到数据库，释放连接资源
+ * 使用 noexcept 保证异常安全
+ */
 MongoWriter::~MongoWriter() noexcept
 {
-    // 确保所有数据已刷新（noexcept 版本）
     flush_all();
     
-    // 关闭连接（noexcept 版本）
     close();
 }
 
+/**
+ * @brief 初始化全局 MongoDB 实例
+ * 
+ * 使用原子操作确保只初始化一次，线程安全
+ */
 void MongoWriter::initialize_global()
 {
-    // 双重检查锁定模式初始化全局实例
     if (!initialized.test_and_set(std::memory_order_acquire)) {
         global_instance = std::make_unique<mongocxx::instance>();
     }
 }
 
+/**
+ * @brief 初始化线程本地的 MongoDB 连接
+ * 
+ * 创建数据库连接，获取集合引用，清空集合（如果配置），创建索引
+ * 
+ * @throws std::exception 连接失败时抛出异常
+ */
 void MongoWriter::initialize_thread()
 {
     try {
-        // 创建线程本地客户端（URI 中已包含连接池和写确认配置）
         mongocxx::uri uri(config.uri());
         client = std::make_unique<mongocxx::client>(uri);
         
-        // 获取集合引用
         collection = (*client)[config.dbname][config.collection];
         
-        // 如果需要，清空集合（在创建索引之前，且只清空一次）
         if (config.drop_collection_before_write) {
-            // 使用原子操作确保只有一个线程执行清空
             if (!collection_dropped.test_and_set(std::memory_order_acquire)) {
                 try {
                     collection.drop();
@@ -127,13 +168,11 @@ void MongoWriter::initialize_thread()
                 } catch (const std::exception &e) {
                     fprintf(stderr, "警告：清空 MongoDB 集合 %s.%s 失败：%s\n", 
                             config.dbname.c_str(), config.collection.c_str(), e.what());
-                    // 清除标志允许重试
                     collection_dropped.clear(std::memory_order_release);
                 }
             }
         }
         
-        // 如果需要，创建索引
         if (config.create_indexes) {
             create_indexes_if_needed();
         }
@@ -146,18 +185,29 @@ void MongoWriter::initialize_thread()
         }
     } catch (const std::exception &e) {
         fprintf(stderr, "错误：MongoDB 连接初始化失败：%s\n", e.what());
-        throw;  // 抛出异常由上层处理
+        throw;
     }
 }
 
+/**
+ * @brief 写入单个瓦片数据
+ * 
+ * 将瓦片数据添加到批量缓冲区，达到批次大小时自动刷新
+ * 支持自动重试机制，失败时自动重新连接
+ * 
+ * @param z Zoom 级别
+ * @param x X 坐标（XYZ 坐标系）
+ * @param y Y 坐标（XYZ 坐标系）
+ * @param data 瓦片数据指针
+ * @param len 瓦片数据长度
+ * @throws std::exception 重试次数用尽后抛出异常
+ */
 void MongoWriter::write_tile(int z, int x, int y, const char *data, size_t len)
 {
     int attempts = 0;
     
     while (attempts < config.max_retries) {
         try {
-            // 构建 MongoDB document
-            // 使用 XYZ 坐标系（与 mbtiles 一致），不翻转 Y 坐标
             auto doc = bsoncxx::builder::stream::document{}
                 << "x" << x
                 << "y" << y
@@ -169,15 +219,13 @@ void MongoWriter::write_tile(int z, int x, int y, const char *data, size_t len)
                 }
                 << bsoncxx::builder::stream::finalize;
             
-            // 添加到批量缓冲区（使用 std::move 转移所有权）
             batch_buffer.push_back(std::move(doc));
             
-            // 检查是否达到批量阈值
             if (batch_buffer.size() >= config.batch_size) {
                 flush_batch();
             }
             
-            return;  // 成功
+            return;
             
         } catch (const std::exception &e) {
             attempts++;
@@ -191,10 +239,9 @@ void MongoWriter::write_tile(int z, int x, int y, const char *data, size_t len)
             if (attempts >= config.max_retries) {
                 fprintf(stderr, "错误：MongoDB 写入失败，已尝试 %d 次。数据可能丢失。\n", 
                         config.max_retries);
-                throw;  // 抛出异常由上层处理
+                throw;
             }
             
-            // 重试前重新连接（带指数退避）
             try {
                 reconnect();
                 total_retries++;
@@ -207,10 +254,15 @@ void MongoWriter::write_tile(int z, int x, int y, const char *data, size_t len)
     }
 }
 
+/**
+ * @brief 刷新所有待写入的数据
+ * 
+ * 将批量缓冲区中的所有瓦片数据写入数据库
+ * 使用 noexcept 保证异常安全，捕获所有异常
+ */
 void MongoWriter::flush_all() noexcept
 {
     try {
-        // 刷新所有批量缓冲区
         if (!batch_buffer.empty()) {
             flush_batch();
         }
@@ -225,11 +277,14 @@ void MongoWriter::flush_all() noexcept
             fprintf(stderr, "警告：flush_all 失败（未知错误）\n");
         }
     }
-    
-    // 输出统计信息（仅在最后一次 flush_all 时输出）
-    // 注意：调用者应在程序退出前统一输出统计信息
 }
 
+/**
+ * @brief 关闭 MongoDB 连接
+ * 
+ * 刷新所有数据，释放客户端连接
+ * 使用 noexcept 保证异常安全
+ */
 void MongoWriter::close() noexcept
 {
     try {
@@ -247,6 +302,15 @@ void MongoWriter::close() noexcept
     }
 }
 
+/**
+ * @brief 刷新批量缓冲区
+ * 
+ * 将批量缓冲区中的所有瓦片文档批量插入到 MongoDB 集合
+ * 支持写确认配置、日志配置、超时配置
+ * 失败时自动重试，使用指数退避策略
+ * 
+ * @throws std::exception 重试次数用尽后抛出异常
+ */
 void MongoWriter::flush_batch()
 {
     if (batch_buffer.empty()) {
@@ -258,49 +322,39 @@ void MongoWriter::flush_batch()
     
     while (!success && attempts < config.max_retries) {
         try {
-            // 配置插入选项和写确认
             mongocxx::options::insert insert_opts;
             insert_opts.bypass_document_validation(false);
-            insert_opts.ordered(false);  // 无序插入，提高性能
+            insert_opts.ordered(false);
             
-            // 设置写确认级别
             mongocxx::write_concern wc;
             switch (config.write_concern_level) {
                 case WriteConcernLevel::NONE:
-                    // w:0 - 无确认
                     wc.acknowledge_level(mongocxx::write_concern::level::k_unacknowledged);
                     break;
                 case WriteConcernLevel::PRIMARY:
-                    // w:1 - 等待主节点确认
                     wc.acknowledge_level(mongocxx::write_concern::level::k_acknowledged);
                     wc.nodes(1);
                     break;
                 case WriteConcernLevel::MAJORITY:
-                    // w:"majority" - 等待多数节点确认
                     wc.acknowledge_level(mongocxx::write_concern::level::k_majority);
                     break;
             }
             
-            // 设置 journal
             if (config.journal) {
                 wc.journal(true);
             }
             
-            // 设置 wtimeout
             if (config.wtimeout_ms > 0) {
                 wc.timeout(std::chrono::milliseconds(config.wtimeout_ms));
             }
             
             insert_opts.write_concern(wc);
             
-            // 执行批量插入
             auto result = collection.insert_many(batch_buffer, insert_opts);
             
-            // 更新统计
             total_tiles_written += batch_buffer.size();
             total_batches_written++;
             
-            // 清空缓冲区
             batch_buffer.clear();
             success = true;
             
@@ -317,15 +371,12 @@ void MongoWriter::flush_batch()
                 total_failed_batches++;
                 fprintf(stderr, "Error: MongoDB flush_batch failed after %d attempts. %zu tiles may be lost.\n", 
                         config.max_retries, batch_buffer.size());
-                // 不清空缓冲区，保留数据以便后续可能的恢复
-                // 但为了避免内存无限增长，在多次失败后清空
                 if (attempts >= config.max_retries * 2) {
                     batch_buffer.clear();
                 }
-                throw;  // 重新抛出异常
+                throw;
             }
             
-            // 重试前重新连接（带指数退避）
             try {
                 reconnect();
                 total_retries++;
@@ -333,17 +384,23 @@ void MongoWriter::flush_batch()
                 if (!quiet) {
                     fprintf(stderr, "MongoDB reconnect failed during flush_batch: %s\n", reconnect_e.what());
                 }
-                // 继续重试循环
             }
         }
     }
 }
 
+/**
+ * @brief 重新连接 MongoDB
+ * 
+ * 使用指数退避策略等待后重新建立数据库连接
+ * 等待时间：100ms * 2^retries，最大 5 秒
+ * 
+ * @throws std::exception 重新连接失败时抛出异常
+ */
 void MongoWriter::reconnect()
 {
-    // 指数退避策略：第 n 次重试等待 100ms * 2^(n-1)
     int wait_ms = 100 * (1 << total_retries.load());
-    wait_ms = std::min(wait_ms, 5000);  // 最多等待 5 秒
+    wait_ms = std::min(wait_ms, 5000);
     
     if (!quiet && wait_ms > 100) {
         fprintf(stderr, "MongoDB reconnecting in %d ms...\n", wait_ms);
@@ -352,7 +409,6 @@ void MongoWriter::reconnect()
     std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
     
     try {
-        // 重新创建客户端
         mongocxx::uri uri(config.uri());
         client = std::make_unique<mongocxx::client>(uri);
         collection = (*client)[config.dbname][config.collection];
@@ -363,22 +419,26 @@ void MongoWriter::reconnect()
         
     } catch (const std::exception &e) {
         fprintf(stderr, "MongoDB reconnect failed: %s\n", e.what());
-        throw;  // 重新抛出，由上层处理
+        throw;
     }
 }
 
+/**
+ * @brief 创建 MongoDB 索引（如果需要）
+ * 
+ * 检查并创建以下索引：
+ * 1. 唯一索引 (z, x, y) - 防止重复瓦片
+ * 2. 查询索引 (z) - 加速按 Zoom 级别查询
+ */
 void MongoWriter::create_indexes_if_needed()
 {
     try {
-        // 获取索引视图
         auto index_view = collection.indexes();
         
-        // 使用 try-catch 包裹索引检查和创建，提高健壮性
         bool unique_index_exists = false;
         bool zoom_index_exists = false;
         
         try {
-            // 检查唯一索引是否已存在
             for (const auto &index : index_view.list()) {
                 auto name_element = index["name"];
                 if (name_element && 
@@ -391,7 +451,6 @@ void MongoWriter::create_indexes_if_needed()
                 }
             }
         } catch (const std::exception &e) {
-            // 索引列表获取失败，尝试直接创建（如果已存在会失败，但无害）
             if (!quiet) {
                 fprintf(stderr, "Warning: Could not list MongoDB indexes: %s. Will attempt to create.\n", e.what());
             }
@@ -399,7 +458,6 @@ void MongoWriter::create_indexes_if_needed()
         
         if (!unique_index_exists) {
             try {
-                // 创建唯一索引：{z: 1, x: 1, y: 1}
                 auto keys = bsoncxx::builder::stream::document{}
                     << "z" << 1
                     << "x" << 1
@@ -418,7 +476,6 @@ void MongoWriter::create_indexes_if_needed()
                             config.dbname.c_str(), config.collection.c_str());
                 }
             } catch (const std::exception &e) {
-                // 索引可能已存在（竞态条件），忽略错误
                 if (!quiet) {
                     fprintf(stderr, "Note: Unique index on (z, x, y) may already exist: %s\n", e.what());
                 }
@@ -427,7 +484,6 @@ void MongoWriter::create_indexes_if_needed()
         
         if (!zoom_index_exists) {
             try {
-                // 创建缩放级别索引：{z: 1}
                 auto keys = bsoncxx::builder::stream::document{}
                     << "z" << 1
                     << bsoncxx::builder::stream::finalize;
@@ -443,7 +499,6 @@ void MongoWriter::create_indexes_if_needed()
                             config.dbname.c_str(), config.collection.c_str());
                 }
             } catch (const std::exception &e) {
-                // 索引可能已存在（竞态条件），忽略错误
                 if (!quiet) {
                     fprintf(stderr, "Note: Index on z may already exist: %s\n", e.what());
                 }
@@ -452,15 +507,19 @@ void MongoWriter::create_indexes_if_needed()
         
     } catch (const std::exception &e) {
         fprintf(stderr, "Warning: Failed to create MongoDB indexes: %s\n", e.what());
-        // 索引创建失败不影响主流程
     }
 }
 
-// 删除指定 zoom 级别的所有瓦片
+/**
+ * @brief 删除指定 Zoom 级别的所有瓦片
+ * 
+ * 用于增量更新或重新生成特定层级的瓦片
+ * 
+ * @param z 要删除的 Zoom 级别
+ */
 void MongoWriter::erase_zoom(int z)
 {
     try {
-        // 删除指定 z 值的所有文档
         auto filter = bsoncxx::builder::stream::document{}
             << "z" << z
             << bsoncxx::builder::stream::finalize;
@@ -476,7 +535,6 @@ void MongoWriter::erase_zoom(int z)
             fprintf(stderr, "警告：删除 MongoDB z=%d 的瓦片失败：%s\n", 
                     z, e.what());
         }
-        // 删除失败不阻止主流程
     } catch (...) {
         if (!quiet) {
             fprintf(stderr, "警告：删除 MongoDB z=%d 的瓦片失败（未知错误）\n", z);

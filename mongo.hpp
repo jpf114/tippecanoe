@@ -64,13 +64,13 @@ struct mongo_config {
     bool enable_progress_report;
     
     mongo_config()
-        : host("localhost"),
-          port(27017),
+        : host(""),
+          port(0),
           dbname(""),
-          collection("tiles"),
+          collection(""),
           username(""),
           password(""),
-          auth_source("admin"),
+          auth_source(""),
           batch_size(DEFAULT_MONGO_BATCH_SIZE),
           connection_pool_size(DEFAULT_CONNECTION_POOL_SIZE),
           timeout_ms(MONGO_TIMEOUT_MS),

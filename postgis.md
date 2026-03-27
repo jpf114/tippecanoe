@@ -64,6 +64,69 @@ struct postgis_config {
 - 错误重试：数据库操作失败时自动重试
 - 进度报告：实时显示处理进度和统计信息
 
+#### 核心 API 函数
+
+##### 1. 连接管理
+
+```cpp
+// 构造函数：初始化配置，自动调整批次大小到合理范围
+PostGISReader::PostGISReader(const postgis_config &cfg);
+
+// 析构函数：释放数据库连接资源
+PostGISReader::~PostGISReader();
+
+// 连接到数据库，使用 30 秒超时
+bool PostGISReader::connect();
+```
+
+##### 2. 数据读取
+
+```cpp
+// 主函数：读取地理空间要素，支持游标模式和普通模式
+// 参数：sst - 序列化状态向量，layer - 图层索引，layername - 图层名称
+bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
+                                   size_t layer, const std::string &layername);
+```
+
+##### 3. 数据处理
+
+```cpp
+// 处理单个要素：构建 GeoJSON Feature 并解析
+void PostGISReader::process_feature(PGresult *res, int row, int nfields, 
+                                     int geom_field_index,
+                                     std::vector<struct serialization_state> &sst, 
+                                     size_t layer, const std::string &layername);
+
+// 处理一批数据：遍历结果集，逐条处理要素
+void PostGISReader::process_batch(PGresult *res, 
+                                   std::vector<struct serialization_state> &sst,
+                                   size_t layer, const std::string &layername, 
+                                   int geom_field_index);
+```
+
+##### 4. 查询执行
+
+```cpp
+// 执行 SQL 查询（带重试机制，最多重试 max_retries 次）
+bool PostGISReader::execute_query_with_retry(const std::string &query);
+
+// 执行单个 SQL 查询（不自动重试）
+bool PostGISReader::execute_query(const std::string &query);
+```
+
+##### 5. 辅助函数
+
+```cpp
+// 检查内存使用情况，超出限制时返回 false
+bool PostGISReader::check_memory_usage();
+
+// 记录处理进度
+void PostGISReader::log_progress(size_t processed, size_t total, const char *stage);
+
+// JSON 字符串转义，支持特殊字符和控制字符
+std::string PostGISReader::escape_json_string(const char *value);
+```
+
 ## 性能优化
 
 ### 核心优化策略

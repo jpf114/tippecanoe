@@ -100,6 +100,19 @@ int retain_points_multiplier = 1;
 std::vector<std::string> unidecode_data;
 size_t maximum_string_attribute_length = 0;
 
+// 智能 MongoDB 批量大小建议函数
+static size_t suggest_mongo_batch_size(size_t estimated_tiles) {
+    if (estimated_tiles < 1000) {
+        return 50;      // 小数据集：快速响应
+    } else if (estimated_tiles < 10000) {
+        return 100;     // 中等数据集：平衡
+    } else if (estimated_tiles < 100000) {
+        return 200;     // 较大数据集：提高吞吐
+    } else {
+        return 500;     // 大数据集：最大化吞吐
+    }
+}
+
 // PostGIS configuration
 bool use_postgis = false;
 postgis_config postgis_cfg{};
@@ -1110,15 +1123,41 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 
 	// MongoDB configuration validation (forced MongoDB output)
 	if (!use_mongo) {
-		fprintf(stderr, "Error: MongoDB output is required. Use --omongo to enable MongoDB output\n");
+		fprintf(stderr, "Error: MongoDB output is required. Use --mongo or --mongo-dbname etc.\n");
 		exit(EXIT_ARGS);
 	}
 
-	// Validate MongoDB configuration
-	if (mongo_cfg.dbname.empty()) {
-		fprintf(stderr, "Error: MongoDB database name is required\n");
+	// Validate ALL MongoDB connection parameters are provided
+	if (mongo_cfg.host.empty()) {
+		fprintf(stderr, "Error: MongoDB host is required (--mongo-host)\n");
 		exit(EXIT_ARGS);
 	}
+	if (mongo_cfg.port == 0) {
+		fprintf(stderr, "Error: MongoDB port is required (--mongo-port)\n");
+		exit(EXIT_ARGS);
+	}
+	if (mongo_cfg.dbname.empty()) {
+		fprintf(stderr, "Error: MongoDB database name is required (--mongo-dbname)\n");
+		exit(EXIT_ARGS);
+	}
+	if (mongo_cfg.collection.empty()) {
+		fprintf(stderr, "Error: MongoDB collection is required (--mongo-collection)\n");
+		exit(EXIT_ARGS);
+	}
+	if (mongo_cfg.username.empty()) {
+		fprintf(stderr, "Error: MongoDB username is required (--mongo-username)\n");
+		exit(EXIT_ARGS);
+	}
+	if (mongo_cfg.password.empty()) {
+		fprintf(stderr, "Error: MongoDB password is required (--mongo-password)\n");
+		exit(EXIT_ARGS);
+	}
+	if (mongo_cfg.auth_source.empty()) {
+		fprintf(stderr, "Error: MongoDB auth source is required (--mongo-auth-source)\n");
+		exit(EXIT_ARGS);
+	}
+	
+	// Validate and limit batch size
 	if (mongo_cfg.batch_size < MIN_MONGO_BATCH_SIZE) {
 		mongo_cfg.batch_size = MIN_MONGO_BATCH_SIZE;
 	} else if (mongo_cfg.batch_size > MAX_MONGO_BATCH_SIZE) {
@@ -1201,6 +1240,21 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 	if (!reader.read_features(sst, sources.size() - 1, postgis_source.layer)) {
 		fprintf(stderr, "Failed to read features from PostGIS\n");
 		exit(EXIT_READ);
+	}
+
+	// Auto-adjust MongoDB batch size based on data volume (only if user didn't specify)
+	if (mongo_cfg.batch_size == DEFAULT_MONGO_BATCH_SIZE) {
+		size_t total_features = reader.getTotalFeaturesProcessed();
+		size_t estimated_tiles = total_features * 2;  // Rough estimate
+		size_t suggested_batch = suggest_mongo_batch_size(estimated_tiles);
+		
+		mongo_cfg.batch_size = suggested_batch;
+		
+		if (!quiet) {
+			fprintf(stderr, "Auto-adjusted MongoDB batch size to %zu "
+					"(processed %zu features, estimated %zu tiles)\n", 
+					mongo_cfg.batch_size, total_features, estimated_tiles);
+		}
 	}
 
 	for (size_t i = 0; i < CPUS; i++) {
@@ -2280,7 +2334,6 @@ void set_attribute_value(const char *arg) {
 }
 
 
-
 int maindb(int argc, char **argv) {
 #ifdef MTRACE
 	mtrace();
@@ -2366,9 +2419,6 @@ int maindb(int argc, char **argv) {
 		{"mongo-pool-size", required_argument, 0, '~'},
 		{"mongo-timeout", required_argument, 0, '~'},
 		{"mongo-no-indexes", no_argument, 0, '~'},
-		{"mongo-write-concern", required_argument, 0, '~'},
-		{"mongo-journal", no_argument, 0, '~'},
-		{"mongo-wtimeout", required_argument, 0, '~'},
 		{"mongo-drop-collection", no_argument, 0, '~'},
 
 		{"Projection of input", 0, 0, 0},
@@ -2726,20 +2776,6 @@ int maindb(int argc, char **argv) {
 				use_mongo = true;
 			} else if (strcmp(opt, "mongo-no-indexes") == 0) {
 				mongo_cfg.create_indexes = false;
-				use_mongo = true;
-			} else if (strcmp(opt, "mongo-write-concern") == 0) {
-				int wc_level = atoi_require(optarg, "MongoDB write concern level");
-				if (wc_level < 0 || wc_level > 2) {
-					fprintf(stderr, "Error: Invalid write concern level (must be 0, 1, or 2)\n");
-					exit(EXIT_ARGS);
-				}
-				mongo_cfg.write_concern_level = static_cast<WriteConcernLevel>(wc_level);
-				use_mongo = true;
-			} else if (strcmp(opt, "mongo-journal") == 0) {
-				mongo_cfg.journal = true;
-				use_mongo = true;
-			} else if (strcmp(opt, "mongo-wtimeout") == 0) {
-				mongo_cfg.wtimeout_ms = atoi_require(optarg, "MongoDB wtimeout");
 				use_mongo = true;
 			} else if (strcmp(opt, "mongo-drop-collection") == 0) {
 				mongo_cfg.drop_collection_before_write = true;
