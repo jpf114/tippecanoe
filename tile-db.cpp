@@ -40,6 +40,7 @@
 #include "serial.hpp"
 #include "options.hpp"
 #include "main.hpp"
+#include "maindb.hpp"
 #include "write_json.hpp"
 #include "milo/dtoa_milo.h"
 #include "evaluator.hpp"
@@ -2872,7 +2873,6 @@ long long write_tile(decompressor *geoms, std::atomic<long long> *geompos_in, ch
 
 				// Write to MongoDB (required)
 				// Use thread-local MongoWriter to avoid race conditions
-				extern mongo_config mongo_cfg;
 				if (mongo_cfg.dbname != "") {
 					try {
 						MongoWriter* thread_mongo_writer = MongoWriter::get_thread_local_instance(mongo_cfg);
@@ -3092,7 +3092,6 @@ exit(EXIT_IMPOSSIBLE);
 	}
 
 	// 线程退出前清理 MongoDB 连接
-	extern mongo_config mongo_cfg;
 	if (mongo_cfg.dbname != "") {
 		MongoWriter::destroy_thread_local_instances();
 	}
@@ -3379,7 +3378,6 @@ int traverse_zooms(int *geomfd, off_t *geom_size, char *global_stringpool, std::
 					dir_erase_zoom(outdir, z);
 				}
 				// MongoDB 也需要删除已生成的 zoom 级别
-				extern mongo_config mongo_cfg;
 				if (mongo_cfg.dbname != "") {
 					MongoWriter* thread_mongo_writer = MongoWriter::get_thread_local_instance(mongo_cfg);
 					if (thread_mongo_writer) {

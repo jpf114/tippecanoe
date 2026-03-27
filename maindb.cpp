@@ -1056,11 +1056,7 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 	}
 
 	std::map<std::string, layermap_entry> layermap;
-
 	std::vector<std::map<std::string, layermap_entry> > layermaps;
-	for (size_t l = 0; l < CPUS; l++) {
-		layermaps.push_back(layermap);
-	}
 
 	long overall_offset = 0;
 	double dist_sum = 0;
