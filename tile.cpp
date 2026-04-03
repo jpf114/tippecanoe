@@ -825,6 +825,45 @@ static unsigned long long choose_mindrop_sequence(std::vector<unsigned long long
 	return drop_sequences[ix];
 }
 
+static double choose_minattribute(std::vector<double> &attribute_values, double f, double existing_attribute, bool descending) {
+	if (attribute_values.size() == 0) {
+		return existing_attribute;
+	}
+
+	std::stable_sort(attribute_values.begin(), attribute_values.end());
+
+	if (descending) {
+		// For descending: drop features > threshold, keep features <= threshold
+		// ix points at the last value to keep
+		size_t ix = (size_t)((attribute_values.size() - 1) * f);
+		while (ix > 0 && attribute_values[ix] >= existing_attribute) {
+			ix--;
+		}
+
+		if (attribute_values[ix] >= existing_attribute) {
+			return existing_attribute;
+		}
+
+		return attribute_values[ix];
+	} else {
+		// For ascending: drop features < threshold, keep features >= threshold
+		// ix points at the first value to keep
+		size_t ix = (size_t)ceil((double)(attribute_values.size() - 1) * (1 - f));
+		if (ix >= attribute_values.size()) {
+			ix = attribute_values.size() - 1;
+		}
+		while (ix + 1 < attribute_values.size() && attribute_values[ix] <= existing_attribute) {
+			ix++;
+		}
+
+		if (attribute_values[ix] <= existing_attribute) {
+			return existing_attribute;
+		}
+
+		return attribute_values[ix];
+	}
+}
+
 static unsigned long long calculate_drop_sequence(serial_feature const &sf) {
 	unsigned long long zoom = std::min(std::max((unsigned long long) sf.feature_minzoom, 0ULL), 31ULL);
 	unsigned long long out = zoom << (64 - 5);	      // top bits are the zoom level: top-priority features are those that appear in the low zooms
@@ -890,6 +929,10 @@ struct write_tile_args {
 	long long minextent_out = 0;
 	unsigned long long mindrop_sequence = 0;
 	unsigned long long mindrop_sequence_out = 0;
+	double minattribute = 0;
+	double minattribute_out = 0;
+	std::string const *drop_by_attribute_as_needed_attribute = NULL;
+	bool drop_by_attribute_descending = false;
 	size_t tile_size_out = 0;
 	size_t feature_count_out = 0;
 	const char *prefilter = NULL;
@@ -1598,11 +1641,12 @@ void skip_tile(decompressor *geoms, std::atomic<long long> *geompos_in, bool com
 	}
 }
 
-long long write_tile(decompressor *geoms, std::atomic<long long> *geompos_in, char *global_stringpool, int z, const unsigned tx, const unsigned ty, const int detail, int min_detail, sqlite3 *outdb, const char *outdir, int buffer, const char *fname, compressor **geomfile, std::atomic<long long> *geompos, int minzoom, int maxzoom, double todo, std::atomic<long long> *along, long long alongminus, double gamma, int child_shards, long long *pool_off, unsigned *initial_x, unsigned *initial_y, std::atomic<int> *running, double simplification, std::vector<std::map<std::string, layermap_entry>> *layermaps, std::vector<std::vector<std::string>> *layer_unmaps, size_t tiling_seg, size_t pass, unsigned long long mingap, long long minextent, unsigned long long mindrop_sequence, const char *prefilter, const char *postfilter, json_object *filter, write_tile_args *arg, atomic_strategy *strategy_out, bool compressed_input, node *shared_nodes_map, size_t nodepos, std::string const &shared_nodes_bloom, std::vector<std::string> const &unidecode_data, long long estimated_complexity, std::set<zxy> &skip_children_out) {
+long long write_tile(decompressor *geoms, std::atomic<long long> *geompos_in, char *global_stringpool, int z, const unsigned tx, const unsigned ty, const int detail, int min_detail, sqlite3 *outdb, const char *outdir, int buffer, const char *fname, compressor **geomfile, std::atomic<long long> *geompos, int minzoom, int maxzoom, double todo, std::atomic<long long> *along, long long alongminus, double gamma, int child_shards, long long *pool_off, unsigned *initial_x, unsigned *initial_y, std::atomic<int> *running, double simplification, std::vector<std::map<std::string, layermap_entry>> *layermaps, std::vector<std::vector<std::string>> *layer_unmaps, size_t tiling_seg, size_t pass, unsigned long long mingap, long long minextent, unsigned long long mindrop_sequence, double minattribute, const char *prefilter, const char *postfilter, json_object *filter, write_tile_args *arg, atomic_strategy *strategy_out, bool compressed_input, node *shared_nodes_map, size_t nodepos, std::string const &shared_nodes_bloom, std::vector<std::string> const &unidecode_data, long long estimated_complexity, std::set<zxy> &skip_children_out) {
 	double merge_fraction = 1;
 	double mingap_fraction = 1;
 	double minextent_fraction = 1;
 	double mindrop_sequence_fraction = 1;
+	double minattribute_fraction = 1;
 
 	static std::atomic<double> oprogress(0);
 	long long og = *geompos_in;
@@ -1676,6 +1720,8 @@ long long write_tile(decompressor *geoms, std::atomic<long long> *geompos_in, ch
 		size_t extents_increment = 1;
 		std::vector<unsigned long long> drop_sequences;
 		size_t drop_sequences_increment = 1;
+		std::vector<double> attribute_values;
+		size_t attribute_values_increment = 1;
 
 		double coalesced_area = 0;
 		drawvec shared_nodes;
@@ -2038,6 +2084,40 @@ long long write_tile(decompressor *geoms, std::atomic<long long> *geompos_in, ch
 						drop_rest = true;
 						can_stop_early = false;
 						continue;
+					}
+				} else if (additional[A_DROP_BY_ATTRIBUTE_AS_NEEDED]) {
+					mvt_value attr_val = find_attribute_value(&sf, *arg->drop_by_attribute_as_needed_attribute);
+					double attr_numeric = 0;
+					bool attr_valid = false;
+
+					if (attr_val.type == mvt_double) {
+						attr_numeric = attr_val.numeric_value.double_value;
+						attr_valid = std::isfinite(attr_numeric);
+					} else if (attr_val.type == mvt_float) {
+						attr_numeric = attr_val.numeric_value.float_value;
+						attr_valid = std::isfinite(attr_numeric);
+					} else if (attr_val.type == mvt_int) {
+						attr_numeric = attr_val.numeric_value.int_value;
+						attr_valid = true;
+					} else if (attr_val.type == mvt_uint) {
+						attr_numeric = attr_val.numeric_value.uint_value;
+						attr_valid = true;
+					} else if (attr_val.type == mvt_sint) {
+						attr_numeric = attr_val.numeric_value.sint_value;
+						attr_valid = true;
+					}
+
+					if (attr_valid) {
+						add_sample_to(attribute_values, attr_numeric, attribute_values_increment, seq);
+						bool should_drop = arg->drop_by_attribute_descending
+							? (minattribute != HUGE_VAL && attr_numeric > minattribute)
+							: (minattribute != -HUGE_VAL && attr_numeric < minattribute);
+						if (should_drop) {
+							can_stop_early = false;
+							if (drop_feature_unless_it_can_be_added_to_a_multiplier_cluster(layer, sf, layer_unmaps, strategy, drop_rest, arg->attribute_accum, key_pool)) {
+								continue;
+							}
+						}
 					}
 				}
 			}
@@ -2692,6 +2772,45 @@ long long write_tile(decompressor *geoms, std::atomic<long long> *geompos_in, ch
 						fprintf(stderr, "Can't increase feature area threshold further\n");
 						exit(EXIT_INCOMPLETE);
 					}
+				} else if (additional[A_DROP_BY_ATTRIBUTE_AS_NEEDED]) {
+					minattribute_fraction = minattribute_fraction *
+									adjusted_max_tile_features / adjusted_feature_count * 0.75;
+					if (minattribute_fraction > 0.80) {
+						if (!quiet) {
+							fprintf(stderr,
+								"Need to drop features, but calculated that we should keep %.1f%% of features\n",
+								minattribute_fraction * 100.0);
+						}
+						minattribute_fraction = 0.80;
+					}
+
+					bool desc = arg->drop_by_attribute_descending;
+					if (attribute_values.empty() && !quiet) {
+						fprintf(stderr, "Warning: no features had a numeric value for attribute '%s'\n",
+							arg->drop_by_attribute_as_needed_attribute->c_str());
+					}
+					double m = choose_minattribute(attribute_values, minattribute_fraction, minattribute, desc);
+					bool better = desc ? m < minattribute : m > minattribute;
+					if (better) {
+						minattribute = m;
+						bool propagate = desc ? minattribute < arg->minattribute_out : minattribute > arg->minattribute_out;
+						if (propagate) {
+							arg->minattribute_out = minattribute;
+							arg->still_dropping = true;
+						}
+						if (!quiet) {
+							fprintf(stderr,
+								"Trying to keep features with '%s' %s %.6f to make it fit\n",
+								arg->drop_by_attribute_as_needed_attribute->c_str(),
+								desc ? "<=" : ">=",
+								minattribute);
+						}
+						line_detail++;
+						continue;
+					} else {
+						fprintf(stderr, "Can't increase attribute threshold further\n");
+						exit(EXIT_INCOMPLETE);
+					}
 				} else if (feature_count > layers.size() && (additional[A_DROP_FRACTION_AS_NEEDED] || additional[A_COALESCE_FRACTION_AS_NEEDED] || prevent[P_DYNAMIC_DROP])) {
 					// The 95% is a guess to avoid too many retries
 					// and probably actually varies based on how much duplicated metadata there is
@@ -2827,6 +2946,37 @@ long long write_tile(decompressor *geoms, std::atomic<long long> *geompos_in, ch
 						continue;
 					} else {
 						fprintf(stderr, "Can't increase feature area threshold further\n");
+						exit(EXIT_INCOMPLETE);
+					}
+				} else if (additional[A_DROP_BY_ATTRIBUTE_AS_NEEDED]) {
+					minattribute_fraction = minattribute_fraction * adjusted_max_tile_size / adjusted_tile_size * 0.75;
+					if (minattribute_fraction > 0.80) {
+						if (!quiet) {
+							fprintf(stderr, "Need to drop features, but calculated that we should keep %.1f%% of features\n", minattribute_fraction * 100.0);
+						}
+						minattribute_fraction = 0.80;
+					}
+					bool desc2 = arg->drop_by_attribute_descending;
+					if (attribute_values.empty() && !quiet) {
+						fprintf(stderr, "Warning: no features had a numeric value for attribute '%s'\n",
+							arg->drop_by_attribute_as_needed_attribute->c_str());
+					}
+					double m = choose_minattribute(attribute_values, minattribute_fraction, minattribute, desc2);
+					bool better2 = desc2 ? m < minattribute : m > minattribute;
+					if (better2) {
+						minattribute = m;
+						bool propagate2 = desc2 ? minattribute < arg->minattribute_out : minattribute > arg->minattribute_out;
+						if (propagate2) {
+							arg->minattribute_out = minattribute;
+							arg->still_dropping = true;
+						}
+						if (!quiet) {
+							fprintf(stderr, "Going to try keeping features with attribute '%s' %s %0.6f to make it fit\n", arg->drop_by_attribute_as_needed_attribute->c_str(), desc2 ? "<=" : ">=", minattribute);
+						}
+						line_detail++;
+						continue;
+					} else {
+						fprintf(stderr, "Can't increase attribute threshold further\n");
 						exit(EXIT_INCOMPLETE);
 					}
 				} else if (feature_count > layers.size() && (additional[A_DROP_FRACTION_AS_NEEDED] || additional[A_COALESCE_FRACTION_AS_NEEDED] || prevent[P_DYNAMIC_DROP])) {
@@ -2997,7 +3147,7 @@ exit(EXIT_IMPOSSIBLE);
 				len = 1;
 			} else {
 				arg->wrote_zoom = z;
-				len = write_tile(&dc, &geompos, arg->global_stringpool, z, x, y, z == arg->maxzoom ? arg->full_detail : arg->low_detail, arg->min_detail, arg->outdb, arg->outdir, arg->buffer, arg->fname, arg->geomfile, arg->geompos, arg->minzoom, arg->maxzoom, arg->todo, arg->along, geompos, arg->gamma, arg->child_shards, arg->pool_off, arg->initial_x, arg->initial_y, arg->running, arg->simplification, arg->layermaps, arg->layer_unmaps, arg->tiling_seg, arg->pass, arg->mingap, arg->minextent, arg->mindrop_sequence, arg->prefilter, arg->postfilter, arg->filter, arg, arg->strategy, arg->compressed, arg->shared_nodes_map, arg->nodepos, *(arg->shared_nodes_bloom), (*arg->unidecode_data), estimated_complexity, arg->skip_children_out);
+				len = write_tile(&dc, &geompos, arg->global_stringpool, z, x, y, z == arg->maxzoom ? arg->full_detail : arg->low_detail, arg->min_detail, arg->outdb, arg->outdir, arg->buffer, arg->fname, arg->geomfile, arg->geompos, arg->minzoom, arg->maxzoom, arg->todo, arg->along, geompos, arg->gamma, arg->child_shards, arg->pool_off, arg->initial_x, arg->initial_y, arg->running, arg->simplification, arg->layermaps, arg->layer_unmaps, arg->tiling_seg, arg->pass, arg->mingap, arg->minextent, arg->mindrop_sequence, arg->minattribute, arg->prefilter, arg->postfilter, arg->filter, arg, arg->strategy, arg->compressed, arg->shared_nodes_map, arg->nodepos, *(arg->shared_nodes_bloom), (*arg->unidecode_data), estimated_complexity, arg->skip_children_out);
 			}
 
 			if (pthread_mutex_lock(&var_lock) != 0) {
@@ -3063,7 +3213,7 @@ exit(EXIT_IMPOSSIBLE);
 	return err_or_null;
 }
 
-int traverse_zooms(int *geomfd, off_t *geom_size, char *global_stringpool, std::atomic<unsigned> *midx, std::atomic<unsigned> *midy, int &maxzoom, int minzoom, sqlite3 *outdb, const char *outdir, int buffer, const char *fname, const char *tmpdir, double gamma, int full_detail, int low_detail, int min_detail, long long *pool_off, unsigned *initial_x, unsigned *initial_y, double simplification, double maxzoom_simplification, std::vector<std::map<std::string, layermap_entry>> &layermaps, const char *prefilter, const char *postfilter, std::unordered_map<std::string, attribute_op> const *attribute_accum, json_object *filter, std::vector<strategy> &strategies, int iz, node *shared_nodes_map, size_t nodepos, std::string const &shared_nodes_bloom, int basezoom, double droprate, std::vector<std::string> const &unidecode_data) {
+int traverse_zooms(int *geomfd, off_t *geom_size, char *global_stringpool, std::atomic<unsigned> *midx, std::atomic<unsigned> *midy, int &maxzoom, int minzoom, sqlite3 *outdb, const char *outdir, int buffer, const char *fname, const char *tmpdir, double gamma, int full_detail, int low_detail, int min_detail, long long *pool_off, unsigned *initial_x, unsigned *initial_y, double simplification, double maxzoom_simplification, std::vector<std::map<std::string, layermap_entry>> &layermaps, const char *prefilter, const char *postfilter, std::unordered_map<std::string, attribute_op> const *attribute_accum, json_object *filter, std::vector<strategy> &strategies, int iz, node *shared_nodes_map, size_t nodepos, std::string const &shared_nodes_bloom, int basezoom, double droprate, std::vector<std::string> const &unidecode_data, std::string const *drop_by_attribute_as_needed_attribute, bool drop_by_attribute_descending) {
 	last_progress = 0;
 
 	// The existing layermaps are one table per input thread.
@@ -3178,6 +3328,7 @@ int traverse_zooms(int *geomfd, off_t *geom_size, char *global_stringpool, std::
 		unsigned long long zoom_mingap = 0;
 		long long zoom_minextent = 0;
 		unsigned long long zoom_mindrop_sequence = 0;
+		double zoom_minattribute = drop_by_attribute_descending ? HUGE_VAL : -HUGE_VAL;
 		size_t zoom_tile_size = 0;
 		size_t zoom_feature_count = 0;
 		std::set<zxy> skip_children_out;
@@ -3214,6 +3365,10 @@ int traverse_zooms(int *geomfd, off_t *geom_size, char *global_stringpool, std::
 				args[thread].minextent_out = zoom_minextent;
 				args[thread].mindrop_sequence = zoom_mindrop_sequence;
 				args[thread].mindrop_sequence_out = zoom_mindrop_sequence;
+				args[thread].minattribute = zoom_minattribute;
+				args[thread].minattribute_out = zoom_minattribute;
+				args[thread].drop_by_attribute_as_needed_attribute = drop_by_attribute_as_needed_attribute;
+				args[thread].drop_by_attribute_descending = drop_by_attribute_descending;
 				args[thread].tile_size_out = 0;
 				args[thread].feature_count_out = 0;
 				args[thread].child_shards = TEMP_FILES / threads;
@@ -3298,6 +3453,13 @@ int traverse_zooms(int *geomfd, off_t *geom_size, char *global_stringpool, std::
 				}
 				if (args[thread].mindrop_sequence_out > zoom_mindrop_sequence) {
 					zoom_mindrop_sequence = args[thread].mindrop_sequence_out;
+					again = true;
+				}
+				bool attr_propagate = drop_by_attribute_descending
+						? args[thread].minattribute_out < zoom_minattribute
+						: args[thread].minattribute_out > zoom_minattribute;
+				if (attr_propagate) {
+					zoom_minattribute = args[thread].minattribute_out;
 					again = true;
 				}
 				if (args[thread].tile_size_out > zoom_tile_size) {
