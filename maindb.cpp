@@ -28,6 +28,7 @@
 #include <zlib.h>
 #include <algorithm>
 #include <vector>
+#include <thread>
 #include <string>
 #include <set>
 #include <map>
@@ -44,16 +45,12 @@
 
 #include "jsonpull/jsonpull.h"
 #include "mbtiles.hpp"
-#include "pmtiles_file.hpp"
 #include "tile-db.hpp"  // 使用 MongoDB 版本
 #include "pool.hpp"
 #include "projection.hpp"
 #include "memfile.hpp"
 #include "maindb.hpp"
 #include "geojson.hpp"
-#include "geobuf.hpp"
-#include "flatgeobuf.hpp"
-#include "geocsv.hpp"
 #include "geometry.hpp"
 #include "serial.hpp"
 #include "options.hpp"
@@ -131,10 +128,7 @@ bool order_by_size = false;
 int prevent[256];
 int additional[256];
 
-struct source {
-	std::string layer = "";
-	std::string description = "";
-};
+
 
 size_t CPUS;
 size_t TEMP_FILES;
@@ -944,7 +938,7 @@ double round_droprate(double r) {
 	return std::round(r * 100000.0) / 100000.0;
 }
 
-std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzoom, int basezoom, double basezoom_marker_width, sqlite3 *outdb, const char *outdir, std::set<std::string> *exclude, std::set<std::string> *include, int exclude_all, json_object *filter, double droprate, int buffer, const char *tmpdir, double gamma, int forcetable, const char *attribution, bool uses_gamma, long long *file_bbox, long long *file_bbox1, long long *file_bbox2, const char *prefilter, const char *postfilter, const char *description, bool guess_maxzoom, bool guess_cluster_maxzoom, std::unordered_map<std::string, int> const *attribute_types, const char *pgm, std::unordered_map<std::string, attribute_op> const *attribute_accum, std::map<std::string, std::string> const &attribute_descriptions, std::string const &commandline, int minimum_maxzoom) {
+std::pair<int, metadata> read_input(std::string &layername, const char *fname, int maxzoom, int minzoom, int basezoom, double basezoom_marker_width, sqlite3 *outdb, const char *outdir, std::set<std::string> *exclude, std::set<std::string> *include, int exclude_all, json_object *filter, double droprate, int buffer, const char *tmpdir, double gamma, int forcetable, const char *attribution, bool uses_gamma, long long *file_bbox, long long *file_bbox1, long long *file_bbox2, const char *prefilter, const char *postfilter, const char *description, bool guess_maxzoom, bool guess_cluster_maxzoom, std::unordered_map<std::string, int> const *attribute_types, const char *pgm, std::unordered_map<std::string, attribute_op> const *attribute_accum, std::map<std::string, std::string> const &attribute_descriptions, std::string const &commandline, int minimum_maxzoom) {
 	int ret = EXIT_SUCCESS;
 
 	std::vector<struct reader> readers;
@@ -1184,15 +1178,10 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 		exit(EXIT_OPEN);
 	}
 
-	// Create a source for PostGIS data
-	source postgis_source;
-	postgis_source.layer = postgis_cfg.table.empty() ? "postgis" : postgis_cfg.table;
-	sources.push_back(postgis_source);
-
 	// Add to layermap
-	layermap_entry e = layermap_entry(sources.size() - 1);
+	layermap_entry e = layermap_entry(0);
 	e.description = "PostGIS layer";
-	layermap.insert(std::pair<std::string, layermap_entry>(postgis_source.layer, e));
+	layermap.insert(std::pair<std::string, layermap_entry>(layername, e));
 	layermaps.clear();
 	for (size_t l = 0; l < CPUS; l++) {
 		layermaps.push_back(layermap);
@@ -1237,14 +1226,60 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 		sst[i].attribute_types = attribute_types;
 	}
 
-	if (!reader.read_features(sst, sources.size() - 1, postgis_source.layer)) {
-		fprintf(stderr, "Failed to read features from PostGIS\n");
-		exit(EXIT_READ);
+	std::atomic<size_t> total_features{0};
+
+	if (!postgis_cfg.pk_field.empty()) {
+		long long min_pk = 0, max_pk = 0;
+		if (reader.get_pk_range(min_pk, max_pk)) {
+			if (!quiet) {
+				fprintf(stderr, "Parallel Fetch enabled over PK %s: Range [%lld, %lld]\n", 
+						postgis_cfg.pk_field.c_str(), min_pk, max_pk);
+			}
+
+			long long pk_range = max_pk - min_pk;
+			if (pk_range >= 0) {
+				max_pk += 1;
+				pk_range += 1;
+
+				long long chunk = pk_range / CPUS;
+				if (chunk == 0) chunk = 1;
+
+				std::vector<std::thread> threads;
+				for (size_t i = 0; i < CPUS; i++) {
+					long long t_min = min_pk + i * chunk;
+					long long t_max = (i == CPUS - 1) ? max_pk : (t_min + chunk);
+
+					if (t_min >= max_pk) break;
+
+					threads.emplace_back([&, i, t_min, t_max]() {
+						PostGISReader t_reader(postgis_cfg);
+						if (!t_reader.read_features(sst, 0, layername, t_min, t_max, true, i)) {
+							fprintf(stderr, "Thread %zu failed to read features\n", i);
+						}
+						total_features.fetch_add(t_reader.getTotalFeaturesProcessed());
+					});
+				}
+
+				for (auto &t : threads) {
+					t.join();
+				}
+			}
+		} else {
+			fprintf(stderr, "Failed to get PK range, falling back to single thread.\n");
+			postgis_cfg.pk_field.clear(); // trigger fallback
+		}
+	}
+
+	if (postgis_cfg.pk_field.empty()) {
+		if (!reader.read_features(sst, 0, layername)) {
+			fprintf(stderr, "Failed to read features from PostGIS\n");
+			exit(EXIT_READ);
+		}
+		total_features = reader.getTotalFeaturesProcessed();
 	}
 
 	// Auto-adjust MongoDB batch size based on data volume (only if user didn't specify)
 	if (mongo_cfg.batch_size == DEFAULT_MONGO_BATCH_SIZE) {
-		size_t total_features = reader.getTotalFeaturesProcessed();
 		size_t estimated_tiles = total_features * 2;  // Rough estimate
 		size_t suggested_batch = suggest_mongo_batch_size(estimated_tiles);
 		
@@ -1253,7 +1288,7 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 		if (!quiet) {
 			fprintf(stderr, "Auto-adjusted MongoDB batch size to %zu "
 					"(processed %zu features, estimated %zu tiles)\n", 
-					mongo_cfg.batch_size, total_features, estimated_tiles);
+					mongo_cfg.batch_size, total_features.load(), estimated_tiles);
 		}
 	}
 
@@ -2335,6 +2370,8 @@ void set_attribute_value(const char *arg) {
 
 
 int maindb(int argc, char **argv) {
+	fprintf(stderr, "Debug: Entering maindb()\n");
+	fflush(stderr);
 #ifdef MTRACE
 	mtrace();
 #endif
@@ -2345,8 +2382,6 @@ int maindb(int argc, char **argv) {
 	extern char *optarg;
 	int i;
 
-	char *name = NULL;
-	char *description = NULL;
 	char *out_mbtiles = NULL;
 	char *out_dir = NULL;
 	sqlite3 *outdb = NULL;
@@ -2360,8 +2395,6 @@ int maindb(int argc, char **argv) {
 	double gamma = 0;
 	int buffer = 5;
 	const char *tmpdir = "/tmp";
-	const char *attribution = NULL;
-	std::vector<source> sources;
 	const char *prefilter = NULL;
 	const char *postfilter = NULL;
 	bool guess_maxzoom = false;
@@ -2390,11 +2423,6 @@ int maindb(int argc, char **argv) {
 		{"force", no_argument, 0, 'f'},
 		{"allow-existing", no_argument, 0, 'F'},
 
-		{"Tileset description and attribution", 0, 0, 0},
-		{"name", required_argument, 0, 'n'},
-		{"attribution", required_argument, 0, 'A'},
-		{"description", required_argument, 0, 'N'},
-
 		{"PostGIS database connection", 0, 0, 0},
 		{"postgis", required_argument, 0, '~'},
 		{"postgis-host", required_argument, 0, '~'},
@@ -2405,6 +2433,7 @@ int maindb(int argc, char **argv) {
 		{"postgis-table", required_argument, 0, '~'},
 		{"postgis-geometry-field", required_argument, 0, '~'},
 		{"postgis-sql", required_argument, 0, '~'},
+		{"postgis-pk", required_argument, 0, '~'},
 
 		{"MongoDB output", 0, 0, 0},
 		{"mongo", required_argument, 0, '~'},
@@ -2611,6 +2640,7 @@ int maindb(int argc, char **argv) {
 
 	int option_index = 0;
 	while ((i = getopt_long(argc, argv, getopt_str, long_options, &option_index)) != -1) {
+		fprintf(stderr, "Debug: Processing option: %d, optarg: %s\n", i, optarg ? optarg : "NULL");
 		switch (i) {
 		case 0:
 			break;
@@ -2735,6 +2765,9 @@ int maindb(int argc, char **argv) {
 			} else if (strcmp(opt, "postgis-sql") == 0) {
 				postgis_cfg.sql = optarg;
 				use_postgis = true;
+			} else if (strcmp(opt, "postgis-pk") == 0) {
+				postgis_cfg.pk_field = optarg;
+				use_postgis = true;
 			} else if (strcmp(opt, "omongo") == 0) {
 				use_mongo = true;
 			} else if (strcmp(opt, "mongo") == 0) {
@@ -2786,18 +2819,6 @@ int maindb(int argc, char **argv) {
 			}
 			break;
 		}
-
-		case 'n':
-			name = optarg;
-			break;
-
-		case 'N':
-			description = optarg;
-			break;
-
-		case 'A':
-		attribution = optarg;
-		break;
 
 		case 'z':
 			if (strcmp(optarg, "g") == 0) {
@@ -3235,10 +3256,6 @@ int maindb(int argc, char **argv) {
 	if (out_mbtiles != NULL) {
 		if (force) {
 			unlink(out_mbtiles);
-		} else {
-			if (pmtiles_has_suffix(out_mbtiles)) {
-				check_pmtiles(out_mbtiles, argv, forcetable);
-			}
 		}
 
 		outdb = mbtiles_open(out_mbtiles, argv, forcetable);
@@ -3257,28 +3274,28 @@ int maindb(int argc, char **argv) {
 	// 1. 初始化 MongoDB（在 read_input 之前，因为 read_input 会调用 traverse_zooms）
 	if (use_mongo) {
 		if (!quiet) {
-			fprintf(stderr, "Initializing MongoDB for tile output...\n");
+			fprintf(stderr, "Debug: Initializing MongoDB for tile output...\n");
 		}
+		fprintf(stderr, "Debug: Calling MongoWriter::initialize_global()...\n");
 		MongoWriter::initialize_global();
+		fprintf(stderr, "Debug: MongoDB global initialization done.\n");
 		// 注意：不创建主线程的 mongo_writer 实例
 		// 工作线程会在 run_thread() 中通过 TLS 自动创建线程本地实例
 		// 避免内存泄漏和资源浪费
 	}
 
+	fprintf(stderr, "Debug: Starting data ingestion pipeline (read_input)...\n");
 	// 2. 调用 read_input() 读取 PostGIS 数据并写入瓦片
 	// read_input 内部会调用 traverse_zooms 进行瓦片写入
-	auto input_ret = read_input(sources, name ? name : out_mbtiles ? out_mbtiles
-					       : out_dir,
-		    maxzoom, minzoom, basezoom, basezoom_marker_width, outdb, out_dir, &exclude, &include, exclude_all, filter, droprate, buffer, tmpdir, gamma, forcetable, attribution, gamma != 0, file_bbox, file_bbox1, file_bbox2, prefilter, postfilter, description, guess_maxzoom, guess_cluster_maxzoom, &attribute_types, argv[0], &attribute_accum, attribute_descriptions, commandline, minimum_maxzoom);
+	std::string postgis_layer = postgis_cfg.table.empty() ? "postgis" : postgis_cfg.table;
+	fprintf(stderr, "Debug: Layer configuration: %s\n", postgis_layer.c_str());
+	auto input_ret = read_input(postgis_layer, out_mbtiles ? out_mbtiles : out_dir,
+		    maxzoom, minzoom, basezoom, basezoom_marker_width, outdb, out_dir, &exclude, &include, exclude_all, filter, droprate, buffer, tmpdir, gamma, forcetable, NULL, gamma != 0, file_bbox, file_bbox1, file_bbox2, prefilter, postfilter, NULL, guess_maxzoom, guess_cluster_maxzoom, &attribute_types, argv[0], &attribute_accum, attribute_descriptions, commandline, minimum_maxzoom);
 
 	ret = std::get<0>(input_ret);
 
 	if (outdb != NULL) {
 		mbtiles_close(outdb, argv[0]);
-	}
-
-	if (pmtiles_has_suffix(out_mbtiles)) {
-		mbtiles_map_image_to_pmtiles(out_mbtiles, std::get<1>(input_ret), prevent[P_TILE_COMPRESSION] == 0, quiet, quiet_progress);
 	}
 
 #ifdef MTRACE

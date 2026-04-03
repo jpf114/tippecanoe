@@ -348,9 +348,24 @@ void MongoWriter::flush_batch()
                 wc.timeout(std::chrono::milliseconds(config.wtimeout_ms));
             }
             
-            insert_opts.write_concern(wc);
-            
-            auto result = collection.insert_many(batch_buffer, insert_opts);
+            mongocxx::options::bulk_write bulk_opts;
+            bulk_opts.ordered(false); // 使用非顺序执行以获得更高性能
+            auto bulk = collection.create_bulk_write(bulk_opts);
+
+            for (const auto& doc : batch_buffer) {
+                bsoncxx::document::view view = doc.view();
+                auto filter = bsoncxx::builder::stream::document{} 
+                    << "z" << view["z"].get_int32()
+                    << "x" << view["x"].get_int32()
+                    << "y" << view["y"].get_int32()
+                    << bsoncxx::builder::stream::finalize;
+                
+                mongocxx::model::replace_one upsert_op(filter.view(), view);
+                upsert_op.upsert(true);
+                bulk.append(upsert_op);
+            }
+
+            auto result = bulk.execute();
             
             total_tiles_written += batch_buffer.size();
             total_batches_written++;

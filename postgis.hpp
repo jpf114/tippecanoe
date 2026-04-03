@@ -28,6 +28,7 @@ struct postgis_config
     std::string table;
     std::string geometry_field;
     std::string sql;
+    std::string pk_field;
     
     // Performance optimization settings
     size_t batch_size;              // Number of features per batch
@@ -45,6 +46,7 @@ struct postgis_config
           table(""),
           geometry_field("geometry"),
           sql(""),
+          pk_field(""),
           batch_size(DEFAULT_BATCH_SIZE),
           use_cursor(true),
           max_memory_mb(MAX_MEMORY_USAGE_MB),
@@ -61,7 +63,9 @@ public:
     ~PostGISReader();
 
     bool connect();
-    bool read_features(std::vector<struct serialization_state> &sst, size_t layer, const std::string &layername);
+    bool get_pk_range(long long &min_val, long long &max_val);
+    bool read_features(std::vector<struct serialization_state> &sst, size_t layer, const std::string &layername,
+                       long long min_pk = 0, long long max_pk = 0, bool has_range = false, size_t thread_id = 0);
     
     // Get statistics
     size_t getTotalFeaturesProcessed() const { return total_features_processed.load(); }
@@ -72,10 +76,11 @@ protected:
     bool execute_query(const std::string &query);
     bool execute_query_with_retry(const std::string &query);
     void process_batch(PGresult *res, std::vector<struct serialization_state> &sst, 
-                      size_t layer, const std::string &layername, int geom_field_index);
+                      size_t layer, const std::string &layername, int geom_field_index, size_t thread_id);
     void process_feature(PGresult *res, int row, int nfields, int geom_field_index,
+                        const std::vector<std::string> &field_names,
                         std::vector<struct serialization_state> &sst, size_t layer, 
-                        const std::string &layername);
+                        const std::string &layername, size_t thread_id);
     std::string escape_json_string(const char *value);
     bool check_memory_usage();
     void log_progress(size_t processed, size_t total, const char *stage);

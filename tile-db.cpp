@@ -2861,52 +2861,54 @@ long long write_tile(decompressor *geoms, std::atomic<long long> *geompos_in, ch
 					detail_reduced++;
 				}
 			} else {
-				if (pthread_mutex_lock(&db_lock) != 0) {
-					perror("pthread_mutex_lock");
-					exit(EXIT_PTHREAD);
-				}
-
 				if (skipped > 0 || too_many_bytes || too_many_features) {
 					fprintf(stderr, "Can't happen: writing tile even though we skipped\n");
 					exit(EXIT_IMPOSSIBLE);
 				}
 
-				// Write to MongoDB (required)
-				// Use thread-local MongoWriter to avoid race conditions
+				// Write to MongoDB (outside db_lock)
+				// MongoDB uses thread-local storage (TLS) instances â each thread
+				// has its own connection and batch buffer, so no external lock is needed.
+				// Moving this outside db_lock allows true concurrent writes to MongoDB
+				// across all worker threads.
 				if (mongo_cfg.dbname != "") {
 					try {
 						MongoWriter* thread_mongo_writer = MongoWriter::get_thread_local_instance(mongo_cfg);
 						if (thread_mongo_writer) {
 							thread_mongo_writer->write_tile(z, tx, ty, compressed.data(), compressed.size());
 						} else {
-							fprintf(stderr, "Warning: Failed to get MongoDB thread-local instance for tile %d/%u/%u\n", 
+							fprintf(stderr, "Fatal Error: Failed to get MongoDB thread-local instance for tile %d/%u/%u\n", 
 							        z, tx, ty);
-							// 不退出，继续处理其他瓦片
+							exit(EXIT_MONGO);
 						}
 					} catch (const std::exception &e) {
-						// MongoWriter 内部已处理错误和重试
-						// 这里只记录警告，不中断整个处理流程
-						fprintf(stderr, "Warning: MongoDB write failed for tile %d/%u/%u: %s\n", 
+						fprintf(stderr, "Fatal Error: MongoDB write failed for tile %d/%u/%u: %s\n", 
 						        z, tx, ty, e.what());
-						// 不退出，继续处理其他瓦片
-						// 错误统计由 MongoWriter 内部处理
+						exit(EXIT_MONGO);
 					} catch (...) {
-						fprintf(stderr, "Warning: MongoDB write failed with unknown error for tile %d/%u/%u\n", 
+						fprintf(stderr, "Fatal Error: MongoDB write failed with unknown error for tile %d/%u/%u\n", 
 						        z, tx, ty);
-						// 不退出，继续处理其他瓦片
+						exit(EXIT_MONGO);
 					}
 				}
 
-				// Write to file (optional)
-				if (outdb != NULL) {
-					mbtiles_write_tile(outdb, z, tx, ty, compressed.data(), compressed.size());
-				} else if (outdir != NULL) {
-					dir_write_tile(outdir, z, tx, ty, compressed);
-				}
+				// Write to file (optional) â requires db_lock for SQLite/dir thread safety
+				if (outdb != NULL || outdir != NULL) {
+					if (pthread_mutex_lock(&db_lock) != 0) {
+						perror("pthread_mutex_lock");
+						exit(EXIT_PTHREAD);
+					}
 
-				if (pthread_mutex_unlock(&db_lock) != 0) {
-					perror("pthread_mutex_unlock");
-					exit(EXIT_PTHREAD);
+					if (outdb != NULL) {
+						mbtiles_write_tile(outdb, z, tx, ty, compressed.data(), compressed.size());
+					} else if (outdir != NULL) {
+						dir_write_tile(outdir, z, tx, ty, compressed);
+					}
+
+					if (pthread_mutex_unlock(&db_lock) != 0) {
+						perror("pthread_mutex_unlock");
+						exit(EXIT_PTHREAD);
+					}
 				}
 
 				if (trying_to_stop_early && line_detail == first_detail) {

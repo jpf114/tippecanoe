@@ -51,22 +51,26 @@ PostGISReader::~PostGISReader()
 bool PostGISReader::connect()
 {
     const char *keywords[] = {"host", "port", "dbname", "user", "password", "connect_timeout", NULL};
+    std::string timeout_str = std::to_string(CONNECTION_TIMEOUT_SEC);
     const char *values[] = {
         config.host.c_str(),
         config.port.c_str(),
         config.dbname.c_str(),
         config.user.c_str(),
         config.password.c_str(),
-        std::to_string(CONNECTION_TIMEOUT_SEC).c_str(),
+        timeout_str.c_str(),
         NULL};
+    
+    fprintf(stderr, "Debug: Connecting to PostGIS (%s:%s/%s)...\n", config.host.c_str(), config.port.c_str(), config.dbname.c_str());
     conn = PQconnectdbParams(keywords, values, 0);
 
     if (PQstatus((PGconn *)conn) != CONNECTION_OK)
     {
-        fprintf(stderr, "Connection to database failed: %s\n", PQerrorMessage((PGconn *)conn));
+        fprintf(stderr, "Debug: Connection to PostGIS failed: %s\n", PQerrorMessage((PGconn *)conn));
         return false;
     }
 
+    fprintf(stderr, "Debug: Connected to PostGIS successfully.\n");
     return true;
 }
 
@@ -191,15 +195,20 @@ std::string PostGISReader::escape_json_string(const char *value)
  * @param sst 序列化状态向量
  * @param layer 当前图层索引
  * @param layername 图层名称
+ * @param thread_id 当前线程ID，用于获取独立的 sst 槽
  */
 void PostGISReader::process_feature(PGresult *res, int row, int nfields, int geom_field_index,
+                                    const std::vector<std::string> &field_names,
                                     std::vector<struct serialization_state> &sst, size_t layer,
-                                    const std::string &layername)
+                                    const std::string &layername, size_t thread_id)
 {
     feature_buffer.clear();
-    feature_buffer.reserve(1024);
+    // 提高预分配：4KB 通常能容纳绝大多数要素，减少扩容开销
+    if (feature_buffer.capacity() < 4096) {
+        feature_buffer.reserve(4096);
+    }
 
-    feature_buffer += "{\"type\":\"Feature\",";
+    feature_buffer.append("{\"type\":\"Feature\",");
 
     char *geom_value = PQgetvalue(res, row, geom_field_index);
     if (geom_value == NULL || strlen(geom_value) == 0)
@@ -207,8 +216,8 @@ void PostGISReader::process_feature(PGresult *res, int row, int nfields, int geo
         return;
     }
 
-    feature_buffer += "\"geometry\":";
-    feature_buffer += geom_value;
+    feature_buffer.append("\"geometry\":");
+    feature_buffer.append(geom_value);
 
     bool has_properties = false;
     for (int field = 0; field < nfields; field++)
@@ -216,7 +225,7 @@ void PostGISReader::process_feature(PGresult *res, int row, int nfields, int geo
         if (field != geom_field_index)
         {
             char *value = PQgetvalue(res, row, field);
-            if (value != NULL && strlen(value) > 0)
+            if (value != NULL && value[0] != '\0')
             {
                 has_properties = true;
                 break;
@@ -226,73 +235,70 @@ void PostGISReader::process_feature(PGresult *res, int row, int nfields, int geo
 
     if (has_properties)
     {
-        feature_buffer += ",\"properties\":{";
+        feature_buffer.append(",\"properties\":{");
         bool first_property = true;
 
         for (int field = 0; field < nfields; field++)
         {
             if (field != geom_field_index)
             {
-                const char *fieldname = PQfname(res, field);
-                if (fieldname == NULL || strlen(fieldname) == 0 ||
-                    strcmp(fieldname, config.geometry_field.c_str()) == 0)
+                const std::string &fieldname = field_names[field];
+                if (fieldname.empty() || 
+                    fieldname == config.geometry_field)
                 {
                     continue;
                 }
 
                 char *value = PQgetvalue(res, row, field);
-                if (value == NULL || strlen(value) == 0)
+                if (value == NULL || value[0] == '\0')
                 {
                     continue;
                 }
 
                 if (!first_property)
                 {
-                    feature_buffer += ",";
+                    feature_buffer.append(",");
                 }
                 first_property = false;
 
-                feature_buffer += "\"";
-                feature_buffer += fieldname;
-                feature_buffer += "\":";
+                feature_buffer.append("\"");
+                feature_buffer.append(fieldname);
+                feature_buffer.append("\":");
 
                 Oid type = PQftype(res, field);
 
                 if (type == 20 || type == 21 || type == 23 || type == 700 || type == 701)
                 {
-                    feature_buffer += value;
+                    feature_buffer.append(value);
                 }
                 else if (type == 16)
                 {
-                    feature_buffer += (strcmp(value, "t") == 0) ? "true" : "false";
+                    feature_buffer.append((value[0] == 't') ? "true" : "false");
                 }
                 else
                 {
-                    feature_buffer += "\"";
-                    feature_buffer += escape_json_string(value);
-                    feature_buffer += "\"";
+                    feature_buffer.append("\"");
+                    feature_buffer.append(escape_json_string(value));
+                    feature_buffer.append("\"");
                 }
             }
         }
-        feature_buffer += "}";
+        feature_buffer.append("}");
     }
 
-    feature_buffer += "}";
+    feature_buffer.append("}");
 
-    char *feature_buffer_copy = strdup(feature_buffer.c_str());
-    if (feature_buffer_copy)
+    // 优化：直接使用 feature_buffer 内存，避免 strdup 的额外分配和拷贝
+    // 由于 parse_json 是同步执行的，在 json_end_map 之前 feature_buffer 保证有效。
+    struct json_pull *jp = json_begin_map((char *) feature_buffer.c_str(), feature_buffer.length());
+    if (jp != NULL)
     {
-        struct json_pull *jp = json_begin_map(feature_buffer_copy, feature_buffer.length());
-        if (jp != NULL)
-        {
-            struct serialization_state temp_sst = sst[layer % sst.size()];
-            temp_sst.fname = "PostGIS";
-            temp_sst.line = row + 1;
+        struct serialization_state temp_sst = sst[thread_id % sst.size()];
+        temp_sst.fname = "PostGIS";
+        temp_sst.line = row + 1;
 
-            parse_json(&temp_sst, jp, layer, layername);
-            json_end_map(jp);
-        }
-        free(feature_buffer_copy);
+        parse_json(&temp_sst, jp, layer, layername);
+        json_end_map(jp);
     }
 
     total_features_processed.fetch_add(1);
@@ -310,16 +316,25 @@ void PostGISReader::process_feature(PGresult *res, int row, int nfields, int geo
  * @param layer 当前图层索引
  * @param layername 图层名称
  * @param geom_field_index 几何字段的索引位置
+ * @param thread_id 线程ID
  */
 void PostGISReader::process_batch(PGresult *res, std::vector<struct serialization_state> &sst,
-                                  size_t layer, const std::string &layername, int geom_field_index)
+                                  size_t layer, const std::string &layername, int geom_field_index,
+                                  size_t thread_id)
 {
     int ntuples = PQntuples(res);
     int nfields = PQnfields(res);
 
+    // 性能优化：在批处理开始前缓存所有字段名，避免在行循环中重复调用 PQfname
+    std::vector<std::string> field_names;
+    field_names.reserve(nfields);
+    for (int i = 0; i < nfields; i++) {
+        field_names.push_back(PQfname(res, i));
+    }
+
     for (int i = 0; i < ntuples; i++)
     {
-        process_feature(res, i, nfields, geom_field_index, sst, layer, layername);
+        process_feature(res, i, nfields, geom_field_index, field_names, sst, layer, layername, thread_id);
 
         if (i % 100 == 0 && !check_memory_usage())
         {
@@ -392,6 +407,51 @@ bool PostGISReader::execute_query(const std::string &query)
 }
 
 /**
+ * @brief 获取主键范围
+ * 
+ * 获取指定主键列的最小值和最大值，用于并行分区扫描
+ * 
+ * @param min_val 传出的最小值
+ * @param max_val 传出的最大值
+ * @return bool 成功返回 true，失败返回 false
+ */
+bool PostGISReader::get_pk_range(long long &min_val, long long &max_val)
+{
+    if (!conn && !connect())
+    {
+        return false;
+    }
+    
+    if (config.pk_field.empty() || config.table.empty()) {
+        fprintf(stderr, "Error: postgis-pk and postgis-table are required for get_pk_range\n");
+        return false;
+    }
+
+    std::string query = "SELECT MIN(" + config.pk_field + "), MAX(" + config.pk_field + ") FROM " + config.table;
+    PGresult *res = PQexec((PGconn *)conn, query.c_str());
+    
+    if (PQresultStatus(res) != PGRES_TUPLES_OK)
+    {
+        fprintf(stderr, "Failed to get PK range: %s\n", PQerrorMessage((PGconn *)conn));
+        PQclear(res);
+        return false;
+    }
+    
+    if (PQntuples(res) == 0 || PQgetisnull(res, 0, 0) || PQgetisnull(res, 0, 1))
+    {
+        fprintf(stderr, "Warning: Table seems to be empty or PK field is NULL\n");
+        PQclear(res);
+        return false;
+    }
+
+    min_val = strtoll(PQgetvalue(res, 0, 0), NULL, 10);
+    max_val = strtoll(PQgetvalue(res, 0, 1), NULL, 10);
+    
+    PQclear(res);
+    return true;
+}
+
+/**
  * @brief 读取地理空间要素的主函数
  * 
  * 从 PostGIS 数据库读取地理空间数据，支持自定义 SQL 查询或自动生成查询
@@ -401,9 +461,14 @@ bool PostGISReader::execute_query(const std::string &query)
  * @param sst 序列化状态向量，用于存储瓦片数据
  * @param layer 当前图层索引
  * @param layername 图层名称
+ * @param min_pk 该分区的最小主键（包含）
+ * @param max_pk 该分区的最大主键（不包含）
+ * @param has_range 是否启用了分区限制
+ * @param thread_id 当前线程ID
  * @return bool 读取成功返回 true，失败返回 false
  */
-bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, size_t layer, const std::string &layername)
+bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, size_t layer, const std::string &layername,
+                                  long long min_pk, long long max_pk, bool has_range, size_t thread_id)
 {
     if (!conn)
     {
@@ -428,14 +493,32 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
         return false;
     }
 
+    if (has_range && !config.pk_field.empty())
+    {
+        // 如果是自定义 SQL，这里强行拼接 WHERE 可能导致语法错误，但通常我们通过 --postgis-table 工作
+        // 简单处理：将子查询包装起来或直接附带 WHERE
+        std::string range_cond = config.pk_field + " >= " + std::to_string(min_pk) + 
+                                 " AND " + config.pk_field + " < " + std::to_string(max_pk);
+        
+        if (!config.sql.empty()) {
+            base_query = "SELECT * FROM (" + config.sql + ") AS subq WHERE " + range_cond;
+        } else {
+            base_query += " WHERE " + range_cond;
+        }
+    }
+
     size_t total_count = 0;
     if (config.enable_progress_report)
     {
         std::string count_query = "SELECT COUNT(*) FROM (" + base_query + ") AS subquery";
+        fprintf(stderr, "Debug: Executing count query: %s\n", count_query.c_str());
         PGresult *count_res = PQexec((PGconn *)conn, count_query.c_str());
         if (PQresultStatus(count_res) == PGRES_TUPLES_OK)
         {
             total_count = strtoull(PQgetvalue(count_res, 0, 0), NULL, 10);
+        }
+        else {
+            fprintf(stderr, "Debug: Count query failed: %s\n", PQerrorMessage((PGconn *)conn));
         }
         PQclear(count_res);
     }
@@ -444,7 +527,8 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
     {
         fprintf(stderr, "Using cursor-based batch processing (batch size: %zu)\n", config.batch_size);
 
-        std::string cursor_name = "postgis_cursor_" + std::to_string(getpid());
+        // 使用当前线程 ID 保证游标名字唯一
+        std::string cursor_name = "postgis_cursor_" + std::to_string(getpid()) + "_" + std::to_string(min_pk);
         std::string declare_query = "DECLARE " + cursor_name + " CURSOR FOR " + base_query;
 
         if (!execute_query(declare_query))
@@ -488,7 +572,7 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
                 geom_field_index = 0;
             }
 
-            process_batch(res, sst, layer, layername, geom_field_index);
+            process_batch(res, sst, layer, layername, geom_field_index, thread_id);
 
             offset += ntuples;
             log_progress(offset, total_count, "Fetching batches");
@@ -550,7 +634,7 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
             geom_field_index = 0;
         }
 
-        process_batch(res, sst, layer, layername, geom_field_index);
+        process_batch(res, sst, layer, layername, geom_field_index, thread_id);
 
         PQclear(res);
     }
