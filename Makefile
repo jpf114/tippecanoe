@@ -66,7 +66,7 @@ LIBS = -L/usr/local/lib
 tippecanoe: geojson.o jsonpull/jsonpull.o tile.o pool.o mbtiles.o geometry.o projection.o memfile.o mvt.o serial.o main.o platform.o text.o dirtiles.o pmtiles_file.o plugin.o read_json.o write_json.o geobuf.o flatgeobuf.o evaluator.o geocsv.o csv.o geojson-loop.o json_logger.o visvalingam.o compression.o clip.o sort.o attribute.o thread.o shared_borders.o postgis.o wkt_parser.o clipper2/src/clipper.engine.o
 	$(CXX) $(PG) $(LIBS) $(PGIS_LIB) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lm -lz -lsqlite3 -lpthread -lpq
 
-tippecanoe-db: geojson.o jsonpull/jsonpull.o tile-db.o pool.o mbtiles.o geometry.o projection.o memfile.o mvt.o serial.o maindb.o platform.o text.o dirtiles.o plugin.o read_json.o write_json.o evaluator.o geojson-loop.o json_logger.o visvalingam.o compression.o clip.o sort.o attribute.o thread.o shared_borders.o postgis.o wkt_parser.o mongo.o clipper2/src/clipper.engine.o
+tippecanoe-db: geojson.o jsonpull/jsonpull.o tile-db.o pool.o mbtiles.o geometry.o projection.o memfile.o mvt.o serial.o maindb.o platform.o text.o dirtiles.o plugin.o read_json.o write_json.o evaluator.o geojson-loop.o json_logger.o visvalingam.o compression.o clip.o sort.o attribute.o thread.o shared_borders.o postgis.o wkt_parser.o mongo.o postgis_manager.o mongo_manager.o clipper2/src/clipper.engine.o
 	$(CXX) $(PG) $(LIBS) $(PGIS_LIB) -I/usr/local/include/libmongoc-1.0 -I/usr/local/include/bson-1.0 -I/usr/local/include/bsoncxx/v_noabi -I/usr/local/include/mongocxx/v_noabi -L/usr/local/lib $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lm -lz -lsqlite3 -lpthread -lpq -lmongocxx -lbsoncxx
 
 tippecanoe-enumerate: enumerate.o
@@ -92,6 +92,10 @@ tippecanoe-overzoom: overzoom.o mvt.o clip.o evaluator.o jsonpull/jsonpull.o tex
 # Special rules must come before generic rules
 # Special rule for mongo.o with MongoDB headers
 mongo.o: mongo.cpp
+	$(CXX) -MMD $(PG) $(PGIS_INCLUDE) $(INCLUDES) -I/usr/local/include/libmongoc-1.0 -I/usr/local/include/bson-1.0 -I/usr/local/include/bsoncxx/v_noabi -I/usr/local/include/mongocxx/v_noabi $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
+
+# Special rule for mongo_manager.o with MongoDB headers
+mongo_manager.o: mongo_manager.cpp
 	$(CXX) -MMD $(PG) $(PGIS_INCLUDE) $(INCLUDES) -I/usr/local/include/libmongoc-1.0 -I/usr/local/include/bson-1.0 -I/usr/local/include/bsoncxx/v_noabi -I/usr/local/include/mongocxx/v_noabi $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
 
 # Special rule for tile-db.o with MongoDB headers (includes mongo.hpp) - for tippecanoe-db only

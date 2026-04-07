@@ -31,6 +31,7 @@
 *.out
 *.app
 tippecanoe
+tippecanoe-db
 tile-join
 tippecanoe-decode
 tippecanoe-enumerate
@@ -52,3 +53,4 @@ tests/**/*.geobuf
 # Nodejs
 node_modules
 /bin
+

@@ -66,6 +66,8 @@
 #include "platform.hpp"
 #include "mongo.hpp"
 #include "config.hpp"
+#include "postgis_manager.hpp"
+#include "mongo_manager.hpp"
 
 static int low_detail = 12;
 static int full_detail = -1;
@@ -97,19 +99,6 @@ long long extend_zooms_max = 0;
 int retain_points_multiplier = 1;
 std::vector<std::string> unidecode_data;
 size_t maximum_string_attribute_length = 0;
-
-// 智能 MongoDB 批量大小建议函数
-static size_t suggest_mongo_batch_size(size_t estimated_tiles) {
-    if (estimated_tiles < 1000) {
-        return 50;      // 小数据集：快速响应
-    } else if (estimated_tiles < 10000) {
-        return 100;     // 中等数据集：平衡
-    } else if (estimated_tiles < 100000) {
-        return 200;     // 较大数据集：提高吞吐
-    } else {
-        return 500;     // 大数据集：最大化吞吐
-    }
-}
 
 // PostGIS configuration
 bool use_postgis = false;
@@ -1095,32 +1084,9 @@ std::pair<int, metadata> read_input(std::string &layername, const char *fname, i
 		exit(EXIT_ARGS);
 	}
 
-	// Validate PostGIS configuration
-	if (postgis_cfg.host.empty()) {
-		fprintf(stderr, "Error: PostGIS host is required\n");
-		exit(EXIT_ARGS);
-	}
-	if (postgis_cfg.port.empty()) {
-		postgis_cfg.port = "5432"; // Default PostgreSQL port
-	}
-	if (postgis_cfg.dbname.empty()) {
-		fprintf(stderr, "Error: PostGIS database name is required\n");
-		exit(EXIT_ARGS);
-	}
-	if (postgis_cfg.user.empty()) {
-		fprintf(stderr, "Error: PostGIS user is required\n");
-		exit(EXIT_ARGS);
-	}
-	if (postgis_cfg.password.empty()) {
-		fprintf(stderr, "Error: PostGIS password is required\n");
-		exit(EXIT_ARGS);
-	}
-	if (postgis_cfg.table.empty() && postgis_cfg.sql.empty()) {
-		fprintf(stderr, "Error: Either PostGIS table or SQL query is required\n");
-		exit(EXIT_ARGS);
-	}
-	if (postgis_cfg.geometry_field.empty()) {
-		fprintf(stderr, "Error: PostGIS geometry field is required\n");
+	// Validate PostGIS configuration using manager
+	if (!PostGIS::validate_config(postgis_cfg)) {
+		fprintf(stderr, "Error: %s\n", PostGIS::get_validation_error().c_str());
 		exit(EXIT_ARGS);
 	}
 
@@ -1130,33 +1096,9 @@ std::pair<int, metadata> read_input(std::string &layername, const char *fname, i
 		exit(EXIT_ARGS);
 	}
 
-	// Validate ALL MongoDB connection parameters are provided
-	if (mongo_cfg.host.empty()) {
-		fprintf(stderr, "Error: MongoDB host is required (--mongo-host)\n");
-		exit(EXIT_ARGS);
-	}
-	if (mongo_cfg.port == 0) {
-		fprintf(stderr, "Error: MongoDB port is required (--mongo-port)\n");
-		exit(EXIT_ARGS);
-	}
-	if (mongo_cfg.dbname.empty()) {
-		fprintf(stderr, "Error: MongoDB database name is required (--mongo-dbname)\n");
-		exit(EXIT_ARGS);
-	}
-	if (mongo_cfg.collection.empty()) {
-		fprintf(stderr, "Error: MongoDB collection is required (--mongo-collection)\n");
-		exit(EXIT_ARGS);
-	}
-	if (mongo_cfg.username.empty()) {
-		fprintf(stderr, "Error: MongoDB username is required (--mongo-username)\n");
-		exit(EXIT_ARGS);
-	}
-	if (mongo_cfg.password.empty()) {
-		fprintf(stderr, "Error: MongoDB password is required (--mongo-password)\n");
-		exit(EXIT_ARGS);
-	}
-	if (mongo_cfg.auth_source.empty()) {
-		fprintf(stderr, "Error: MongoDB auth source is required (--mongo-auth-source)\n");
+	// Validate MongoDB configuration using manager
+	if (!MongoDB::validate_config(mongo_cfg)) {
+		fprintf(stderr, "Error: %s\n", MongoDB::get_validation_error().c_str());
 		exit(EXIT_ARGS);
 	}
 	
@@ -1237,60 +1179,18 @@ std::pair<int, metadata> read_input(std::string &layername, const char *fname, i
 
 	std::atomic<size_t> total_features{0};
 
-	if (!postgis_cfg.pk_field.empty()) {
-		long long min_pk = 0, max_pk = 0;
-		if (reader.get_pk_range(min_pk, max_pk)) {
-			if (!quiet) {
-				fprintf(stderr, "Parallel Fetch enabled over PK %s: Range [%lld, %lld]\n", 
-						postgis_cfg.pk_field.c_str(), min_pk, max_pk);
-			}
-
-			long long pk_range = max_pk - min_pk;
-			if (pk_range >= 0) {
-				max_pk += 1;
-				pk_range += 1;
-
-				long long chunk = pk_range / CPUS;
-				if (chunk == 0) chunk = 1;
-
-				std::vector<std::thread> threads;
-				for (size_t i = 0; i < CPUS; i++) {
-					long long t_min = min_pk + i * chunk;
-					long long t_max = (i == CPUS - 1) ? max_pk : (t_min + chunk);
-
-					if (t_min >= max_pk) break;
-
-					threads.emplace_back([&, i, t_min, t_max]() {
-						PostGISReader t_reader(postgis_cfg);
-						if (!t_reader.read_features(sst, 0, layername, t_min, t_max, true, i)) {
-							fprintf(stderr, "Thread %zu failed to read features\n", i);
-						}
-						total_features.fetch_add(t_reader.getTotalFeaturesProcessed());
-					});
-				}
-
-				for (auto &t : threads) {
-					t.join();
-				}
-			}
-		} else {
-			fprintf(stderr, "Failed to get PK range, falling back to single thread.\n");
-			postgis_cfg.pk_field.clear(); // trigger fallback
-		}
+	// Use PostGIS manager for parallel reading
+	PostGIS::ParallelReader parallel_reader(postgis_cfg, CPUS);
+	if (!parallel_reader.read_parallel(sst, 0, layername)) {
+		fprintf(stderr, "Failed to read features from PostGIS\n");
+		exit(EXIT_READ);
 	}
-
-	if (postgis_cfg.pk_field.empty()) {
-		if (!reader.read_features(sst, 0, layername)) {
-			fprintf(stderr, "Failed to read features from PostGIS\n");
-			exit(EXIT_READ);
-		}
-		total_features = reader.getTotalFeaturesProcessed();
-	}
+	total_features = parallel_reader.get_total_features();
 
 	// Auto-adjust MongoDB batch size based on data volume (only if user didn't specify)
 	if (mongo_cfg.batch_size == DEFAULT_MONGO_BATCH_SIZE) {
-		size_t estimated_tiles = total_features * 2;  // Rough estimate
-		size_t suggested_batch = suggest_mongo_batch_size(estimated_tiles);
+		size_t estimated_tiles = MongoDB::estimate_tile_count(total_features.load());
+		size_t suggested_batch = MongoDB::suggest_batch_size(estimated_tiles);
 		
 		mongo_cfg.batch_size = suggested_batch;
 		
@@ -3282,15 +3182,7 @@ int maindb(int argc, char **argv) {
 
 	// 1. 初始化 MongoDB（在 read_input 之前，因为 read_input 会调用 traverse_zooms）
 	if (use_mongo) {
-		if (!quiet) {
-			DEBUG_LOG("Initializing MongoDB for tile output...");
-		}
-		DEBUG_LOG("Calling MongoWriter::initialize_global()...");
-		MongoWriter::initialize_global();
-		DEBUG_LOG("MongoDB global initialization done.");
-		// 注意：不创建主线程的 mongo_writer 实例
-		// 工作线程会在 run_thread() 中通过 TLS 自动创建线程本地实例
-		// 避免内存泄漏和资源浪费
+		MongoDB::initialize_global();
 	}
 
 	DEBUG_LOG("Starting data ingestion pipeline (read_input)...");
@@ -3323,24 +3215,17 @@ int maindb(int argc, char **argv) {
 	}
 
 	// 3. 检查 MongoDB 错误统计（在清理之前）
-	// 注意：工作线程使用 TLS 实例，需要通过 destroy_thread_local_instances() 获取统计
+	// 注意：工作线程使用 TLS 实例，需要通过 cleanup_global() 获取统计
 	if (use_mongo) {
-		// 先刷新所有 TLS 实例的缓冲区并汇总统计
-		MongoWriter::destroy_thread_local_instances();
+		MongoDB::cleanup_global();
 		
-		// 输出全局统计信息
-		if (!quiet) {
-			fprintf(stderr, "\nMongoDB 统计信息:\n");
-			fprintf(stderr, "  写入瓦片数：%zu\n", MongoWriter::get_global_total_tiles());
-			fprintf(stderr, "  批量写入次数：%zu\n", MongoWriter::get_global_total_batches());
-			fprintf(stderr, "  重试次数：%zu\n", MongoWriter::get_global_total_retries());
-			fprintf(stderr, "  错误次数：%zu\n", MongoWriter::get_global_total_errors());
-		}
+		// 获取并输出统计信息
+		auto stats = MongoDB::get_global_stats();
+		MongoDB::print_stats(stats, quiet);
 		
 		// 检查全局错误统计
-		size_t mongo_errors = MongoWriter::get_global_total_errors();
-		if (mongo_errors > 0) {
-			fprintf(stderr, "Error: MongoDB had %zu errors during write operations\n", mongo_errors);
+		if (stats.total_errors > 0) {
+			fprintf(stderr, "Error: MongoDB had %zu errors during write operations\n", stats.total_errors);
 			if (ret == 0) {
 				ret = EXIT_MONGO;
 			}
