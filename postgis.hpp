@@ -6,17 +6,10 @@
 #include <atomic>
 #include "geometry.hpp"
 #include "serial.hpp"
+#include "config.hpp"
 
 // Forward declaration for libpq types
 typedef struct pg_result PGresult;
-
-// Performance optimization constants
-constexpr size_t DEFAULT_BATCH_SIZE = 1000;        // Number of features to process per batch
-constexpr size_t MAX_BATCH_SIZE = 10000;           // Maximum batch size
-constexpr size_t MIN_BATCH_SIZE = 100;             // Minimum batch size
-constexpr size_t MAX_MEMORY_USAGE_MB = 512;        // Maximum memory usage in MB
-constexpr int MAX_RETRIES = 3;                     // Maximum retry attempts for database operations
-constexpr int CONNECTION_TIMEOUT_SEC = 30;         // Connection timeout in seconds
 
 struct postgis_config
 {
@@ -47,10 +40,10 @@ struct postgis_config
           geometry_field("geometry"),
           sql(""),
           pk_field(""),
-          batch_size(DEFAULT_BATCH_SIZE),
+          batch_size(DEFAULT_POSTGIS_BATCH_SIZE),
           use_cursor(true),
-          max_memory_mb(MAX_MEMORY_USAGE_MB),
-          max_retries(MAX_RETRIES),
+          max_memory_mb(MAX_POSTGIS_MEMORY_USAGE_MB),
+          max_retries(MAX_POSTGIS_RETRIES),
           enable_progress_report(true)
     {
     }
@@ -88,17 +81,11 @@ protected:
 private:
     postgis_config config;
     void *conn;
-    key_pool kpool;
     
     // Statistics and monitoring
     std::atomic<size_t> total_features_processed{0};
     std::atomic<size_t> total_batches_processed{0};
     std::atomic<size_t> current_memory_usage{0};
-    std::atomic<size_t> peak_memory_usage{0};
-    
-    // Buffer reuse for performance
-    std::string feature_buffer;
-    std::string properties_buffer;
 };
 
 #endif // POSTGIS_HPP

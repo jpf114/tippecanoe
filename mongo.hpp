@@ -14,16 +14,7 @@
 #include <mongocxx/options/replace.hpp>
 #include <mongocxx/write_concern.hpp>
 #include <mongocxx/options/client.hpp>
-
-// MongoDB 性能优化常量
-constexpr size_t DEFAULT_MONGO_BATCH_SIZE = 100;     // 默认批量插入大小
-constexpr size_t MAX_MONGO_BATCH_SIZE = 1000;        // 最大批量大小
-constexpr size_t MIN_MONGO_BATCH_SIZE = 10;          // 最小批量大小
-constexpr int MONGO_TIMEOUT_MS = 30000;              // 默认超时时间（毫秒）
-constexpr int MONGO_MAX_RETRIES = 3;                 // 最大重试次数
-constexpr int DEFAULT_WRITE_CONCERN = 1;             // 默认写确认级别 (0: 无确认，1: 主节点，2: majority)
-constexpr size_t MAX_CONNECTION_POOL_SIZE = 50;      // 最大连接池大小（防止资源耗尽）
-constexpr size_t DEFAULT_CONNECTION_POOL_SIZE = 10;  // 默认连接池大小
+#include "config.hpp"
 
 // MongoDB 写确认级别枚举
 enum class WriteConcernLevel {
@@ -72,7 +63,7 @@ struct mongo_config {
           password(""),
           auth_source(""),
           batch_size(DEFAULT_MONGO_BATCH_SIZE),
-          connection_pool_size(DEFAULT_CONNECTION_POOL_SIZE),
+          connection_pool_size(DEFAULT_MONGO_CONNECTION_POOL_SIZE),
           timeout_ms(MONGO_TIMEOUT_MS),
           max_retries(MONGO_MAX_RETRIES),
           write_concern_level(WriteConcernLevel::PRIMARY),
@@ -164,7 +155,7 @@ struct mongo_config {
         }
         
         // 连接池配置（限制最大值防止资源耗尽）
-        size_t actual_pool_size = std::min(connection_pool_size, MAX_CONNECTION_POOL_SIZE);
+        size_t actual_pool_size = std::min(connection_pool_size, MAX_MONGO_CONNECTION_POOL_SIZE);
         options += "&maxPoolSize=" + std::to_string(actual_pool_size);
         options += "&minPoolSize=1";
         

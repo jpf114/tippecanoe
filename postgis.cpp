@@ -7,6 +7,7 @@
 #include "geometry.hpp"
 #include "serial.hpp"
 #include "geojson.hpp"
+#include "wkt_parser.hpp"
 
 /**
  * @brief PostGIS 读取器构造函数
@@ -18,13 +19,13 @@
  */
 PostGISReader::PostGISReader(const postgis_config &cfg) : config(cfg), conn(NULL)
 {
-    if (config.batch_size < MIN_BATCH_SIZE)
+    if (config.batch_size < MIN_POSTGIS_BATCH_SIZE)
     {
-        config.batch_size = MIN_BATCH_SIZE;
+        config.batch_size = MIN_POSTGIS_BATCH_SIZE;
     }
-    else if (config.batch_size > MAX_BATCH_SIZE)
+    else if (config.batch_size > MAX_POSTGIS_BATCH_SIZE)
     {
-        config.batch_size = MAX_BATCH_SIZE;
+        config.batch_size = MAX_POSTGIS_BATCH_SIZE;
     }
 }
 
@@ -51,7 +52,7 @@ PostGISReader::~PostGISReader()
 bool PostGISReader::connect()
 {
     const char *keywords[] = {"host", "port", "dbname", "user", "password", "connect_timeout", NULL};
-    std::string timeout_str = std::to_string(CONNECTION_TIMEOUT_SEC);
+    std::string timeout_str = std::to_string(POSTGIS_CONNECTION_TIMEOUT_SEC);
     const char *values[] = {
         config.host.c_str(),
         config.port.c_str(),
@@ -61,16 +62,16 @@ bool PostGISReader::connect()
         timeout_str.c_str(),
         NULL};
     
-    fprintf(stderr, "Debug: Connecting to PostGIS (%s:%s/%s)...\n", config.host.c_str(), config.port.c_str(), config.dbname.c_str());
+    DEBUG_LOG("Connecting to PostGIS (%s:%s/%s)...", config.host.c_str(), config.port.c_str(), config.dbname.c_str());
     conn = PQconnectdbParams(keywords, values, 0);
 
     if (PQstatus((PGconn *)conn) != CONNECTION_OK)
     {
-        fprintf(stderr, "Debug: Connection to PostGIS failed: %s\n", PQerrorMessage((PGconn *)conn));
+        fprintf(stderr, "Error: Connection to PostGIS failed: %s\n", PQerrorMessage((PGconn *)conn));
         return false;
     }
 
-    fprintf(stderr, "Debug: Connected to PostGIS successfully.\n");
+    DEBUG_LOG("Connected to PostGIS successfully.");
     return true;
 }
 
@@ -78,6 +79,7 @@ bool PostGISReader::connect()
  * @brief 检查内存使用情况
  * 
  * 检查当前内存使用是否超过配置的最大限制
+ * 添加内存峰值跟踪和预警机制
  * 
  * @return bool 内存使用正常返回 true，超出限制返回 false
  */
@@ -86,12 +88,33 @@ bool PostGISReader::check_memory_usage()
     size_t estimated = current_memory_usage.load();
     size_t limit = config.max_memory_mb * 1024 * 1024;
     
+    // 更新峰值记录（如果有需要可以在 postgis.hpp 中恢复 peak_memory_usage）
+    
     if (estimated > limit)
     {
-        fprintf(stderr, "Warning: Memory usage (%zu MB) exceeds limit (%zu MB)\n",
+        fprintf(stderr, "⚠️  ERROR: Memory usage (%zu MB) exceeds limit (%zu MB)\n",
                 estimated / (1024 * 1024), config.max_memory_mb);
         return false;
     }
+    
+    // 预警：达到 80% 时提醒
+    if (estimated > limit * 0.8)
+    {
+        fprintf(stderr, "⚠️  WARNING: Memory usage at %.1f%% (%zu MB / %zu MB)\n",
+                (double)estimated / limit * 100.0,
+                estimated / (1024 * 1024),
+                config.max_memory_mb);
+    }
+    
+    // 提示：达到 50% 时记录
+    if (estimated > limit * 0.5 && estimated < limit * 0.8)
+    {
+        fprintf(stderr, "ℹ️  INFO: Memory usage at %.1f%% (%zu MB / %zu MB)\n",
+                (double)estimated / limit * 100.0,
+                estimated / (1024 * 1024),
+                config.max_memory_mb);
+    }
+    
     return true;
 }
 
@@ -185,8 +208,8 @@ std::string PostGISReader::escape_json_string(const char *value)
 /**
  * @brief 处理单个要素
  * 
- * 从数据库查询结果中提取单个要素，构建 GeoJSON Feature 格式，
- * 并调用解析器将其转换为 Tippecanoe 内部格式
+ * 从 PostgreSQL 查询结果中提取几何和属性数据，解析 WKT 几何，
+ * 直接构建 serial_feature 并调用 serialize_feature 进行序列化
  * 
  * @param res PostgreSQL 查询结果集
  * @param row 当前处理的行号
@@ -195,115 +218,112 @@ std::string PostGISReader::escape_json_string(const char *value)
  * @param sst 序列化状态向量
  * @param layer 当前图层索引
  * @param layername 图层名称
- * @param thread_id 当前线程ID，用于获取独立的 sst 槽
+ * @param thread_id 当前线程 ID，用于获取独立的 sst 槽
  */
 void PostGISReader::process_feature(PGresult *res, int row, int nfields, int geom_field_index,
                                     const std::vector<std::string> &field_names,
                                     std::vector<struct serialization_state> &sst, size_t layer,
                                     const std::string &layername, size_t thread_id)
 {
-    feature_buffer.clear();
-    // 提高预分配：4KB 通常能容纳绝大多数要素，减少扩容开销
-    if (feature_buffer.capacity() < 4096) {
-        feature_buffer.reserve(4096);
-    }
-
-    feature_buffer.append("{\"type\":\"Feature\",");
-
-    char *geom_value = PQgetvalue(res, row, geom_field_index);
-    if (geom_value == NULL || strlen(geom_value) == 0)
+    // 获取 WKT 字符串
+    char *wkt_value = PQgetvalue(res, row, geom_field_index);
+    if (wkt_value == NULL || strlen(wkt_value) == 0)
     {
+        fprintf(stderr, "Error: Empty or NULL WKT value at row %d\n", row + 1);
         return;
     }
-
-    feature_buffer.append("\"geometry\":");
-    feature_buffer.append(geom_value);
-
-    bool has_properties = false;
+    
+    // 解析 WKT 为 drawvec
+    WKTResult result = parse_wkt(std::string(wkt_value));
+    if (!result.valid)
+    {
+        fprintf(stderr, "Error: Failed to parse WKT at row %d: %s\n", 
+                row + 1, result.error.c_str());
+        fprintf(stderr, "  WKT content: %.100s%s\n", wkt_value, 
+                strlen(wkt_value) > 100 ? "..." : "");
+        return;
+    }
+    
+    // 跟踪内存使用：drawvec
+    size_t coord_memory = result.coordinates.capacity() * sizeof(draw);
+    current_memory_usage.fetch_add(coord_memory);
+    
+    // 构建 serial_feature（完全复用 geojson.cpp 的逻辑）
+    serial_feature sf;
+    sf.layer = layer;
+    sf.segment = thread_id % sst.size();
+    sf.t = mb_geometry[result.geometry_type];
+    sf.geometry = result.coordinates;
+    sf.has_id = false;
+    sf.id = 0;
+    sf.tippecanoe_minzoom = -1;
+    sf.tippecanoe_maxzoom = -1;
+    sf.feature_minzoom = 0;
+    sf.seq = *(sst[thread_id % sst.size()].layer_seq);
+    
+    // 处理属性
+    std::vector<std::shared_ptr<std::string>> full_keys;
+    std::vector<serial_val> values;
+    
+    // 跟踪属性内存
+    size_t attr_memory = 0;
+    
     for (int field = 0; field < nfields; field++)
     {
         if (field != geom_field_index)
         {
+            const std::string &fieldname = field_names[field];
+            if (fieldname.empty() || fieldname == config.geometry_field)
+            {
+                continue;
+            }
+            
             char *value = PQgetvalue(res, row, field);
             if (value != NULL && value[0] != '\0')
             {
-                has_properties = true;
-                break;
-            }
-        }
-    }
-
-    if (has_properties)
-    {
-        feature_buffer.append(",\"properties\":{");
-        bool first_property = true;
-
-        for (int field = 0; field < nfields; field++)
-        {
-            if (field != geom_field_index)
-            {
-                const std::string &fieldname = field_names[field];
-                if (fieldname.empty() || 
-                    fieldname == config.geometry_field)
-                {
-                    continue;
-                }
-
-                char *value = PQgetvalue(res, row, field);
-                if (value == NULL || value[0] == '\0')
-                {
-                    continue;
-                }
-
-                if (!first_property)
-                {
-                    feature_buffer.append(",");
-                }
-                first_property = false;
-
-                feature_buffer.append("\"");
-                feature_buffer.append(fieldname);
-                feature_buffer.append("\":");
-
+                full_keys.emplace_back(std::make_shared<std::string>(fieldname));
+                attr_memory += fieldname.size() + sizeof(std::string);
+                
+                serial_val sv;
                 Oid type = PQftype(res, field);
-
                 if (type == 20 || type == 21 || type == 23 || type == 700 || type == 701)
                 {
-                    feature_buffer.append(value);
+                    sv.type = mvt_double;
+                    sv.s = value;
                 }
                 else if (type == 16)
                 {
-                    feature_buffer.append((value[0] == 't') ? "true" : "false");
+                    sv.type = mvt_bool;
+                    sv.s = (value[0] == 't') ? "true" : "false";
                 }
                 else
                 {
-                    feature_buffer.append("\"");
-                    feature_buffer.append(escape_json_string(value));
-                    feature_buffer.append("\"");
+                    sv.type = mvt_string;
+                    sv.s = value;
                 }
+                values.push_back(sv);
+                attr_memory += strlen(value) + 32;  // 估算：字符串 + 结构体开销
             }
         }
-        feature_buffer.append("}");
     }
-
-    feature_buffer.append("}");
-
-    // 优化：直接使用 feature_buffer 内存，避免 strdup 的额外分配和拷贝
-    // 由于 parse_json 是同步执行的，在 json_end_map 之前 feature_buffer 保证有效。
-    struct json_pull *jp = json_begin_map((char *) feature_buffer.c_str(), feature_buffer.length());
-    if (jp != NULL)
-    {
-        struct serialization_state temp_sst = sst[thread_id % sst.size()];
-        temp_sst.fname = "PostGIS";
-        temp_sst.line = row + 1;
-
-        parse_json(&temp_sst, jp, layer, layername);
-        json_end_map(jp);
-    }
-
+    
+    sf.full_keys = std::move(full_keys);
+    sf.full_values = std::move(values);
+    
+    // 跟踪属性内存
+    current_memory_usage.fetch_add(attr_memory);
+    
+    // 直接调用 serialize_feature()
+    struct serialization_state temp_sst = sst[thread_id % sst.size()];
+    temp_sst.fname = "PostGIS";
+    temp_sst.line = row + 1;
+    
+    serialize_feature(&temp_sst, sf, layername);
+    
+    // 释放内存：在 serialize_feature 后减少计数
+    current_memory_usage.fetch_sub(coord_memory + attr_memory);
+    
     total_features_processed.fetch_add(1);
-
-    current_memory_usage.fetch_add(feature_buffer.capacity());
 }
 
 /**
@@ -336,9 +356,11 @@ void PostGISReader::process_batch(PGresult *res, std::vector<struct serializatio
     {
         process_feature(res, i, nfields, geom_field_index, field_names, sst, layer, layername, thread_id);
 
+        // 每 100 个要素检查一次内存，及时释放压力
         if (i % 100 == 0 && !check_memory_usage())
         {
-            fprintf(stderr, "Warning: Memory pressure detected at feature %d\n", i);
+            fprintf(stderr, "⚠️  Memory pressure at feature %d, pausing...\n", i);
+            usleep(100000);  // 暂停 0.1 秒，等待内存释放
         }
     }
 
@@ -485,7 +507,39 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
     }
     else if (!config.table.empty() && !config.geometry_field.empty())
     {
-        base_query = "SELECT ST_AsGeoJSON(ST_Transform(" + config.geometry_field + ", 4326)) as geojson, * FROM " + config.table;
+        // 检查几何字段的 SRID，如果已经是 4326，则跳过 ST_Transform
+        std::string srid_check_query = "SELECT ST_SRID(" + config.geometry_field + ") FROM " + config.table + " LIMIT 1";
+        DEBUG_LOG("Checking geometry SRID: %s", srid_check_query.c_str());
+        
+        PGresult *srid_res = PQexec((PGconn *)conn, srid_check_query.c_str());
+        int geometry_srid = 0;
+        
+        if (PQresultStatus(srid_res) == PGRES_TUPLES_OK && PQntuples(srid_res) > 0)
+        {
+            geometry_srid = atoi(PQgetvalue(srid_res, 0, 0));
+            DEBUG_LOG("Geometry SRID = %d, target SRID = 4326", geometry_srid);
+            
+            if (geometry_srid == 4326)
+            {
+                // SRID 匹配，跳过 ST_Transform
+                base_query = "SELECT ST_AsText(" + config.geometry_field + ") as wkt, * FROM " + config.table;
+                DEBUG_LOG("SRID matches, using WKT format without transformation");
+            }
+            else
+            {
+                // SRID 不匹配，需要进行坐标转换
+                base_query = "SELECT ST_AsText(ST_Transform(" + config.geometry_field + ", 4326)) as wkt, * FROM " + config.table;
+                DEBUG_LOG("SRID mismatch, using WKT format with ST_Transform to 4326");
+            }
+        }
+        else
+        {
+            // 无法获取 SRID，默认进行坐标转换
+            fprintf(stderr, "Warning: Could not determine geometry SRID, assuming transformation needed\n");
+            base_query = "SELECT ST_AsText(ST_Transform(" + config.geometry_field + ", 4326)) as wkt, * FROM " + config.table;
+        }
+        
+        PQclear(srid_res);
     }
     else
     {
@@ -511,14 +565,14 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
     if (config.enable_progress_report)
     {
         std::string count_query = "SELECT COUNT(*) FROM (" + base_query + ") AS subquery";
-        fprintf(stderr, "Debug: Executing count query: %s\n", count_query.c_str());
+        DEBUG_LOG("Executing count query: %s", count_query.c_str());
         PGresult *count_res = PQexec((PGconn *)conn, count_query.c_str());
         if (PQresultStatus(count_res) == PGRES_TUPLES_OK)
         {
             total_count = strtoull(PQgetvalue(count_res, 0, 0), NULL, 10);
         }
         else {
-            fprintf(stderr, "Debug: Count query failed: %s\n", PQerrorMessage((PGconn *)conn));
+            DEBUG_LOG("Count query failed: %s", PQerrorMessage((PGconn *)conn));
         }
         PQclear(count_res);
     }
@@ -559,17 +613,25 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
 
             int geom_field_index = -1;
             int nfields = PQnfields(res);
+            
+            // 优先查找 wkt 字段（WKT 格式）
             for (int i = 0; i < nfields; i++)
             {
-                if (strcmp(PQfname(res, i), "geojson") == 0)
+                if (strcmp(PQfname(res, i), "wkt") == 0)
                 {
                     geom_field_index = i;
+                    DEBUG_LOG("Found WKT field at index %d", i);
                     break;
                 }
             }
+            
             if (geom_field_index == -1)
             {
-                geom_field_index = 0;
+                fprintf(stderr, "Error: WKT geometry field not found in cursor result\n");
+                PQclear(res);
+                std::string close_query = "CLOSE " + cursor_name;
+                execute_query(close_query);
+                return false;
             }
 
             process_batch(res, sst, layer, layername, geom_field_index, thread_id);
@@ -577,12 +639,14 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
             offset += ntuples;
             log_progress(offset, total_count, "Fetching batches");
 
+            // ✅ 立即释放数据库结果集内存
             PQclear(res);
 
+            // ✅ 检查内存压力，必要时暂停
             if (!check_memory_usage())
             {
-                fprintf(stderr, "Memory pressure detected, pausing...\n");
-                usleep(100000);
+                fprintf(stderr, "⚠️  Memory pressure detected, pausing batch fetch...\n");
+                usleep(500000);  // 暂停 0.5 秒
             }
         }
 
@@ -607,31 +671,28 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
 
         int geom_field_index = -1;
         int nfields = PQnfields(res);
+        
+        // 优先查找 wkt 字段（WKT 格式）
         for (int i = 0; i < nfields; i++)
         {
-            if (strcmp(PQfname(res, i), "geojson") == 0)
+            if (strcmp(PQfname(res, i), "wkt") == 0)
             {
                 geom_field_index = i;
+                DEBUG_LOG("Found WKT field at index %d", i);
                 break;
-            }
-        }
-
-        if (geom_field_index == -1 && !config.geometry_field.empty())
-        {
-            for (int i = 0; i < nfields; i++)
-            {
-                if (strcmp(PQfname(res, i), config.geometry_field.c_str()) == 0)
-                {
-                    geom_field_index = i;
-                    break;
-                }
             }
         }
 
         if (geom_field_index == -1)
         {
-            fprintf(stderr, "Warning: Geometry column not found, using first column\n");
-            geom_field_index = 0;
+            fprintf(stderr, "Error: WKT geometry field not found in query result\n");
+            fprintf(stderr, "Available fields: ");
+            for (int i = 0; i < nfields; i++) {
+                fprintf(stderr, "%s ", PQfname(res, i));
+            }
+            fprintf(stderr, "\n");
+            PQclear(res);
+            return false;
         }
 
         process_batch(res, sst, layer, layername, geom_field_index, thread_id);

@@ -65,6 +65,7 @@
 #include "thread.hpp"
 #include "platform.hpp"
 #include "mongo.hpp"
+#include "config.hpp"
 
 static int low_detail = 12;
 static int full_detail = -1;
@@ -217,6 +218,14 @@ void init_cpus() {
 
 	// Round down to a power of 2
 	CPUS = 1 << (int) (log(CPUS) / log(2));
+	
+	// Limit CPUS to control PostgreSQL connections (1 thread = 1 connection)
+	// This prevents exceeding PostgreSQL max_connections limit
+	if (CPUS > MAX_POSTGRES_CONNECTIONS) {
+		fprintf(stderr, "Limiting CPUS from %zu to %zu to control PostgreSQL connections\n", 
+		        CPUS, MAX_POSTGRES_CONNECTIONS);
+		CPUS = MAX_POSTGRES_CONNECTIONS;
+	}
 
 	MAX_FILES = get_max_open_files();
 
@@ -2370,7 +2379,7 @@ void set_attribute_value(const char *arg) {
 
 
 int maindb(int argc, char **argv) {
-	fprintf(stderr, "Debug: Entering maindb()\n");
+	DEBUG_LOG("Entering maindb()");
 	fflush(stderr);
 #ifdef MTRACE
 	mtrace();
@@ -2640,7 +2649,7 @@ int maindb(int argc, char **argv) {
 
 	int option_index = 0;
 	while ((i = getopt_long(argc, argv, getopt_str, long_options, &option_index)) != -1) {
-		fprintf(stderr, "Debug: Processing option: %d, optarg: %s\n", i, optarg ? optarg : "NULL");
+		DEBUG_LOG("Processing option: %d, optarg: %s", i, optarg ? optarg : "NULL");
 		switch (i) {
 		case 0:
 			break;
@@ -3274,21 +3283,21 @@ int maindb(int argc, char **argv) {
 	// 1. 初始化 MongoDB（在 read_input 之前，因为 read_input 会调用 traverse_zooms）
 	if (use_mongo) {
 		if (!quiet) {
-			fprintf(stderr, "Debug: Initializing MongoDB for tile output...\n");
+			DEBUG_LOG("Initializing MongoDB for tile output...");
 		}
-		fprintf(stderr, "Debug: Calling MongoWriter::initialize_global()...\n");
+		DEBUG_LOG("Calling MongoWriter::initialize_global()...");
 		MongoWriter::initialize_global();
-		fprintf(stderr, "Debug: MongoDB global initialization done.\n");
+		DEBUG_LOG("MongoDB global initialization done.");
 		// 注意：不创建主线程的 mongo_writer 实例
 		// 工作线程会在 run_thread() 中通过 TLS 自动创建线程本地实例
 		// 避免内存泄漏和资源浪费
 	}
 
-	fprintf(stderr, "Debug: Starting data ingestion pipeline (read_input)...\n");
+	DEBUG_LOG("Starting data ingestion pipeline (read_input)...");
 	// 2. 调用 read_input() 读取 PostGIS 数据并写入瓦片
 	// read_input 内部会调用 traverse_zooms 进行瓦片写入
 	std::string postgis_layer = postgis_cfg.table.empty() ? "postgis" : postgis_cfg.table;
-	fprintf(stderr, "Debug: Layer configuration: %s\n", postgis_layer.c_str());
+	DEBUG_LOG("Layer configuration: %s", postgis_layer.c_str());
 	auto input_ret = read_input(postgis_layer, out_mbtiles ? out_mbtiles : out_dir,
 		    maxzoom, minzoom, basezoom, basezoom_marker_width, outdb, out_dir, &exclude, &include, exclude_all, filter, droprate, buffer, tmpdir, gamma, forcetable, NULL, gamma != 0, file_bbox, file_bbox1, file_bbox2, prefilter, postfilter, NULL, guess_maxzoom, guess_cluster_maxzoom, &attribute_types, argv[0], &attribute_accum, attribute_descriptions, commandline, minimum_maxzoom);
 
