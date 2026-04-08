@@ -1097,8 +1097,9 @@ std::pair<int, metadata> read_input(std::string &layername, const char *fname, i
 	}
 
 	// Validate MongoDB configuration using manager
-	if (!MongoDB::validate_config(mongo_cfg)) {
-		fprintf(stderr, "Error: %s\n", MongoDB::get_validation_error().c_str());
+	auto mongo_validation_error = MongoDB::validate_config(mongo_cfg);
+	if (mongo_validation_error.has_value()) {
+		fprintf(stderr, "Error: %s\n", mongo_validation_error.value().c_str());
 		exit(EXIT_ARGS);
 	}
 	
@@ -1189,15 +1190,15 @@ std::pair<int, metadata> read_input(std::string &layername, const char *fname, i
 
 	// Auto-adjust MongoDB batch size based on data volume (only if user didn't specify)
 	if (mongo_cfg.batch_size == DEFAULT_MONGO_BATCH_SIZE) {
-		size_t estimated_tiles = MongoDB::estimate_tile_count(total_features.load());
+		size_t estimated_tiles = MongoDB::estimate_tile_count(total_features.load(), minzoom, maxzoom);
 		size_t suggested_batch = MongoDB::suggest_batch_size(estimated_tiles);
 		
 		mongo_cfg.batch_size = suggested_batch;
 		
 		if (!quiet) {
 			fprintf(stderr, "Auto-adjusted MongoDB batch size to %zu "
-					"(processed %zu features, estimated %zu tiles)\n", 
-					mongo_cfg.batch_size, total_features.load(), estimated_tiles);
+					"(processed %zu features, estimated %zu tiles, zoom %d-%d)\n", 
+					mongo_cfg.batch_size, total_features.load(), estimated_tiles, minzoom, maxzoom);
 		}
 	}
 

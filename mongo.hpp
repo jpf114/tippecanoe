@@ -3,8 +3,10 @@
 
 #include <string>
 #include <vector>
+#include <tuple>
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <bsoncxx/builder/stream/document.hpp>
 #include <bsoncxx/document/view.hpp>
 #include <mongocxx/client.hpp>
@@ -134,7 +136,6 @@ struct mongo_config {
         return true;
     }
     
-    // 生成 MongoDB 连接 URI（包含连接池、超时、写确认等配置）
     std::string uri() const {
         std::string uri_str = "mongodb://";
         
@@ -148,49 +149,49 @@ struct mongo_config {
             uri_str += dbname;
         }
         
-        // 添加连接选项
-        std::string options;
+        std::vector<std::string> opts;
+        
         if (!auth_source.empty()) {
-            options += "authSource=" + auth_source;
+            opts.push_back("authSource=" + auth_source);
         }
         
-        // 连接池配置（限制最大值防止资源耗尽）
         size_t actual_pool_size = std::min(connection_pool_size, MAX_MONGO_CONNECTION_POOL_SIZE);
-        options += "&maxPoolSize=" + std::to_string(actual_pool_size);
-        options += "&minPoolSize=1";
+        opts.push_back("maxPoolSize=" + std::to_string(actual_pool_size));
+        opts.push_back("minPoolSize=1");
         
-        // 超时配置
-        options += "&serverSelectionTimeoutMS=" + std::to_string(timeout_ms);
-        options += "&connectTimeoutMS=" + std::to_string(timeout_ms);
-        options += "&socketTimeoutMS=" + std::to_string(timeout_ms);
+        opts.push_back("serverSelectionTimeoutMS=" + std::to_string(timeout_ms));
+        opts.push_back("connectTimeoutMS=" + std::to_string(timeout_ms));
+        opts.push_back("socketTimeoutMS=" + std::to_string(timeout_ms));
         
-        // 写确认配置
         switch (write_concern_level) {
             case WriteConcernLevel::NONE:
-                options += "&w=0";
+                opts.push_back("w=0");
                 break;
             case WriteConcernLevel::PRIMARY:
-                options += "&w=1";
+                opts.push_back("w=1");
                 break;
             case WriteConcernLevel::MAJORITY:
-                options += "&w=majority";
+                opts.push_back("w=majority");
                 break;
         }
         
         if (journal) {
-            options += "&journal=true";
+            opts.push_back("journal=true");
         }
         
         if (wtimeout_ms > 0) {
-            options += "&wtimeoutMS=" + std::to_string(wtimeout_ms);
+            opts.push_back("wtimeoutMS=" + std::to_string(wtimeout_ms));
         }
         
-        // 添加重试读取配置
-        options += "&retryReads=true";
-        options += "&retryWrites=true";
+        opts.push_back("retryReads=true");
+        opts.push_back("retryWrites=true");
         
-        if (!options.empty()) {
-            uri_str += "?" + options;
+        if (!opts.empty()) {
+            uri_str += "?";
+            for (size_t i = 0; i < opts.size(); i++) {
+                if (i > 0) uri_str += "&";
+                uri_str += opts[i];
+            }
         }
         
         return uri_str;
@@ -213,7 +214,7 @@ public:
     static MongoWriter* get_thread_local_instance(const mongo_config &cfg);
     
     // 销毁线程本地实例（在程序退出前调用）
-    static void destroy_thread_local_instances();
+    static void destroy_current_thread_instance();
     
     // 获取全局统计信息（所有 TLS 实例的总和）
     static size_t get_global_total_tiles();
@@ -244,41 +245,46 @@ public:
     void erase_zoom(int z);
 
 private:
-    // 批量刷新（带重试机制）
     void flush_batch();
-    
-    // 重新连接（带指数退避）
+    void flush_batch_insert();
+    void flush_batch_upsert();
     void reconnect();
-    
-    // 创建索引
     void create_indexes_if_needed();
+    void build_write_concern();
     
-    // 配置
+    struct tile_coords {
+        int z, x, y;
+    };
+    
     mongo_config config;
     
-    // 线程本地客户端和集合
     std::unique_ptr<mongocxx::client> client;
     mongocxx::collection collection;
     
-    // 批量缓冲区（线程本地）
     std::vector<bsoncxx::document::value> batch_buffer;
+    std::vector<tile_coords> batch_coords;
+    
+    mongocxx::write_concern cached_wc;
+    bool wc_initialized{false};
+    bool use_upsert{true};
     
     // 统计信息（原子变量）
     std::atomic<size_t> total_tiles_written{0};
     std::atomic<size_t> total_batches_written{0};
     std::atomic<size_t> total_retries{0};
     std::atomic<size_t> total_errors{0};
-    std::atomic<size_t> total_failed_batches{0};  // 新增：失败的批量写入次数
+    std::atomic<size_t> total_failed_batches{0};
+    std::atomic<size_t> flush_failure_rounds{0};
+    size_t consecutive_reconnects{0};
     
-    // 全局实例（单例）
     static std::unique_ptr<mongocxx::instance> global_instance;
     static std::atomic_flag initialized;
-    static std::atomic_flag collection_dropped;  // 确保只清空一次集合
+    static std::once_flag collection_drop_flag;
+    static std::once_flag index_create_flag;
 };
 
-// TLS（线程本地存储）实例管理
-// 注意：TLS 实例由 thread_local 变量自动管理，不需要显式注册表
-// 每个线程的 tls_mongo_writer 在该线程结束时自动销毁
-// 建议在每个工作线程退出前显式调用 destroy_thread_local_instances() 确保数据刷新
+// Each worker thread must call destroy_current_thread_instance() on its own
+// exit path to ensure its buffered tiles are flushed and statistics are
+// accumulated into the global counters.
 
 #endif // MONGO_HPP

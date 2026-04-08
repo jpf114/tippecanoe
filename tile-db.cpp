@@ -3095,7 +3095,7 @@ exit(EXIT_IMPOSSIBLE);
 
 	// 线程退出前清理 MongoDB 连接
 	if (mongo_cfg.dbname != "") {
-		MongoWriter::destroy_thread_local_instances();
+		MongoWriter::destroy_current_thread_instance();
 	}
 
 	arg->running--;

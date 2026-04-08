@@ -4,67 +4,69 @@
 
 namespace MongoDB {
 
-static std::string validation_error;
-
-bool validate_config(const mongo_config& cfg) {
-    validation_error.clear();
-    
+std::optional<std::string> validate_config(const mongo_config& cfg) {
     if (cfg.host.empty()) {
-        validation_error = "MongoDB host is required";
-        return false;
+        return "MongoDB host is required";
     }
     
     if (cfg.port == 0) {
-        validation_error = "MongoDB port is required";
-        return false;
+        return "MongoDB port is required";
     }
     
     if (cfg.dbname.empty()) {
-        validation_error = "MongoDB database name is required";
-        return false;
+        return "MongoDB database name is required";
     }
     
     if (cfg.collection.empty()) {
-        validation_error = "MongoDB collection is required";
-        return false;
+        return "MongoDB collection is required";
     }
     
     if (cfg.username.empty()) {
-        validation_error = "MongoDB username is required";
-        return false;
+        return "MongoDB username is required";
     }
     
     if (cfg.password.empty()) {
-        validation_error = "MongoDB password is required";
-        return false;
+        return "MongoDB password is required";
     }
     
     if (cfg.auth_source.empty()) {
-        validation_error = "MongoDB auth source is required";
-        return false;
+        return "MongoDB auth source is required";
     }
     
-    return true;
-}
-
-std::string get_validation_error() {
-    return validation_error;
+    return std::nullopt;
 }
 
 size_t suggest_batch_size(size_t estimated_tiles) {
-    if (estimated_tiles < 1000) {
-        return 50;
-    } else if (estimated_tiles < 10000) {
+    if (estimated_tiles < 10000) {
         return 100;
     } else if (estimated_tiles < 100000) {
         return 200;
-    } else {
+    } else if (estimated_tiles < 500000) {
         return 500;
+    } else if (estimated_tiles < 2000000) {
+        return 800;
+    } else {
+        return 1000;
     }
 }
 
-size_t estimate_tile_count(size_t feature_count) {
-    return feature_count * 2;
+size_t estimate_tile_count(size_t feature_count, int min_zoom, int max_zoom) {
+    if (feature_count == 0 || min_zoom > max_zoom) {
+        return 0;
+    }
+    
+    size_t total_tiles = 0;
+    int zoom_range = max_zoom - min_zoom + 1;
+    
+    for (int z = min_zoom; z <= max_zoom; z++) {
+        size_t tiles_at_zoom = 1ULL << (2 * z);
+        double coverage_ratio = std::min(1.0, feature_count * 4.0 / tiles_at_zoom);
+        total_tiles += static_cast<size_t>(tiles_at_zoom * coverage_ratio * 0.3);
+    }
+    
+    total_tiles = std::max(total_tiles, feature_count * static_cast<size_t>(zoom_range));
+    
+    return total_tiles;
 }
 
 void initialize_global() {
@@ -75,7 +77,7 @@ void initialize_global() {
 
 void cleanup_global() {
     DEBUG_LOG("Cleaning up MongoDB thread local instances...");
-    MongoWriter::destroy_thread_local_instances();
+    MongoWriter::destroy_current_thread_instance();
     DEBUG_LOG("MongoDB cleanup done.");
 }
 
