@@ -142,7 +142,6 @@ void MongoWriter::write_tile(int z, int x, int y, const char *data, size_t len)
         << "x" << x
         << "y" << y
         << "z" << z
-        << "c" << 1
         << "d" << bsoncxx::types::b_binary{
             bsoncxx::binary_sub_type::k_binary,
             static_cast<uint32_t>(len),
@@ -151,6 +150,7 @@ void MongoWriter::write_tile(int z, int x, int y, const char *data, size_t len)
         << bsoncxx::builder::stream::finalize;
 
     batch_buffer.push_back(std::move(doc));
+
     batch_coords.push_back({z, x, y});
 
     if (batch_buffer.size() >= config.batch_size) {

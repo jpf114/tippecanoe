@@ -194,6 +194,8 @@ tippecanoe-db \
 | `--mongo-no-indexes` | 否 | 不创建索引 |
 | `--mongo-metadata` | 否 | 写入元数据到 `{collection}_metadata` 集合 |
 
+> **注意：** MongoDB 存储的瓦片数据为 gzip 压缩格式，与 MBTiles 格式一致。读取时需先解压。
+
 #### 3.2.3 瓦片生成参数
 
 | 参数 | 默认值 | 说明 |
@@ -282,6 +284,7 @@ tippecanoe-db \
 
 ```javascript
 const { MongoClient } = require('mongodb');
+const zlib = require('zlib');
 
 async function getTile(z, x, y) {
   const client = new MongoClient('mongodb://writer:pass@mongo-host:27017/tile_service?authSource=admin');
@@ -289,14 +292,11 @@ async function getTile(z, x, y) {
   const db = client.db('tile_service');
   const tile = await db.collection('admin_regions').findOne({ z, x, y });
   await client.close();
-  
-  if (tile && tile.c === 1) {
-    // gzip 压缩数据，需解压
-    const zlib = require('zlib');
-    const decompressed = zlib.gunzipSync(tile.d.buffer);
-    return decompressed;
-  }
-  return tile ? tile.d.buffer : null;
+
+  if (!tile || !tile.d) return null;
+
+  // 瓦片数据为 gzip 压缩格式，需解压
+  return zlib.gunzipSync(tile.d.buffer);
 }
 
 async function getMetadata() {
@@ -366,7 +366,6 @@ tippecanoe-db \
   "z": 10,
   "x": 825,
   "y": 402,
-  "c": 1,
   "d": Binary(gzip_compressed_pbf_data)
 }
 ```
@@ -376,10 +375,11 @@ tippecanoe-db \
 | z | int32 | 缩放级别 |
 | x | int32 | X 坐标（XYZ 方案） |
 | y | int32 | Y 坐标（XYZ 方案） |
-| c | int32 | 压缩标志（1=gzip 压缩） |
-| d | Binary | 瓦片数据 |
+| d | Binary | 瓦片数据（gzip 压缩的 PBF，与 MBTiles 格式一致） |
 
 > **坐标系说明：** MongoDB 中使用 XYZ 坐标方案（Y 轴从上向下递增），与 TMS 方案（MBTiles 使用）的转换关系为：`xyz_y = 2^z - 1 - tms_y`
+> 
+> **数据格式说明：** MongoDB 存储的瓦片数据为 gzip 压缩格式，与 MBTiles 规范一致。读取时需先 gunzip 解压得到原始 PBF 数据。
 
 **索引：**
 

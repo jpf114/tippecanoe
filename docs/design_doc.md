@@ -248,7 +248,7 @@ WKBResult parse_wkb_hex(const std::string& hex);
 ```
 write_tile(z, x, y, data, len)
   ├── 背压检查: pending_writes >= MAX_PENDING_WRITES(5000) → sleep
-  ├── 构建 BSON 文档: {z, x, y, c:1, d: Binary}
+  ├── 构建 BSON 文档: {z, x, y, d: Binary(gzip_compressed_data)}
   ├── 加入 batch_buffer
   └── buffer 满 (≥ batch_size) → flush_batch()
 
@@ -485,7 +485,6 @@ MongoDB flush 失败 ───┤
   "z": 10,
   "x": 825,
   "y": 402,
-  "c": 1,
   "d": Binary(gzip_compressed_pbf_data)
 }
 ```
@@ -495,8 +494,9 @@ MongoDB flush 失败 ───┤
 | z | int32 | 缩放级别 |
 | x | int32 | X 坐标（XYZ 方案） |
 | y | int32 | Y 坐标（XYZ 方案，非 TMS） |
-| c | int32 | 压缩标志（1=gzip） |
-| d | Binary | 瓦片数据（gzip 压缩的 PBF） |
+| d | Binary | 瓦片数据（gzip 压缩的 PBF，与 MBTiles 格式一致） |
+
+> **注意：** MongoDB 存储的瓦片数据始终为 gzip 压缩格式，与 MBTiles 规范一致。读取端需先 gunzip 解压。
 
 **元数据集合（如 `china_metadata`）：**
 
@@ -773,7 +773,7 @@ struct mongo_config {
     
     // 元数据
     write_metadata = false
-    
+
     // 监控
     enable_progress_report = true
 };
