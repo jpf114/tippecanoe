@@ -50,6 +50,7 @@
 #include "attribute.hpp"
 #include "thread.hpp"
 #include "shared_borders.hpp"
+#include "error_logger.hpp"
 
 extern "C" {
 #include "jsonpull/jsonpull.h"
@@ -1697,10 +1698,12 @@ long long write_tile(decompressor *geoms, std::atomic<long long> *geompos_in, ch
 
 		key_pool key_pool;
 
-		std::atomic<bool> within[child_shards];
-		long long start_geompos[child_shards];
+		std::vector<std::atomic<bool>> within_v(child_shards);
+		std::vector<long long> start_geompos_v(child_shards);
+		std::atomic<bool> *within = within_v.data();
+		long long *start_geompos = start_geompos_v.data();
 		for (size_t i = 0; i < (size_t) child_shards; i++) {
-			within[i] = false;
+			std::atomic_init(&within[i], false);
 			start_geompos[i] = -1;
 		}
 
@@ -2877,18 +2880,21 @@ long long write_tile(decompressor *geoms, std::atomic<long long> *geompos_in, ch
 						if (thread_mongo_writer) {
 							thread_mongo_writer->write_tile(z, tx, ty, compressed.data(), compressed.size());
 						} else {
-							fprintf(stderr, "Fatal Error: Failed to get MongoDB thread-local instance for tile %d/%u/%u\n", 
+							fprintf(stderr, "Error: Failed to get MongoDB thread-local instance for tile %d/%u/%u\n",
 							        z, tx, ty);
-							exit(EXIT_MONGO);
+							ErrorLogger::instance().log_mongo_error(z, tx, ty, "write_tile",
+								"Failed to get thread-local instance");
 						}
 					} catch (const std::exception &e) {
-						fprintf(stderr, "Fatal Error: MongoDB write failed for tile %d/%u/%u: %s\n", 
+						fprintf(stderr, "Error: MongoDB write failed for tile %d/%u/%u: %s\n",
 						        z, tx, ty, e.what());
-						exit(EXIT_MONGO);
+						ErrorLogger::instance().log_mongo_error(z, tx, ty, "write_tile",
+							std::string("Exception: ") + e.what());
 					} catch (...) {
-						fprintf(stderr, "Fatal Error: MongoDB write failed with unknown error for tile %d/%u/%u\n", 
+						fprintf(stderr, "Error: MongoDB write failed with unknown error for tile %d/%u/%u\n",
 						        z, tx, ty);
-						exit(EXIT_MONGO);
+						ErrorLogger::instance().log_mongo_error(z, tx, ty, "write_tile",
+							"Unknown exception");
 					}
 				}
 

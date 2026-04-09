@@ -1,5 +1,6 @@
 #include "postgis_manager.hpp"
 #include "config.hpp"
+#include "error_logger.hpp"
 #include <cstring>
 #include <cstdio>
 
@@ -9,37 +10,37 @@ static std::string validation_error;
 
 bool validate_config(const postgis_config& cfg) {
     validation_error.clear();
-    
+
     if (cfg.host.empty()) {
         validation_error = "PostGIS host is required";
         return false;
     }
-    
+
     if (cfg.dbname.empty()) {
         validation_error = "PostGIS database name is required";
         return false;
     }
-    
+
     if (cfg.user.empty()) {
         validation_error = "PostGIS user is required";
         return false;
     }
-    
+
     if (cfg.password.empty()) {
         validation_error = "PostGIS password is required";
         return false;
     }
-    
+
     if (cfg.table.empty() && cfg.sql.empty()) {
         validation_error = "Either PostGIS table or SQL query is required";
         return false;
     }
-    
-    if (cfg.geometry_field.empty()) {
-        validation_error = "PostGIS geometry field is required";
+
+    if (cfg.geometry_field.empty() && cfg.sql.empty()) {
+        validation_error = "PostGIS geometry field is required (unless using custom SQL)";
         return false;
     }
-    
+
     return true;
 }
 
@@ -54,85 +55,66 @@ ParallelReader::ParallelReader(const postgis_config& cfg, size_t threads)
 ParallelReader::~ParallelReader() {
 }
 
-bool ParallelReader::read_parallel(std::vector<struct serialization_state>& sst, 
+bool ParallelReader::read_parallel(std::vector<struct serialization_state>& sst,
                                    size_t layer, const std::string& layername) {
-    if (!config.pk_field.empty()) {
-        return read_with_pk_range(sst, layer, layername);
-    } else {
-        return read_single_thread(sst, layer, layername);
-    }
-}
+    if (num_threads <= 1) {
+        PostGISReader reader(config);
+        if (!reader.connect()) {
+            fprintf(stderr, "Failed to connect to PostGIS database\n");
+            ErrorLogger::instance().log_error(ErrorSource::POSTGIS_READ, 0, 0, 0,
+                                              "Failed to connect to PostGIS database");
+            return false;
+        }
 
-bool ParallelReader::read_with_pk_range(std::vector<struct serialization_state>& sst, 
-                                        size_t layer, const std::string& layername) {
-    PostGISReader reader(config);
-    if (!reader.connect()) {
-        fprintf(stderr, "Failed to connect to PostGIS database\n");
-        return false;
+        if (!reader.read_features(sst, layer, layername, 0, 1)) {
+            fprintf(stderr, "Failed to read features from PostGIS\n");
+            return false;
+        }
+
+        total_features = reader.getTotalFeaturesProcessed();
+        total_parse_errors = reader.getParseErrors();
+        return true;
     }
-    
-    long long min_pk = 0, max_pk = 0;
-    if (!reader.get_pk_range(min_pk, max_pk)) {
-        fprintf(stderr, "Failed to get PK range, falling back to single thread.\n");
-        config.pk_field.clear();
-        return read_single_thread(sst, layer, layername);
-    }
-    
-    DEBUG_LOG("Parallel Fetch enabled over PK %s: Range [%lld, %lld]", 
-             config.pk_field.c_str(), min_pk, max_pk);
-    
-    long long pk_range = max_pk - min_pk;
-    if (pk_range < 0) {
-        return read_single_thread(sst, layer, layername);
-    }
-    
-    max_pk += 1;
-    pk_range += 1;
-    
-    long long chunk = pk_range / num_threads;
-    if (chunk == 0) chunk = 1;
-    
+
+    fprintf(stderr, "Starting parallel read with %zu threads (hash-based ctid sharding)\n", num_threads);
+
     std::vector<std::thread> threads;
     std::atomic<size_t> thread_errors{0};
-    
+
     for (size_t i = 0; i < num_threads; i++) {
-        long long t_min = min_pk + i * chunk;
-        long long t_max = (i == num_threads - 1) ? max_pk : (t_min + chunk);
-        
-        if (t_min >= max_pk) break;
-        
-        threads.emplace_back([&, i, t_min, t_max]() {
+        threads.emplace_back([&, i]() {
             PostGISReader t_reader(config);
-            if (!t_reader.read_features(sst, layer, layername, t_min, t_max, true, i)) {
+            if (!t_reader.connect()) {
+                fprintf(stderr, "Thread %zu failed to connect to PostGIS\n", i);
+                ErrorLogger::instance().log_error(ErrorSource::POSTGIS_READ, 0, 0, 0,
+                                                  "Thread " + std::to_string(i) + ": connection failed");
+                thread_errors.fetch_add(1);
+                return;
+            }
+
+            if (!t_reader.read_features(sst, layer, layername, i, num_threads)) {
                 fprintf(stderr, "Thread %zu failed to read features\n", i);
                 thread_errors.fetch_add(1);
+                return;
             }
+
             total_features.fetch_add(t_reader.getTotalFeaturesProcessed());
+            total_parse_errors.fetch_add(t_reader.getParseErrors());
         });
     }
-    
+
     for (auto& t : threads) {
         t.join();
     }
-    
-    return thread_errors.load() == 0;
+
+    if (thread_errors.load() > 0) {
+        fprintf(stderr, "Warning: %zu threads encountered errors during parallel read\n", thread_errors.load());
+    }
+
+    fprintf(stderr, "Parallel read complete: %zu features, %zu parse errors\n",
+            total_features.load(), total_parse_errors.load());
+
+    return thread_errors.load() < num_threads;
 }
 
-bool ParallelReader::read_single_thread(std::vector<struct serialization_state>& sst, 
-                                        size_t layer, const std::string& layername) {
-    PostGISReader reader(config);
-    if (!reader.connect()) {
-        fprintf(stderr, "Failed to connect to PostGIS database\n");
-        return false;
-    }
-    
-    if (!reader.read_features(sst, layer, layername)) {
-        fprintf(stderr, "Failed to read features from PostGIS\n");
-        return false;
-    }
-    
-    total_features = reader.getTotalFeaturesProcessed();
-    return true;
 }
-
-} // namespace PostGIS

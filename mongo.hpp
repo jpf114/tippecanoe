@@ -53,6 +53,9 @@ struct mongo_config {
     // 集合管理参数
     bool drop_collection_before_write;
     
+    // 元数据参数
+    bool write_metadata;
+    
     // 监控参数
     bool enable_progress_report;
     
@@ -73,6 +76,7 @@ struct mongo_config {
           wtimeout_ms(5000),
           create_indexes(true),
           drop_collection_before_write(false),
+          write_metadata(false),
           enable_progress_report(true)
     {
     }
@@ -123,10 +127,6 @@ struct mongo_config {
         auth_source = parts[5];
         collection = parts[6];
         
-        // 始终自动 drop 集合
-        drop_collection_before_write = true;
-        
-        // 验证必填字段
         if (dbname.empty() || username.empty() || auth_source.empty() || collection.empty()) {
             fprintf(stderr, "Error: MongoDB connection string has empty required fields\n");
             fprintf(stderr, "Format: host:port:dbname:user:password:auth_source:collection\n");
@@ -244,10 +244,11 @@ public:
     // 删除指定 zoom 级别的所有瓦片（用于重新生成）
     void erase_zoom(int z);
 
+    // 写入元数据到 {collection}_metadata 集合
+    void write_metadata(const std::string &json_metadata);
+
 private:
     void flush_batch();
-    void flush_batch_insert();
-    void flush_batch_upsert();
     void reconnect();
     void create_indexes_if_needed();
     void build_write_concern();
@@ -276,7 +277,10 @@ private:
     std::atomic<size_t> total_failed_batches{0};
     std::atomic<size_t> flush_failure_rounds{0};
     size_t consecutive_reconnects{0};
-    
+
+    static std::atomic<size_t> pending_writes;
+    static constexpr size_t MAX_PENDING_WRITES = 5000;
+
     static std::unique_ptr<mongocxx::instance> global_instance;
     static std::atomic_flag initialized;
     static std::once_flag collection_drop_flag;

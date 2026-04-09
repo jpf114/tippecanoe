@@ -18,23 +18,20 @@ class ParallelReader {
 public:
     ParallelReader(const postgis_config& cfg, size_t num_threads);
     ~ParallelReader();
-    
-    bool read_parallel(std::vector<struct serialization_state>& sst, 
+
+    bool read_parallel(std::vector<struct serialization_state>& sst,
                       size_t layer, const std::string& layername);
-    
+
     size_t get_total_features() const { return total_features.load(); }
-    
+    size_t get_total_parse_errors() const { return total_parse_errors.load(); }
+
 private:
     postgis_config config;
     size_t num_threads;
     std::atomic<size_t> total_features{0};
-    
-    bool read_with_pk_range(std::vector<struct serialization_state>& sst, 
-                            size_t layer, const std::string& layername);
-    bool read_single_thread(std::vector<struct serialization_state>& sst, 
-                           size_t layer, const std::string& layername);
+    std::atomic<size_t> total_parse_errors{0};
 };
 
-} // namespace PostGIS
+}
 
-#endif // POSTGIS_MANAGER_HPP
+#endif

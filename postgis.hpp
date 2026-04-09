@@ -8,7 +8,6 @@
 #include "serial.hpp"
 #include "config.hpp"
 
-// Forward declaration for libpq types
 typedef struct pg_result PGresult;
 
 struct postgis_config
@@ -21,14 +20,12 @@ struct postgis_config
     std::string table;
     std::string geometry_field;
     std::string sql;
-    std::string pk_field;
-    
-    // Performance optimization settings
-    size_t batch_size;              // Number of features per batch
-    bool use_cursor;                // Use cursor for large datasets
-    size_t max_memory_mb;           // Maximum memory usage in MB
-    int max_retries;                // Maximum retry attempts
-    bool enable_progress_report;    // Enable progress reporting
+
+    size_t batch_size;
+    bool use_cursor;
+    size_t max_memory_mb;
+    int max_retries;
+    bool enable_progress_report;
 
     postgis_config()
         : host("localhost"),
@@ -39,7 +36,6 @@ struct postgis_config
           table(""),
           geometry_field("geometry"),
           sql(""),
-          pk_field(""),
           batch_size(DEFAULT_POSTGIS_BATCH_SIZE),
           use_cursor(true),
           max_memory_mb(MAX_POSTGIS_MEMORY_USAGE_MB),
@@ -56,36 +52,43 @@ public:
     ~PostGISReader();
 
     bool connect();
-    bool get_pk_range(long long &min_val, long long &max_val);
     bool read_features(std::vector<struct serialization_state> &sst, size_t layer, const std::string &layername,
-                       long long min_pk = 0, long long max_pk = 0, bool has_range = false, size_t thread_id = 0);
-    
-    // Get statistics
+                       size_t thread_id = 0, size_t num_threads = 1);
+
+    static int get_cached_srid(const postgis_config &cfg, void *conn);
+    static std::string build_select_query(const postgis_config &cfg, int srid);
+
     size_t getTotalFeaturesProcessed() const { return total_features_processed.load(); }
     size_t getTotalBatchesProcessed() const { return total_batches_processed.load(); }
     size_t getCurrentMemoryUsage() const { return current_memory_usage.load(); }
+    size_t getParseErrors() const { return parse_errors_.load(); }
 
 protected:
     bool execute_query(const std::string &query);
     bool execute_query_with_retry(const std::string &query);
-    void process_batch(PGresult *res, std::vector<struct serialization_state> &sst, 
-                      size_t layer, const std::string &layername, int geom_field_index, size_t thread_id);
-    void process_feature(PGresult *res, int row, int nfields, int geom_field_index,
+    void process_batch(PGresult *res, std::vector<struct serialization_state> &sst,
+                      size_t layer, const std::string &layername, int wkb_field_index, size_t thread_id);
+    void process_feature(PGresult *res, int row, int nfields, int wkb_field_index,
                         const std::vector<std::string> &field_names,
-                        std::vector<struct serialization_state> &sst, size_t layer, 
+                        std::vector<struct serialization_state> &sst, size_t layer,
                         const std::string &layername, size_t thread_id);
     std::string escape_json_string(const char *value);
     bool check_memory_usage();
     void log_progress(size_t processed, size_t total, const char *stage);
 
+    std::vector<uint8_t> decode_bytea(const char *hex_data, size_t hex_len);
+
 private:
     postgis_config config;
     void *conn;
-    
-    // Statistics and monitoring
+
     std::atomic<size_t> total_features_processed{0};
     std::atomic<size_t> total_batches_processed{0};
     std::atomic<size_t> current_memory_usage{0};
+    std::atomic<size_t> parse_errors_{0};
+
+    static int cached_srid_;
+    static bool srid_cached_;
 };
 
-#endif // POSTGIS_HPP
+#endif

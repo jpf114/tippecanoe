@@ -68,6 +68,7 @@
 #include "config.hpp"
 #include "postgis_manager.hpp"
 #include "mongo_manager.hpp"
+#include "error_logger.hpp"
 
 static int low_detail = 12;
 static int full_detail = -1;
@@ -830,7 +831,8 @@ void radix(std::vector<struct reader> &readers, int nreaders, FILE *geomfile, FI
 		geom_total += geomst.st_size;
 	}
 
-	struct drop_state ds[maxzoom + 1];
+	std::vector<struct drop_state> ds_v(maxzoom + 1);
+	struct drop_state *ds = ds_v.data();
 	prep_drop_states(ds, maxzoom, basezoom, droprate);
 
 	long long progress = 0, progress_max = geom_total, progress_reported = -1;
@@ -2029,7 +2031,8 @@ std::pair<int, metadata> read_input(std::string &layername, const char *fname, i
 		madvise(geom, indexpos, MADV_SEQUENTIAL);
 		madvise(geom, indexpos, MADV_WILLNEED);
 
-		struct drop_state ds[maxzoom + 1];
+		std::vector<struct drop_state> ds_v(maxzoom + 1);
+		struct drop_state *ds = ds_v.data();
 		prep_drop_states(ds, maxzoom, basezoom, droprate);
 
 		if (drop_denser > 0) {
@@ -2343,7 +2346,6 @@ int maindb(int argc, char **argv) {
 		{"postgis-table", required_argument, 0, '~'},
 		{"postgis-geometry-field", required_argument, 0, '~'},
 		{"postgis-sql", required_argument, 0, '~'},
-		{"postgis-pk", required_argument, 0, '~'},
 
 		{"MongoDB output", 0, 0, 0},
 		{"mongo", required_argument, 0, '~'},
@@ -2359,6 +2361,7 @@ int maindb(int argc, char **argv) {
 		{"mongo-timeout", required_argument, 0, '~'},
 		{"mongo-no-indexes", no_argument, 0, '~'},
 		{"mongo-drop-collection", no_argument, 0, '~'},
+		{"mongo-metadata", no_argument, 0, '~'},
 
 		{"Projection of input", 0, 0, 0},
 		{"projection", required_argument, 0, 's'},
@@ -2675,9 +2678,6 @@ int maindb(int argc, char **argv) {
 			} else if (strcmp(opt, "postgis-sql") == 0) {
 				postgis_cfg.sql = optarg;
 				use_postgis = true;
-			} else if (strcmp(opt, "postgis-pk") == 0) {
-				postgis_cfg.pk_field = optarg;
-				use_postgis = true;
 			} else if (strcmp(opt, "omongo") == 0) {
 				use_mongo = true;
 			} else if (strcmp(opt, "mongo") == 0) {
@@ -2722,6 +2722,9 @@ int maindb(int argc, char **argv) {
 				use_mongo = true;
 			} else if (strcmp(opt, "mongo-drop-collection") == 0) {
 				mongo_cfg.drop_collection_before_write = true;
+				use_mongo = true;
+			} else if (strcmp(opt, "mongo-metadata") == 0) {
+				mongo_cfg.write_metadata = true;
 				use_mongo = true;
 			} else {
 				fprintf(stderr, "%s: Unrecognized option --%s\n", argv[0], opt);
@@ -3181,7 +3184,25 @@ int maindb(int argc, char **argv) {
 	long long file_bbox1[4] = {0xFFFFFFFF, 0xFFFFFFFF, 0, 0};	      // standard -180 to 180 world plane
 	long long file_bbox2[4] = {0x1FFFFFFFF, 0xFFFFFFFF, 0x100000000, 0};  // 0 to 360 world plane
 
-	// 1. 初始化 MongoDB（在 read_input 之前，因为 read_input 会调用 traverse_zooms）
+	// 1. Initialize error logger
+	{
+		std::string exec_dir;
+		if (argv[0] && argv[0][0] == '/') {
+			exec_dir = argv[0];
+			auto last_slash = exec_dir.rfind('/');
+			if (last_slash != std::string::npos) {
+				exec_dir = exec_dir.substr(0, last_slash);
+			}
+		} else {
+			char cwd_buf[4096];
+			if (getcwd(cwd_buf, sizeof(cwd_buf))) {
+				exec_dir = cwd_buf;
+			}
+		}
+		ErrorLogger::instance().initialize(exec_dir);
+	}
+
+	// 2. Initialize MongoDB (before read_input, since read_input calls traverse_zooms)
 	if (use_mongo) {
 		MongoDB::initialize_global();
 	}
@@ -3195,6 +3216,43 @@ int maindb(int argc, char **argv) {
 		    maxzoom, minzoom, basezoom, basezoom_marker_width, outdb, out_dir, &exclude, &include, exclude_all, filter, droprate, buffer, tmpdir, gamma, forcetable, NULL, gamma != 0, file_bbox, file_bbox1, file_bbox2, prefilter, postfilter, NULL, guess_maxzoom, guess_cluster_maxzoom, &attribute_types, argv[0], &attribute_accum, attribute_descriptions, commandline, minimum_maxzoom);
 
 	ret = std::get<0>(input_ret);
+
+	// Write metadata to MongoDB if requested
+	if (use_mongo && mongo_cfg.write_metadata && mongo_cfg.dbname != "") {
+		struct metadata meta = std::get<1>(input_ret);
+		std::string meta_json = "{";
+		meta_json += "\"name\":\"" + meta.name + "\",";
+		meta_json += "\"description\":\"" + meta.description + "\",";
+		meta_json += "\"version\":" + std::to_string(meta.version) + ",";
+		meta_json += "\"type\":\"" + meta.type + "\",";
+		meta_json += "\"format\":\"" + meta.format + "\",";
+		meta_json += "\"minzoom\":" + std::to_string(meta.minzoom) + ",";
+		meta_json += "\"maxzoom\":" + std::to_string(meta.maxzoom) + ",";
+		meta_json += "\"bounds\":[" + std::to_string(meta.minlon) + "," + std::to_string(meta.minlat) + "," + std::to_string(meta.maxlon) + "," + std::to_string(meta.maxlat) + "],";
+		meta_json += "\"center\":[" + std::to_string(meta.center_lon) + "," + std::to_string(meta.center_lat) + "," + std::to_string(meta.center_z) + "]";
+		if (!meta.attribution.empty()) {
+			meta_json += ",\"attribution\":\"" + meta.attribution + "\"";
+		}
+		if (!meta.generator.empty()) {
+			meta_json += ",\"generator\":\"" + meta.generator + "\"";
+		}
+		if (!meta.vector_layers_json.empty()) {
+			meta_json += ",\"vector_layers\":" + meta.vector_layers_json;
+		}
+		if (!meta.tilestats_json.empty()) {
+			meta_json += ",\"tilestats\":" + meta.tilestats_json;
+		}
+		meta_json += "}";
+
+		try {
+			MongoWriter* meta_writer = MongoWriter::get_thread_local_instance(mongo_cfg);
+			if (meta_writer) {
+				meta_writer->write_metadata(meta_json);
+			}
+		} catch (const std::exception &e) {
+			fprintf(stderr, "Warning: failed to write MongoDB metadata: %s\n", e.what());
+		}
+	}
 
 	if (outdb != NULL) {
 		mbtiles_close(outdb, argv[0]);
@@ -3220,11 +3278,9 @@ int maindb(int argc, char **argv) {
 	if (use_mongo) {
 		MongoDB::cleanup_global();
 		
-		// 获取并输出统计信息
 		auto stats = MongoDB::get_global_stats();
 		MongoDB::print_stats(stats, quiet);
 		
-		// 检查全局错误统计
 		if (stats.total_errors > 0) {
 			fprintf(stderr, "Error: MongoDB had %zu errors during write operations\n", stats.total_errors);
 			if (ret == 0) {
@@ -3232,6 +3288,9 @@ int maindb(int argc, char **argv) {
 			}
 		}
 	}
+
+	ErrorLogger::instance().print_summary(quiet);
+	ErrorLogger::instance().close();
 
 	return ret;
 }
