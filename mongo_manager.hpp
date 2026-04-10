@@ -15,6 +15,7 @@ size_t estimate_tile_count(size_t feature_count, int min_zoom, int max_zoom);
 
 void initialize_global();
 void cleanup_global();
+void shutdown_global();
 
 struct GlobalStats {
     size_t total_tiles;

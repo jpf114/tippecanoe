@@ -59,6 +59,15 @@ bool PostGISReader::connect()
     return true;
 }
 
+void PostGISReader::disconnect()
+{
+    if (conn)
+    {
+        PQfinish((PGconn *)conn);
+        conn = NULL;
+    }
+}
+
 int PostGISReader::get_cached_srid(const postgis_config &cfg, void *conn_ptr)
 {
     if (srid_cached_)

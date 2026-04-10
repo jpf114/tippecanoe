@@ -3,6 +3,7 @@
 #include "error_logger.hpp"
 #include <cstring>
 #include <cstdio>
+#include <algorithm>
 
 namespace PostGIS {
 
@@ -27,7 +28,7 @@ bool validate_config(const postgis_config& cfg) {
     }
 
     if (cfg.password.empty()) {
-        validation_error = "PostGIS password is required";
+        validation_error = "PostGIS password is required (use --postgis-password if empty)";
         return false;
     }
 
@@ -68,11 +69,13 @@ bool ParallelReader::read_parallel(std::vector<struct serialization_state>& sst,
 
         if (!reader.read_features(sst, layer, layername, 0, 1)) {
             fprintf(stderr, "Failed to read features from PostGIS\n");
+            reader.disconnect();
             return false;
         }
 
         total_features = reader.getTotalFeaturesProcessed();
         total_parse_errors = reader.getParseErrors();
+        reader.disconnect();
         return true;
     }
 
@@ -95,11 +98,13 @@ bool ParallelReader::read_parallel(std::vector<struct serialization_state>& sst,
             if (!t_reader.read_features(sst, layer, layername, i, num_threads)) {
                 fprintf(stderr, "Thread %zu failed to read features\n", i);
                 thread_errors.fetch_add(1);
+                t_reader.disconnect();
                 return;
             }
 
             total_features.fetch_add(t_reader.getTotalFeaturesProcessed());
             total_parse_errors.fetch_add(t_reader.getParseErrors());
+            t_reader.disconnect();
         });
     }
 

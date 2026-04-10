@@ -2874,27 +2874,21 @@ long long write_tile(decompressor *geoms, std::atomic<long long> *geompos_in, ch
 				// has its own connection and batch buffer, so no external lock is needed.
 				// Moving this outside db_lock allows true concurrent writes to MongoDB
 				// across all worker threads.
-				if (mongo_cfg.dbname != "") {
+				if (use_mongo) {
 					try {
-						MongoWriter* thread_mongo_writer = MongoWriter::get_thread_local_instance(mongo_cfg);
-						if (thread_mongo_writer) {
-							thread_mongo_writer->write_tile(z, tx, ty, compressed.data(), compressed.size());
+						MongoWriter* writer = MongoWriter::get_shared_instance(mongo_cfg);
+						if (writer) {
+							writer->write_tile(z, tx, ty, compressed.data(), compressed.size());
 						} else {
-							fprintf(stderr, "Error: Failed to get MongoDB thread-local instance for tile %d/%u/%u\n",
+							fprintf(stderr, "Error: Failed to get MongoDB shared instance for tile %d/%u/%u\n",
 							        z, tx, ty);
-							ErrorLogger::instance().log_mongo_error(z, tx, ty, "write_tile",
-								"Failed to get thread-local instance");
 						}
 					} catch (const std::exception &e) {
 						fprintf(stderr, "Error: MongoDB write failed for tile %d/%u/%u: %s\n",
 						        z, tx, ty, e.what());
-						ErrorLogger::instance().log_mongo_error(z, tx, ty, "write_tile",
-							std::string("Exception: ") + e.what());
 					} catch (...) {
 						fprintf(stderr, "Error: MongoDB write failed with unknown error for tile %d/%u/%u\n",
 						        z, tx, ty);
-						ErrorLogger::instance().log_mongo_error(z, tx, ty, "write_tile",
-							"Unknown exception");
 					}
 				}
 
@@ -2941,9 +2935,6 @@ long long write_tile(decompressor *geoms, std::atomic<long long> *geompos_in, ch
 void *run_thread(void *vargs) {
 	write_tile_args *arg = (write_tile_args *) vargs;
 	int *err_or_null = NULL;
-
-	// 注意：MongoDB 连接会在第一次 write_tile 时自动初始化
-	// 不需要在这里显式初始化
 
 	while (true) {
 		bool done = false;
@@ -3099,8 +3090,7 @@ exit(EXIT_IMPOSSIBLE);
 		}
 	}
 
-	// 线程退出前清理 MongoDB 连接
-	if (mongo_cfg.dbname != "") {
+	if (use_mongo) {
 		MongoWriter::destroy_current_thread_instance();
 	}
 
@@ -3386,10 +3376,10 @@ int traverse_zooms(int *geomfd, off_t *geom_size, char *global_stringpool, std::
 					dir_erase_zoom(outdir, z);
 				}
 				// MongoDB 也需要删除已生成的 zoom 级别
-				if (mongo_cfg.dbname != "") {
-					MongoWriter* thread_mongo_writer = MongoWriter::get_thread_local_instance(mongo_cfg);
-					if (thread_mongo_writer) {
-						thread_mongo_writer->erase_zoom(z);
+				if (use_mongo) {
+					MongoWriter* writer = MongoWriter::get_shared_instance(mongo_cfg);
+					if (writer) {
+						writer->erase_zoom(z);
 					}
 				}
 			} else {

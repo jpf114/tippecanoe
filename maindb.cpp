@@ -69,6 +69,7 @@
 #include "postgis_manager.hpp"
 #include "mongo_manager.hpp"
 #include "error_logger.hpp"
+#include "common_main.hpp"
 
 static int low_detail = 12;
 static int full_detail = -1;
@@ -109,9 +110,6 @@ postgis_config postgis_cfg{};
 bool use_mongo = false;
 mongo_config mongo_cfg{};
 
-// Global MongoWriter instance (will be initialized after argument parsing)
-std::unique_ptr<MongoWriter> mongo_writer;
-
 std::vector<order_field> order_by;
 bool order_reverse;
 bool order_by_size = false;
@@ -125,817 +123,146 @@ size_t CPUS;
 size_t TEMP_FILES;
 long long MAX_FILES;
 size_t memsize;
-static long long diskfree;
+long long diskfree;
 char **av;
 
 std::vector<clipbbox> clipbboxes;
 
-void checkdisk(std::vector<struct reader> *r) {
-	long long used = 0;
-	for (size_t i = 0; i < r->size(); i++) {
-		// Pool and tree are used once.
-		// Geometry and index will be duplicated during sorting and tiling.
-		used += 2 * (*r)[i].geompos + 2 * (*r)[i].indexpos + (*r)[i].poolfile->off + (*r)[i].treefile->off +
-			(*r)[i].vertexpos + (*r)[i].nodepos;
-	}
-
-	static int warned = 0;
-	if (used > diskfree * .9 && !warned) {
-		fprintf(stderr, "You will probably run out of disk space.\n%lld bytes used or committed, of %lld originally available\n", used, diskfree);
-		warned = 1;
-	}
-};
-
-int atoi_require(const char *s, const char *what) {
-	char *err = NULL;
-	if (*s == '\0') {
-		fprintf(stderr, "%s: %s must be a number (got %s)\n", *av, what, s);
+static void validate_postgis_config() {
+	if (!use_postgis) {
+		fprintf(stderr, "Error: PostGIS configuration is required\n");
 		exit(EXIT_ARGS);
 	}
-	int ret = strtol(s, &err, 10);
-	if (*err != '\0') {
-		fprintf(stderr, "%s: %s must be a number (got %s)\n", *av, what, s);
+
+	if (!PostGIS::validate_config(postgis_cfg)) {
+		fprintf(stderr, "Error: %s\n", PostGIS::get_validation_error().c_str());
 		exit(EXIT_ARGS);
 	}
-	return ret;
 }
 
-double atof_require(const char *s, const char *what) {
-	char *err = NULL;
-	if (*s == '\0') {
-		fprintf(stderr, "%s: %s must be a number (got %s)\n", *av, what, s);
+static void validate_mongo_config() {
+	if (!use_mongo) {
+		fprintf(stderr, "Error: MongoDB output is required. Use --mongo or --mongo-dbname etc.\n");
 		exit(EXIT_ARGS);
 	}
-	double ret = strtod(s, &err);
-	if (*err != '\0') {
-		fprintf(stderr, "%s: %s must be a number (got %s)\n", *av, what, s);
+
+	auto mongo_validation_error = MongoDB::validate_config(mongo_cfg);
+	if (mongo_validation_error.has_value()) {
+		fprintf(stderr, "Error: %s\n", mongo_validation_error.value().c_str());
 		exit(EXIT_ARGS);
 	}
-	return ret;
+
+	mongo_cfg.normalize();
+
+	if (!quiet) {
+		fprintf(stderr, "MongoDB output enabled: %s.%s (batch size: %zu)\n",
+				mongo_cfg.dbname.c_str(), mongo_cfg.collection.c_str(), mongo_cfg.batch_size);
+	}
 }
 
-long long atoll_require(const char *s, const char *what) {
-	char *err = NULL;
-	if (*s == '\0') {
-		fprintf(stderr, "%s: %s must be a number (got %s)\n", *av, what, s);
-		exit(EXIT_ARGS);
-	}
-	long long ret = strtoll(s, &err, 10);
-	if (*err != '\0') {
-		fprintf(stderr, "%s: %s must be a number (got %s)\n", *av, what, s);
-		exit(EXIT_ARGS);
-	}
-	return ret;
-}
-
-void init_cpus() {
-	const char *TIPPECANOE_MAX_THREADS = getenv("TIPPECANOE_MAX_THREADS");
-
-	if (TIPPECANOE_MAX_THREADS != NULL) {
-		CPUS = atoi_require(TIPPECANOE_MAX_THREADS, "TIPPECANOE_MAX_THREADS");
-	} else {
-		CPUS = get_num_avail_cpus();
+static void read_postgis_data(std::string &layername, const char *fname,
+                              std::vector<struct reader> &readers,
+                              std::atomic<long long> &progress_seq,
+                              int *initialized, unsigned *initial_x, unsigned *initial_y,
+                              std::vector<std::map<std::string, layermap_entry>> &layermaps,
+                              long long overall_offset,
+                              bool guess_maxzoom, int maxzoom, int basezoom,
+                              std::set<std::string> *exclude, std::set<std::string> *include,
+                              int exclude_all, bool uses_gamma, double gamma,
+                              std::unordered_map<std::string, int> const *attribute_types,
+                              const char *tmpdir,
+                              const char *prefilter, const char *postfilter,
+                              double &dist_sum, size_t &dist_count, double &area_sum) {
+	if (!quiet) {
+		fprintf(stderr, "Reading from PostGIS database: %s@%s:%s/%s\n",
+			postgis_cfg.user.c_str(), postgis_cfg.host.c_str(), postgis_cfg.port.c_str(), postgis_cfg.dbname.c_str());
 	}
 
-	if (CPUS < 1) {
-		CPUS = 1;
-	}
-
-	// Guard against short struct index.segment
-	if (CPUS > 32767) {
-		CPUS = 32767;
-	}
-
-	// Round down to a power of 2
-	CPUS = 1 << (int) (log(CPUS) / log(2));
-	
-	// Limit CPUS to control PostgreSQL connections (1 thread = 1 connection)
-	// This prevents exceeding PostgreSQL max_connections limit
-	if (CPUS > MAX_POSTGRES_CONNECTIONS) {
-		fprintf(stderr, "Limiting CPUS from %zu to %zu to control PostgreSQL connections\n", 
-		        CPUS, MAX_POSTGRES_CONNECTIONS);
-		CPUS = MAX_POSTGRES_CONNECTIONS;
-	}
-
-	MAX_FILES = get_max_open_files();
-
-	// Don't really want too many temporary files, because the file system
-	// will start to bog down eventually
-	if (MAX_FILES > 2000) {
-		MAX_FILES = 2000;
-	}
-
-	// MacOS can run out of system file descriptors
-	// even if we stay under the rlimit, so try to
-	// find out the real limit.
-	long long fds[MAX_FILES];
-	long long i;
-	for (i = 0; i < MAX_FILES; i++) {
-		fds[i] = open(get_null_device(), O_RDONLY | O_CLOEXEC);
-		if (fds[i] < 0) {
-			break;
-		}
-	}
-	long long j;
-	for (j = 0; j < i; j++) {
-		if (close(fds[j]) < 0) {
-			perror("close");
-			exit(EXIT_CLOSE);
-		}
-	}
-
-	// Scale down because we really don't want to run the system out of files
-	MAX_FILES = i * 3 / 4;
-	if (MAX_FILES < 32) {
-		fprintf(stderr, "Can't open a useful number of files: %lld\n", MAX_FILES);
+	PostGISReader reader(postgis_cfg);
+	if (!reader.connect()) {
+		fprintf(stderr, "Failed to connect to PostGIS database\n");
 		exit(EXIT_OPEN);
 	}
+	reader.disconnect();
 
-	TEMP_FILES = (MAX_FILES - 10) / 2;
-	if (TEMP_FILES > CPUS * 4) {
-		TEMP_FILES = CPUS * 4;
-	}
-}
-
-int indexcmp(const void *v1, const void *v2) {
-	const struct index *i1 = (const struct index *) v1;
-	const struct index *i2 = (const struct index *) v2;
-
-	if (i1->ix < i2->ix) {
-		return -1;
-	} else if (i1->ix > i2->ix) {
-		return 1;
+	layermap_entry e = layermap_entry(0);
+	e.description = "PostGIS layer";
+	std::map<std::string, layermap_entry> layermap;
+	layermap.insert(std::pair<std::string, layermap_entry>(layername, e));
+	layermaps.clear();
+	for (size_t l = 0; l < CPUS; l++) {
+		layermaps.push_back(layermap);
 	}
 
-	if (i1->seq < i2->seq) {
-		return -1;
-	} else if (i1->seq > i2->seq) {
-		return 1;
-	}
+	std::vector<struct serialization_state> sst;
+	sst.resize(CPUS);
+
+	std::vector<std::atomic<long long>> layer_seq_v(CPUS);
+	std::vector<double> dist_sums_v(CPUS, 0);
+	std::vector<size_t> dist_counts_v(CPUS, 0);
+	std::vector<double> area_sums_v(CPUS, 0);
+	std::atomic<long long> *layer_seq = layer_seq_v.data();
+	double *dist_sums = dist_sums_v.data();
+	size_t *dist_counts = dist_counts_v.data();
+	double *area_sums = area_sums_v.data();
 
-	return 0;
-}
-
-struct mergelist {
-	long long start;
-	long long end;
-
-	struct mergelist *next;
-};
-
-static void insert(struct mergelist *m, struct mergelist **head, unsigned char *map) {
-	while (*head != NULL && indexcmp(map + m->start, map + (*head)->start) > 0) {
-		head = &((*head)->next);
-	}
-
-	m->next = *head;
-	*head = m;
-}
-
-struct drop_state {
-	double gap;
-	unsigned long long previndex;
-	double interval;
-	double seq;  // floating point because interval is
-};
-
-struct drop_densest {
-	unsigned long long gap;
-	size_t seq;
-
-	bool operator<(const drop_densest &o) const {
-		// largest gap sorts first
-		return gap > o.gap;
-	}
-};
-
-int calc_feature_minzoom(struct index *ix, struct drop_state *ds, int maxzoom, double gamma) {
-	int feature_minzoom = 0;
-
-	if (gamma >= 0 && (ix->t == VT_POINT ||
-			   (additional[A_LINE_DROP] && ix->t == VT_LINE) ||
-			   (additional[A_POLYGON_DROP] && ix->t == VT_POLYGON))) {
-		for (ssize_t i = maxzoom; i >= 0; i--) {
-			ds[i].seq++;
-		}
-		for (ssize_t i = maxzoom; i >= 0; i--) {
-			if (ds[i].seq < 0) {
-				feature_minzoom = i + 1;
-
-				// The feature we are pushing out
-				// appears in zooms i + 1 through maxzoom,
-				// so track where that was so we can make sure
-				// not to cluster something else that is *too*
-				// far away into it.
-				for (ssize_t j = i + 1; j <= maxzoom; j++) {
-					ds[j].previndex = ix->ix;
-				}
-
-				break;
-			} else {
-				ds[i].seq -= ds[i].interval;
-			}
-		}
-
-		// If this feature has been chosen only for a high zoom level,
-		// check whether at a low zoom level it is nevertheless too far
-		// from the last feature chosen for that low zoom, in which case
-		// we will go ahead and push it out.
-
-		if (preserve_point_density_threshold > 0) {
-			for (ssize_t i = 0; i < feature_minzoom && i < maxzoom; i++) {
-				if (ix->ix - ds[i].previndex > ((1LL << (32 - i)) / preserve_point_density_threshold) * ((1LL << (32 - i)) / preserve_point_density_threshold)) {
-					feature_minzoom = i;
-
-					for (ssize_t j = i; j <= maxzoom; j++) {
-						ds[j].previndex = ix->ix;
-					}
-
-					break;
-				}
-			}
-		}
-
-		// XXX manage_gap
-	}
-
-	return feature_minzoom;
-}
-
-static void merge(struct mergelist *merges, size_t nmerges, unsigned char *map, FILE *indexfile, int bytes, char *geom_map, FILE *geom_out, std::atomic<long long> *geompos, long long *progress, long long *progress_max, long long *progress_reported, int maxzoom, double gamma, struct drop_state *ds) {
-	struct mergelist *head = NULL;
-
-	for (size_t i = 0; i < nmerges; i++) {
-		if (merges[i].start < merges[i].end) {
-			insert(&(merges[i]), &head, map);
-		}
-	}
-
-	last_progress = 0;
-
-	while (head != NULL) {
-		struct index ix = *((struct index *) (map + head->start));
-		long long pos = *geompos;
-
-		// MAGIC: This knows that the feature minzoom is the last byte of the serialized feature
-		// and is writing one byte less and then adding the byte for the minzoom.
-
-		fwrite_check(geom_map + ix.start, 1, ix.end - ix.start - 1, geom_out, geompos, "merge geometry");
-		int feature_minzoom = calc_feature_minzoom(&ix, ds, maxzoom, gamma);
-		serialize_byte(geom_out, feature_minzoom, geompos, "merge geometry");
-
-		// Count this as an 75%-accomplishment, since we already 25%-counted it
-		*progress += (ix.end - ix.start) * 3 / 4;
-		if (!quiet && !quiet_progress && progress_time() && 100 * *progress / *progress_max != *progress_reported) {
-			fprintf(stderr, "Reordering geometry: %lld%% \r", 100 * *progress / *progress_max);
-			fflush(stderr);
-			*progress_reported = 100 * *progress / *progress_max;
-		}
-
-		ix.start = pos;
-		ix.end = *geompos;
-		std::atomic<long long> indexpos;
-		fwrite_check(&ix, bytes, 1, indexfile, &indexpos, "merge temporary");
-		head->start += bytes;
-
-		struct mergelist *m = head;
-		head = m->next;
-		m->next = NULL;
-
-		if (m->start < m->end) {
-			insert(m, &head, map);
-		}
-	}
-}
-
-struct sort_arg {
-	int task;
-	int cpus;
-	long long indexpos;
-	struct mergelist *merges;
-	int indexfd;
-	size_t nmerges;
-	long long unit;
-	int bytes;
-
-	sort_arg(int task1, int cpus1, long long indexpos1, struct mergelist *merges1, int indexfd1, size_t nmerges1, long long unit1, int bytes1)
-	    : task(task1), cpus(cpus1), indexpos(indexpos1), merges(merges1), indexfd(indexfd1), nmerges(nmerges1), unit(unit1), bytes(bytes1) {
-	}
-};
-
-void *run_sort(void *v) {
-	struct sort_arg *a = (struct sort_arg *) v;
-
-	long long start;
-	for (start = a->task * a->unit; start < a->indexpos; start += a->unit * a->cpus) {
-		long long end = start + a->unit;
-		if (end > a->indexpos) {
-			end = a->indexpos;
-		}
-
-		a->merges[start / a->unit].start = start;
-		a->merges[start / a->unit].end = end;
-		a->merges[start / a->unit].next = NULL;
-
-		// Read section of index into memory to sort and then use pwrite()
-		// to write it back out rather than sorting in mapped memory,
-		// because writable mapped memory seems to have bad performance
-		// problems on ECS (and maybe in containers in general)?
-
-		std::string s;
-		s.resize(end - start);
-
-		if (pread(a->indexfd, (void *) s.c_str(), end - start, start) != end - start) {
-			fprintf(stderr, "pread(index): %s\n", strerror(errno));
-			exit(EXIT_READ);
-		}
-
-		qsort((void *) s.c_str(), (end - start) / a->bytes, a->bytes, indexcmp);
-
-		if (pwrite(a->indexfd, s.c_str(), end - start, start) != end - start) {
-			fprintf(stderr, "pwrite(index): %s\n", strerror(errno));
-			exit(EXIT_WRITE);
-		}
-	}
-
-	return NULL;
-}
-
-
-
-void radix1(int *geomfds_in, int *indexfds_in, int inputs, int prefix, int splits, long long mem, const char *tmpdir, long long *availfiles, FILE *geomfile, FILE *indexfile, std::atomic<long long> *geompos_out, long long *progress, long long *progress_max, long long *progress_reported, int maxzoom, int basezoom, double droprate, double gamma, struct drop_state *ds) {
-	// Arranged as bits to facilitate subdividing again if a subdivided file is still huge
-	int splitbits = log(splits) / log(2);
-	splits = 1 << splitbits;
-
-	FILE *geomfiles[splits];
-	FILE *indexfiles[splits];
-	int geomfds[splits];
-	int indexfds[splits];
-	std::atomic<long long> sub_geompos[splits];
-
-	int i;
-	for (i = 0; i < splits; i++) {
-		sub_geompos[i] = 0;
-
-		char geomname[strlen(tmpdir) + strlen("/geom.XXXXXXXX") + 1];
-		snprintf(geomname, sizeof(geomname), "%s%s", tmpdir, "/geom.XXXXXXXX");
-		char indexname[strlen(tmpdir) + strlen("/index.XXXXXXXX") + 1];
-		snprintf(indexname, sizeof(indexname), "%s%s", tmpdir, "/index.XXXXXXXX");
-
-		geomfds[i] = mkstemp_cloexec(geomname);
-		if (geomfds[i] < 0) {
-			perror(geomname);
-			exit(EXIT_OPEN);
-		}
-		indexfds[i] = mkstemp_cloexec(indexname);
-		if (indexfds[i] < 0) {
-			perror(indexname);
-			exit(EXIT_OPEN);
-		}
-
-		geomfiles[i] = fopen_oflag(geomname, "wb", O_WRONLY | O_CLOEXEC);
-		if (geomfiles[i] == NULL) {
-			perror(geomname);
-			exit(EXIT_OPEN);
-		}
-		indexfiles[i] = fopen_oflag(indexname, "wb", O_WRONLY | O_CLOEXEC);
-		if (indexfiles[i] == NULL) {
-			perror(indexname);
-			exit(EXIT_OPEN);
-		}
-
-		*availfiles -= 4;
-
-		unlink(geomname);
-		unlink(indexname);
-	}
-
-	for (i = 0; i < inputs; i++) {
-		struct stat geomst, indexst;
-		if (fstat(geomfds_in[i], &geomst) < 0) {
-			perror("stat geom");
-			exit(EXIT_STAT);
-		}
-		if (fstat(indexfds_in[i], &indexst) < 0) {
-			perror("stat index");
-			exit(EXIT_STAT);
-		}
-
-		if (indexst.st_size != 0) {
-			struct index *indexmap = (struct index *) mmap(NULL, indexst.st_size, PROT_READ, MAP_PRIVATE, indexfds_in[i], 0);
-			if (indexmap == MAP_FAILED) {
-				fprintf(stderr, "fd %lld, len %lld\n", (long long) indexfds_in[i], (long long) indexst.st_size);
-				perror("map index");
-				exit(EXIT_STAT);
-			}
-			madvise(indexmap, indexst.st_size, MADV_SEQUENTIAL);
-			madvise(indexmap, indexst.st_size, MADV_WILLNEED);
-			char *geommap = (char *) mmap(NULL, geomst.st_size, PROT_READ, MAP_PRIVATE, geomfds_in[i], 0);
-			if (geommap == MAP_FAILED) {
-				perror("map geom");
-				exit(EXIT_MEMORY);
-			}
-			madvise(geommap, geomst.st_size, MADV_SEQUENTIAL);
-			madvise(geommap, geomst.st_size, MADV_WILLNEED);
-
-			for (size_t a = 0; a < indexst.st_size / sizeof(struct index); a++) {
-				struct index ix = indexmap[a];
-				unsigned long long which = (ix.ix << prefix) >> (64 - splitbits);
-				long long pos = sub_geompos[which];
-
-				fwrite_check(geommap + ix.start, ix.end - ix.start, 1, geomfiles[which], &sub_geompos[which], "geom");
-
-				// Count this as a 25%-accomplishment, since we will copy again
-				*progress += (ix.end - ix.start) / 4;
-				if (!quiet && !quiet_progress && progress_time() && 100 * *progress / *progress_max != *progress_reported) {
-					fprintf(stderr, "Reordering geometry: %lld%% \r", 100 * *progress / *progress_max);
-					fflush(stderr);
-					*progress_reported = 100 * *progress / *progress_max;
-				}
-
-				ix.start = pos;
-				ix.end = sub_geompos[which];
-
-				std::atomic<long long> indexpos;
-				fwrite_check(&ix, sizeof(struct index), 1, indexfiles[which], &indexpos, "index");
-			}
-
-			madvise(indexmap, indexst.st_size, MADV_DONTNEED);
-			if (munmap(indexmap, indexst.st_size) < 0) {
-				perror("unmap index");
-				exit(EXIT_MEMORY);
-			}
-			madvise(geommap, geomst.st_size, MADV_DONTNEED);
-			if (munmap(geommap, geomst.st_size) < 0) {
-				perror("unmap geom");
-				exit(EXIT_MEMORY);
-			}
-		}
-
-		if (close(geomfds_in[i]) < 0) {
-			perror("close geom");
-			exit(EXIT_CLOSE);
-		}
-		if (close(indexfds_in[i]) < 0) {
-			perror("close index");
-			exit(EXIT_CLOSE);
-		}
-
-		*availfiles += 2;
-	}
-
-	for (i = 0; i < splits; i++) {
-		if (fclose(geomfiles[i]) != 0) {
-			perror("fclose geom");
-			exit(EXIT_CLOSE);
-		}
-		if (fclose(indexfiles[i]) != 0) {
-			perror("fclose index");
-			exit(EXIT_CLOSE);
-		}
-
-		*availfiles += 2;
-	}
-
-	for (i = 0; i < splits; i++) {
-		int already_closed = 0;
-
-		struct stat geomst, indexst;
-		if (fstat(geomfds[i], &geomst) < 0) {
-			perror("stat geom");
-			exit(EXIT_STAT);
-		}
-		if (fstat(indexfds[i], &indexst) < 0) {
-			perror("stat index");
-			exit(EXIT_STAT);
-		}
-
-		if (indexst.st_size > 0) {
-			if (indexst.st_size + geomst.st_size < mem) {
-				std::atomic<long long> indexpos(indexst.st_size);
-				int bytes = sizeof(struct index);
-
-				int page = get_page_size();
-				// Don't try to sort more than 2GB at once,
-				// which used to crash Macs and may still
-				long long max_unit = 2LL * 1024 * 1024 * 1024;
-				long long unit = ((indexpos / CPUS + bytes - 1) / bytes) * bytes;
-				if (unit > max_unit) {
-					unit = max_unit;
-				}
-				unit = ((unit + page - 1) / page) * page;
-				if (unit < page) {
-					unit = page;
-				}
-
-				size_t nmerges = (indexpos + unit - 1) / unit;
-				struct mergelist merges[nmerges];
-
-				for (size_t a = 0; a < nmerges; a++) {
-					merges[a].start = merges[a].end = 0;
-				}
-
-				pthread_t pthreads[CPUS];
-				std::vector<sort_arg> args;
-
-				for (size_t a = 0; a < CPUS; a++) {
-					args.push_back(sort_arg(
-						a,
-						CPUS,
-						indexpos,
-						merges,
-						indexfds[i],
-						nmerges,
-						unit,
-						bytes));
-				}
-
-				for (size_t a = 0; a < CPUS; a++) {
-					if (thread_create(&pthreads[a], NULL, run_sort, &args[a]) != 0) {
-						perror("pthread_create");
-						exit(EXIT_PTHREAD);
-					}
-				}
-
-				for (size_t a = 0; a < CPUS; a++) {
-					void *retval;
-
-					if (pthread_join(pthreads[a], &retval) != 0) {
-						perror("pthread_join 679");
-					}
-				}
-
-				struct indexmap *indexmap = (struct indexmap *) mmap(NULL, indexst.st_size, PROT_READ, MAP_PRIVATE, indexfds[i], 0);
-				if (indexmap == MAP_FAILED) {
-					fprintf(stderr, "fd %lld, len %lld\n", (long long) indexfds[i], (long long) indexst.st_size);
-					perror("map index");
-					exit(EXIT_MEMORY);
-				}
-				madvise(indexmap, indexst.st_size, MADV_RANDOM);  // sequential, but from several pointers at once
-				madvise(indexmap, indexst.st_size, MADV_WILLNEED);
-				char *geommap = (char *) mmap(NULL, geomst.st_size, PROT_READ, MAP_PRIVATE, geomfds[i], 0);
-				if (geommap == MAP_FAILED) {
-					perror("map geom");
-					exit(EXIT_MEMORY);
-				}
-				madvise(geommap, geomst.st_size, MADV_RANDOM);
-				madvise(geommap, geomst.st_size, MADV_WILLNEED);
-
-				merge(merges, nmerges, (unsigned char *) indexmap, indexfile, bytes, geommap, geomfile, geompos_out, progress, progress_max, progress_reported, maxzoom, gamma, ds);
-
-				madvise(indexmap, indexst.st_size, MADV_DONTNEED);
-				if (munmap(indexmap, indexst.st_size) < 0) {
-					perror("unmap index");
-					exit(EXIT_MEMORY);
-				}
-				madvise(geommap, geomst.st_size, MADV_DONTNEED);
-				if (munmap(geommap, geomst.st_size) < 0) {
-					perror("unmap geom");
-					exit(EXIT_MEMORY);
-				}
-			} else if (indexst.st_size == sizeof(struct index) || prefix + splitbits >= 64) {
-				struct index *indexmap = (struct index *) mmap(NULL, indexst.st_size, PROT_READ, MAP_PRIVATE, indexfds[i], 0);
-				if (indexmap == MAP_FAILED) {
-					fprintf(stderr, "fd %lld, len %lld\n", (long long) indexfds[i], (long long) indexst.st_size);
-					perror("map index");
-					exit(EXIT_MEMORY);
-				}
-				madvise(indexmap, indexst.st_size, MADV_SEQUENTIAL);
-				madvise(indexmap, indexst.st_size, MADV_WILLNEED);
-				char *geommap = (char *) mmap(NULL, geomst.st_size, PROT_READ, MAP_PRIVATE, geomfds[i], 0);
-				if (geommap == MAP_FAILED) {
-					perror("map geom");
-					exit(EXIT_MEMORY);
-				}
-				madvise(geommap, geomst.st_size, MADV_RANDOM);
-				madvise(geommap, geomst.st_size, MADV_WILLNEED);
-
-				for (size_t a = 0; a < indexst.st_size / sizeof(struct index); a++) {
-					struct index ix = indexmap[a];
-					long long pos = *geompos_out;
-
-					fwrite_check(geommap + ix.start, ix.end - ix.start, 1, geomfile, geompos_out, "geom");
-					int feature_minzoom = calc_feature_minzoom(&ix, ds, maxzoom, gamma);
-					serialize_byte(geomfile, feature_minzoom, geompos_out, "merge geometry");
-
-					// Count this as an 75%-accomplishment, since we already 25%-counted it
-					*progress += (ix.end - ix.start) * 3 / 4;
-					if (!quiet && !quiet_progress && progress_time() && 100 * *progress / *progress_max != *progress_reported) {
-						fprintf(stderr, "Reordering geometry: %lld%% \r", 100 * *progress / *progress_max);
-						fflush(stderr);
-						*progress_reported = 100 * *progress / *progress_max;
-					}
-
-					ix.start = pos;
-					ix.end = *geompos_out;
-					std::atomic<long long> indexpos;
-					fwrite_check(&ix, sizeof(struct index), 1, indexfile, &indexpos, "index");
-				}
-
-				madvise(indexmap, indexst.st_size, MADV_DONTNEED);
-				if (munmap(indexmap, indexst.st_size) < 0) {
-					perror("unmap index");
-					exit(EXIT_MEMORY);
-				}
-				madvise(geommap, geomst.st_size, MADV_DONTNEED);
-				if (munmap(geommap, geomst.st_size) < 0) {
-					perror("unmap geom");
-					exit(EXIT_MEMORY);
-				}
-			} else {
-				// We already reported the progress from splitting this radix out
-				// but we need to split it again, which will be credited with more
-				// progress. So increase the total amount of progress to report by
-				// the additional progress that will happpen, which may move the
-				// counter backward but will be an honest estimate of the work remaining.
-				*progress_max += geomst.st_size / 4;
-
-				radix1(&geomfds[i], &indexfds[i], 1, prefix + splitbits, *availfiles / 4, mem, tmpdir, availfiles, geomfile, indexfile, geompos_out, progress, progress_max, progress_reported, maxzoom, basezoom, droprate, gamma, ds);
-				already_closed = 1;
-			}
-		}
-
-		if (!already_closed) {
-			if (close(geomfds[i]) < 0) {
-				perror("close geom");
-				exit(EXIT_CLOSE);
-			}
-			if (close(indexfds[i]) < 0) {
-				perror("close index");
-				exit(EXIT_CLOSE);
-			}
-
-			*availfiles += 2;
-		}
-	}
-}
-
-void prep_drop_states(struct drop_state *ds, int maxzoom, int basezoom, double droprate) {
-	// Needs to be signed for interval calculation
-	for (ssize_t i = 0; i <= maxzoom; i++) {
-		ds[i].gap = 0;
-		ds[i].previndex = 0;
-		ds[i].interval = 0;
-
-		if (i < basezoom) {
-			ds[i].interval = std::exp(std::log(droprate) * (basezoom - i));
-		}
-
-		ds[i].seq = 0;
-	}
-}
-
-void radix(std::vector<struct reader> &readers, int nreaders, FILE *geomfile, FILE *indexfile, const char *tmpdir, std::atomic<long long> *geompos, int maxzoom, int basezoom, double droprate, double gamma) {
-	// Run through the index and geometry for each reader,
-	// splitting the contents out by index into as many
-	// sub-files as we can write to simultaneously.
-
-	// Then sort each of those by index, recursively if it is
-	// too big to fit in memory.
-
-	// Then concatenate each of the sub-outputs into a final output.
-
-	long long mem = memsize;
-
-	// Just for code coverage testing. Deeply recursive sorting is very slow
-	// compared to sorting in memory.
-	if (additional[A_PREFER_RADIX_SORT]) {
-		mem = 8192;
-	}
-
-	long long availfiles = MAX_FILES - 2 * nreaders	 // each reader has a geom and an index
-			       - 3			 // pool, mbtiles, mbtiles journal
-			       - 4			 // top-level geom and index output, both FILE and fd
-			       - 3;			 // stdin, stdout, stderr
-
-	// 4 because for each we have output and input FILE and fd for geom and index
-	int splits = availfiles / 4;
-
-	// Be somewhat conservative about memory availability because the whole point of this
-	// is to keep from thrashing by working on chunks that will fit in memory.
-	mem /= 2;
-
-	long long geom_total = 0;
-	int geomfds[nreaders];
-	int indexfds[nreaders];
-	for (int i = 0; i < nreaders; i++) {
-		geomfds[i] = readers[i].geomfd;
-		indexfds[i] = readers[i].indexfd;
-
-		struct stat geomst;
-		if (fstat(readers[i].geomfd, &geomst) < 0) {
-			perror("stat geom");
-			exit(EXIT_STAT);
-		}
-		geom_total += geomst.st_size;
-	}
-
-	std::vector<struct drop_state> ds_v(maxzoom + 1);
-	struct drop_state *ds = ds_v.data();
-	prep_drop_states(ds, maxzoom, basezoom, droprate);
-
-	long long progress = 0, progress_max = geom_total, progress_reported = -1;
-	long long availfiles_before = availfiles;
-	radix1(geomfds, indexfds, nreaders, 0, splits, mem, tmpdir, &availfiles, geomfile, indexfile, geompos, &progress, &progress_max, &progress_reported, maxzoom, basezoom, droprate, gamma, ds);
-
-	if (availfiles - 2 * nreaders != availfiles_before) {
-		fprintf(stderr, "Internal error: miscounted available file descriptors: %lld vs %lld\n", availfiles - 2 * nreaders, availfiles);
-		exit(EXIT_IMPOSSIBLE);
-	}
-}
-
-void choose_first_zoom(long long *file_bbox, long long *file_bbox1, long long *file_bbox2, std::vector<struct reader> &readers, unsigned *iz, unsigned *ix, unsigned *iy, int minzoom, int buffer) {
 	for (size_t i = 0; i < CPUS; i++) {
-		if (readers[i].file_bbox[0] < file_bbox[0]) {
-			file_bbox[0] = readers[i].file_bbox[0];
-		}
-		if (readers[i].file_bbox[1] < file_bbox[1]) {
-			file_bbox[1] = readers[i].file_bbox[1];
-		}
-		if (readers[i].file_bbox[2] > file_bbox[2]) {
-			file_bbox[2] = readers[i].file_bbox[2];
-		}
-		if (readers[i].file_bbox[3] > file_bbox[3]) {
-			file_bbox[3] = readers[i].file_bbox[3];
-		}
+		layer_seq[i] = overall_offset;
 
-		file_bbox1[0] = std::min(file_bbox1[0], readers[i].file_bbox1[0]);
-		file_bbox1[1] = std::min(file_bbox1[1], readers[i].file_bbox1[1]);
-		file_bbox1[2] = std::max(file_bbox1[2], readers[i].file_bbox1[2]);
-		file_bbox1[3] = std::max(file_bbox1[3], readers[i].file_bbox1[3]);
-
-		file_bbox2[0] = std::min(file_bbox2[0], readers[i].file_bbox2[0]);
-		file_bbox2[1] = std::min(file_bbox2[1], readers[i].file_bbox2[1]);
-		file_bbox2[2] = std::max(file_bbox2[2], readers[i].file_bbox2[2]);
-		file_bbox2[3] = std::max(file_bbox2[3], readers[i].file_bbox2[3]);
+		sst[i].fname = "PostGIS";
+		sst[i].line = 0;
+		sst[i].layer_seq = &layer_seq[i];
+		sst[i].progress_seq = &progress_seq;
+		sst[i].readers = &readers;
+		sst[i].segment = i;
+		sst[i].initial_x = &initial_x[i];
+		sst[i].initial_y = &initial_y[i];
+		sst[i].initialized = &initialized[i];
+		sst[i].dist_sum = &dist_sums[i];
+		sst[i].dist_count = &dist_counts[i];
+		sst[i].area_sum = &area_sums[i];
+		sst[i].want_dist = guess_maxzoom;
+		sst[i].maxzoom = maxzoom;
+		sst[i].filters = prefilter != NULL || postfilter != NULL;
+		sst[i].uses_gamma = uses_gamma;
+		sst[i].layermap = &layermaps[i];
+		sst[i].exclude = exclude;
+		sst[i].include = include;
+		sst[i].exclude_all = exclude_all;
+		sst[i].basezoom = basezoom;
+		sst[i].attribute_types = attribute_types;
 	}
 
-	// If the bounding box extends off the plane on either side,
-	// a feature wrapped across the date line, so the width of the
-	// bounding box is the whole world.
-	if (file_bbox[0] < 0) {
-		file_bbox[0] = 0;
-		file_bbox[2] = (1LL << 32) - 1;
-	}
-	if (file_bbox[2] > (1LL << 32) - 1) {
-		file_bbox[0] = 0;
-		file_bbox[2] = (1LL << 32) - 1;
-	}
-	if (file_bbox[1] < 0) {
-		file_bbox[1] = 0;
-	}
-	if (file_bbox[3] > (1LL << 32) - 1) {
-		file_bbox[3] = (1LL << 32) - 1;
-	}
+	std::atomic<size_t> total_features{0};
 
-	for (ssize_t z = minzoom; z >= 0; z--) {
-		long long shift = 1LL << (32 - z);
+	PostGIS::ParallelReader parallel_reader(postgis_cfg, CPUS);
+	if (!parallel_reader.read_parallel(sst, 0, layername)) {
+		fprintf(stderr, "Failed to read features from PostGIS\n");
+		exit(EXIT_READ);
+	}
+	total_features = parallel_reader.get_total_features();
 
-		long long left = (file_bbox[0] - buffer * shift / 256) / shift;
-		long long top = (file_bbox[1] - buffer * shift / 256) / shift;
-		long long right = (file_bbox[2] + buffer * shift / 256) / shift;
-		long long bottom = (file_bbox[3] + buffer * shift / 256) / shift;
+	if (mongo_cfg.batch_size == DEFAULT_MONGO_BATCH_SIZE) {
+		size_t estimated_tiles = MongoDB::estimate_tile_count(total_features.load(), 0, maxzoom);
+		size_t suggested_batch = MongoDB::suggest_batch_size(estimated_tiles);
 
-		if (left == right && top == bottom) {
-			*iz = z;
-			*ix = left;
-			*iy = top;
-			break;
+		mongo_cfg.batch_size = suggested_batch;
+		mongo_cfg.normalize();
+
+		if (!quiet) {
+			fprintf(stderr, "Auto-adjusted MongoDB batch size to %zu "
+					"(processed %zu features, estimated %zu tiles)\n",
+					mongo_cfg.batch_size, total_features.load(), estimated_tiles);
 		}
 	}
-}
 
-int vertexcmp(const void *void1, const void *void2) {
-	vertex *v1 = (vertex *) void1;
-	vertex *v2 = (vertex *) void2;
-
-	if (v1->mid < v2->mid) {
-		return -1;
-	}
-	if (v1->mid > v2->mid) {
-		return 1;
+	for (size_t i = 0; i < CPUS; i++) {
+		dist_sum += dist_sums[i];
+		dist_count += dist_counts[i];
+		area_sum += area_sums[i];
 	}
 
-	if (v1->p1 < v2->p1) {
-		return -1;
-	}
-	if (v1->p1 > v2->p1) {
-		return 1;
-	}
-
-	if (v1->p2 < v2->p2) {
-		return -1;
-	}
-	if (v1->p2 > v2->p2) {
-		return 1;
-	}
-
-	return 0;
-}
-
-double round_droprate(double r) {
-	return std::round(r * 100000.0) / 100000.0;
+	checkdisk(&readers);
 }
 
 std::pair<int, metadata> read_input(std::string &layername, const char *fname, int maxzoom, int minzoom, int basezoom, double basezoom_marker_width, sqlite3 *outdb, const char *outdir, std::set<std::string> *exclude, std::set<std::string> *include, int exclude_all, json_object *filter, double droprate, int buffer, const char *tmpdir, double gamma, int forcetable, const char *attribution, bool uses_gamma, long long *file_bbox, long long *file_bbox1, long long *file_bbox2, const char *prefilter, const char *postfilter, const char *description, bool guess_maxzoom, bool guess_cluster_maxzoom, std::unordered_map<std::string, int> const *attribute_types, const char *pgm, std::unordered_map<std::string, attribute_op> const *attribute_accum, std::map<std::string, std::string> const &attribute_descriptions, std::string const &commandline, int minimum_maxzoom) {
@@ -1055,20 +382,18 @@ std::pair<int, metadata> read_input(std::string &layername, const char *fname, i
 
 	std::atomic<long long> progress_seq(0);
 
-	// 2 * CPUS: One per reader thread, one per tiling thread
-	int initialized[2 * CPUS];
-	unsigned initial_x[2 * CPUS], initial_y[2 * CPUS];
-	for (size_t i = 0; i < 2 * CPUS; i++) {
-		initialized[i] = initial_x[i] = initial_y[i] = 0;
-	}
+	size_t init_count = 2 * CPUS;
+	std::vector<int> initialized_v(init_count, 0);
+	std::vector<unsigned> initial_x_v(init_count, 0);
+	std::vector<unsigned> initial_y_v(init_count, 0);
+	int *initialized = initialized_v.data();
+	unsigned *initial_x = initial_x_v.data();
+	unsigned *initial_y = initial_y_v.data();
 
 	std::map<std::string, layermap_entry> layermap;
 	std::vector<std::map<std::string, layermap_entry> > layermaps;
 
 	long overall_offset = 0;
-	double dist_sum = 0;
-	size_t dist_count = 0;
-	double area_sum = 0;
 
 	int files_open_before_reading = open(get_null_device(), O_RDONLY | O_CLOEXEC);
 	if (files_open_before_reading < 0) {
@@ -1080,138 +405,21 @@ std::pair<int, metadata> read_input(std::string &layername, const char *fname, i
 		exit(EXIT_CLOSE);
 	}
 
-	// PostGIS configuration is required
-	if(!use_postgis) {
-		fprintf(stderr, "Error: PostGIS configuration is required\n");
-		exit(EXIT_ARGS);
-	}
+	validate_postgis_config();
+	validate_mongo_config();
 
-	// Validate PostGIS configuration using manager
-	if (!PostGIS::validate_config(postgis_cfg)) {
-		fprintf(stderr, "Error: %s\n", PostGIS::get_validation_error().c_str());
-		exit(EXIT_ARGS);
-	}
+	double dist_sum = 0;
+	size_t dist_count = 0;
+	double area_sum = 0;
 
-	// MongoDB configuration validation (forced MongoDB output)
-	if (!use_mongo) {
-		fprintf(stderr, "Error: MongoDB output is required. Use --mongo or --mongo-dbname etc.\n");
-		exit(EXIT_ARGS);
-	}
-
-	// Validate MongoDB configuration using manager
-	auto mongo_validation_error = MongoDB::validate_config(mongo_cfg);
-	if (mongo_validation_error.has_value()) {
-		fprintf(stderr, "Error: %s\n", mongo_validation_error.value().c_str());
-		exit(EXIT_ARGS);
-	}
-	
-	// Validate and limit batch size
-	if (mongo_cfg.batch_size < MIN_MONGO_BATCH_SIZE) {
-		mongo_cfg.batch_size = MIN_MONGO_BATCH_SIZE;
-	} else if (mongo_cfg.batch_size > MAX_MONGO_BATCH_SIZE) {
-		mongo_cfg.batch_size = MAX_MONGO_BATCH_SIZE;
-	}
-
-	if (!quiet) {
-		fprintf(stderr, "MongoDB output enabled: %s.%s (batch size: %zu)\n", 
-				mongo_cfg.dbname.c_str(), mongo_cfg.collection.c_str(), mongo_cfg.batch_size);
-	}
-
-	// 注意：MongoDB 的初始化和生命周期管理在 maindb() 函数中处理
-	// 这里只验证配置，不创建连接
-
-	if (!quiet) {
-		fprintf(stderr, "Reading from PostGIS database: %s@%s:%s/%s\n", 
-			postgis_cfg.user.c_str(), postgis_cfg.host.c_str(), postgis_cfg.port.c_str(), postgis_cfg.dbname.c_str());
-	}
-
-	// Create a PostGISReader instance
-	PostGISReader reader(postgis_cfg);
-	if (!reader.connect()) {
-		fprintf(stderr, "Failed to connect to PostGIS database\n");
-		exit(EXIT_OPEN);
-	}
-
-	// Add to layermap
-	layermap_entry e = layermap_entry(0);
-	e.description = "PostGIS layer";
-	layermap.insert(std::pair<std::string, layermap_entry>(layername, e));
-	layermaps.clear();
-	for (size_t l = 0; l < CPUS; l++) {
-		layermaps.push_back(layermap);
-	}
-
-	// Read features from PostGIS
-	std::vector<struct serialization_state> sst;
-	sst.resize(CPUS);
-
-	std::atomic<long long> layer_seq[CPUS];
-	double dist_sums[CPUS];
-	size_t dist_counts[CPUS];
-	double area_sums[CPUS];
-
-	for (size_t i = 0; i < CPUS; i++) {
-		layer_seq[i] = overall_offset;
-		dist_sums[i] = 0;
-		dist_counts[i] = 0;
-		area_sums[i] = 0;
-
-		sst[i].fname = "PostGIS";
-		sst[i].line = 0;
-		sst[i].layer_seq = &layer_seq[i];
-		sst[i].progress_seq = &progress_seq;
-		sst[i].readers = &readers;
-		sst[i].segment = i;
-		sst[i].initial_x = &initial_x[i];
-		sst[i].initial_y = &initial_y[i];
-		sst[i].initialized = &initialized[i];
-		sst[i].dist_sum = &dist_sums[i];
-		sst[i].dist_count = &dist_counts[i];
-		sst[i].area_sum = &area_sums[i];
-		sst[i].want_dist = guess_maxzoom;
-		sst[i].maxzoom = maxzoom;
-		sst[i].filters = prefilter != NULL || postfilter != NULL;
-		sst[i].uses_gamma = uses_gamma;
-		sst[i].layermap = &layermaps[i];
-		sst[i].exclude = exclude;
-		sst[i].include = include;
-		sst[i].exclude_all = exclude_all;
-		sst[i].basezoom = basezoom;
-		sst[i].attribute_types = attribute_types;
-	}
-
-	std::atomic<size_t> total_features{0};
-
-	// Use PostGIS manager for parallel reading
-	PostGIS::ParallelReader parallel_reader(postgis_cfg, CPUS);
-	if (!parallel_reader.read_parallel(sst, 0, layername)) {
-		fprintf(stderr, "Failed to read features from PostGIS\n");
-		exit(EXIT_READ);
-	}
-	total_features = parallel_reader.get_total_features();
-
-	// Auto-adjust MongoDB batch size based on data volume (only if user didn't specify)
-	if (mongo_cfg.batch_size == DEFAULT_MONGO_BATCH_SIZE) {
-		size_t estimated_tiles = MongoDB::estimate_tile_count(total_features.load(), minzoom, maxzoom);
-		size_t suggested_batch = MongoDB::suggest_batch_size(estimated_tiles);
-		
-		mongo_cfg.batch_size = suggested_batch;
-		
-		if (!quiet) {
-			fprintf(stderr, "Auto-adjusted MongoDB batch size to %zu "
-					"(processed %zu features, estimated %zu tiles, zoom %d-%d)\n", 
-					mongo_cfg.batch_size, total_features.load(), estimated_tiles, minzoom, maxzoom);
-		}
-	}
-
-	for (size_t i = 0; i < CPUS; i++) {
-		dist_sum += dist_sums[i];
-		dist_count += dist_counts[i];
-		area_sum += area_sums[i];
-	}
-
-	overall_offset = layer_seq[0];
-	checkdisk(&readers);
+	read_postgis_data(layername, fname, readers, progress_seq,
+	                  initialized, initial_x, initial_y,
+	                  layermaps, overall_offset,
+	                  guess_maxzoom, maxzoom, basezoom,
+	                  exclude, include, exclude_all,
+	                  uses_gamma, gamma, attribute_types,
+	                  tmpdir, prefilter, postfilter,
+	                  dist_sum, dist_count, area_sum);
 
 	int files_open_after_reading = open(get_null_device(), O_RDONLY | O_CLOEXEC);
 	if (files_open_after_reading < 0) {
@@ -1266,11 +474,9 @@ std::pair<int, metadata> read_input(std::string &layername, const char *fname, i
 	// but keep track of the offsets into it since we still need
 	// segment+offset to find the data.
 
-	// 2 * CPUS: One per input thread, one per tiling thread
-	long long pool_off[2 * CPUS];
-	for (size_t i = 0; i < 2 * CPUS; i++) {
-		pool_off[i] = 0;
-	}
+	size_t pool_count = 2 * CPUS;
+	std::vector<long long> pool_off_v(pool_count, 0);
+	long long *pool_off = pool_off_v.data();
 
 	char poolname[strlen(tmpdir) + strlen("/pool.XXXXXXXX") + 1];
 	snprintf(poolname, sizeof(poolname), "%s%s", tmpdir, "/pool.XXXXXXXX");
@@ -2292,6 +1498,12 @@ int maindb(int argc, char **argv) {
 	av = argv;
 	init_cpus();
 
+	if (CPUS > MAX_POSTGRES_CONNECTIONS) {
+		fprintf(stderr, "Limiting CPUS from %zu to %zu to control PostgreSQL connections\n",
+		        CPUS, MAX_POSTGRES_CONNECTIONS);
+		CPUS = MAX_POSTGRES_CONNECTIONS;
+	}
+
 	extern char *optarg;
 	int i;
 
@@ -2638,22 +1850,9 @@ int maindb(int argc, char **argv) {
 				maximum_string_attribute_length = atoll_require(optarg, "Maximum string attribute length");
 			} else if (strcmp(opt, "postgis") == 0) {
 				use_postgis = true;
-				std::string postgis_arg = optarg;
-				size_t pos = 0;
-				std::vector<std::string> parts;
-				while ((pos = postgis_arg.find(':')) != std::string::npos) {
-					parts.push_back(postgis_arg.substr(0, pos));
-					postgis_arg.erase(0, pos + 1);
+				if (!postgis_cfg.parse_connection_string(optarg)) {
+					exit(EXIT_ARGS);
 				}
-				parts.push_back(postgis_arg);
-				if (parts.size() >= 1) postgis_cfg.host = parts[0];
-				if (parts.size() >= 2) postgis_cfg.port = parts[1];
-				if (parts.size() >= 3) postgis_cfg.dbname = parts[2];
-				if (parts.size() >= 4) postgis_cfg.user = parts[3];
-				if (parts.size() >= 5) postgis_cfg.password = parts[4];
-				if (parts.size() >= 6) postgis_cfg.table = parts[5];
-				if (parts.size() >= 7) postgis_cfg.geometry_field = parts[6];
-				if (parts.size() >= 8) postgis_cfg.sql = parts[7];
 			} else if (strcmp(opt, "postgis-host") == 0) {
 				postgis_cfg.host = optarg;
 				use_postgis = true;
@@ -2678,8 +1877,6 @@ int maindb(int argc, char **argv) {
 			} else if (strcmp(opt, "postgis-sql") == 0) {
 				postgis_cfg.sql = optarg;
 				use_postgis = true;
-			} else if (strcmp(opt, "omongo") == 0) {
-				use_mongo = true;
 			} else if (strcmp(opt, "mongo") == 0) {
 				// 解析单行配置：host:port:dbname:user:password:auth_source:collection
 				if (!mongo_cfg.parse_connection_string(optarg)) {
@@ -3157,7 +2354,7 @@ int maindb(int argc, char **argv) {
 	}
 
 	if (out_mbtiles == NULL && out_dir == NULL && !use_mongo) {
-		fprintf(stderr, "%s: must specify -o out.mbtiles or -e directory (or use --omongo for MongoDB output)\n", av[0]);
+		fprintf(stderr, "%s: must specify -o out.mbtiles or -e directory or use --mongo for MongoDB output\n", av[0]);
 		exit(EXIT_ARGS);
 	}
 
@@ -3220,34 +2417,11 @@ int maindb(int argc, char **argv) {
 	// Write metadata to MongoDB if requested
 	if (use_mongo && mongo_cfg.write_metadata && mongo_cfg.dbname != "") {
 		struct metadata meta = std::get<1>(input_ret);
-		std::string meta_json = "{";
-		meta_json += "\"name\":\"" + meta.name + "\",";
-		meta_json += "\"description\":\"" + meta.description + "\",";
-		meta_json += "\"version\":" + std::to_string(meta.version) + ",";
-		meta_json += "\"type\":\"" + meta.type + "\",";
-		meta_json += "\"format\":\"" + meta.format + "\",";
-		meta_json += "\"minzoom\":" + std::to_string(meta.minzoom) + ",";
-		meta_json += "\"maxzoom\":" + std::to_string(meta.maxzoom) + ",";
-		meta_json += "\"bounds\":[" + std::to_string(meta.minlon) + "," + std::to_string(meta.minlat) + "," + std::to_string(meta.maxlon) + "," + std::to_string(meta.maxlat) + "],";
-		meta_json += "\"center\":[" + std::to_string(meta.center_lon) + "," + std::to_string(meta.center_lat) + "," + std::to_string(meta.center_z) + "]";
-		if (!meta.attribution.empty()) {
-			meta_json += ",\"attribution\":\"" + meta.attribution + "\"";
-		}
-		if (!meta.generator.empty()) {
-			meta_json += ",\"generator\":\"" + meta.generator + "\"";
-		}
-		if (!meta.vector_layers_json.empty()) {
-			meta_json += ",\"vector_layers\":" + meta.vector_layers_json;
-		}
-		if (!meta.tilestats_json.empty()) {
-			meta_json += ",\"tilestats\":" + meta.tilestats_json;
-		}
-		meta_json += "}";
 
 		try {
-			MongoWriter* meta_writer = MongoWriter::get_thread_local_instance(mongo_cfg);
+			MongoWriter* meta_writer = MongoWriter::get_shared_instance(mongo_cfg);
 			if (meta_writer) {
-				meta_writer->write_metadata(meta_json);
+				meta_writer->write_metadata_bson(meta);
 			}
 		} catch (const std::exception &e) {
 			fprintf(stderr, "Warning: failed to write MongoDB metadata: %s\n", e.what());
@@ -3287,6 +2461,8 @@ int maindb(int argc, char **argv) {
 				ret = EXIT_MONGO;
 			}
 		}
+
+		MongoDB::shutdown_global();
 	}
 
 	ErrorLogger::instance().print_summary(quiet);
@@ -3297,45 +2473,4 @@ int maindb(int argc, char **argv) {
 
 int main(int argc, char **argv) {
 	return maindb(argc, argv);
-}
-
-int mkstemp_cloexec(char *name) {
-	int fd = mkstemp(name);
-	if (fd >= 0) {
-		if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
-			perror("cloexec for temporary file");
-			exit(EXIT_OPEN);
-		}
-	}
-	return fd;
-}
-
-FILE *fopen_oflag(const char *name, const char *mode, int oflag) {
-	int fd = open(name, oflag);
-	if (fd < 0) {
-		return NULL;
-	}
-	return fdopen(fd, mode);
-}
-
-bool progress_time() {
-	if (progress_interval == 0.0) {
-		return true;
-	}
-
-	struct timeval tv;
-	double now;
-	if (gettimeofday(&tv, NULL) != 0) {
-		fprintf(stderr, "%s: Can't get the time of day: %s\n", *av, strerror(errno));
-		now = 0;
-	} else {
-		now = tv.tv_sec + tv.tv_usec / 1000000.0;
-	}
-
-	if (now - last_progress >= progress_interval) {
-		last_progress = now;
-		return true;
-	} else {
-		return false;
-	}
 }

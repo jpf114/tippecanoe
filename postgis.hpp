@@ -43,6 +43,46 @@ struct postgis_config
           enable_progress_report(true)
     {
     }
+
+    bool parse_connection_string(const std::string &conn_str) {
+        std::vector<std::string> parts;
+        std::string current;
+
+        for (size_t i = 0; i < conn_str.size(); i++) {
+            char c = conn_str[i];
+            if (c == ':') {
+                parts.push_back(current);
+                current.clear();
+            } else {
+                current += c;
+            }
+        }
+        parts.push_back(current);
+
+        if (parts.size() < 3) {
+            fprintf(stderr, "Error: PostGIS connection string must have at least 3 parts\n");
+            fprintf(stderr, "Format: host:port:dbname[:user[:password[:table[:geometry_field[:sql]]]]]\n");
+            fprintf(stderr, "Example: localhost:5432:gis:user:pass:my_table:geom\n");
+            fprintf(stderr, "Got %zu parts: %s\n", parts.size(), conn_str.c_str());
+            return false;
+        }
+
+        host = parts[0];
+        port = parts[1];
+        dbname = parts[2];
+        if (parts.size() >= 4) user = parts[3];
+        if (parts.size() >= 5) password = parts[4];
+        if (parts.size() >= 6) table = parts[5];
+        if (parts.size() >= 7) geometry_field = parts[6];
+        if (parts.size() >= 8) sql = parts[7];
+
+        if (dbname.empty()) {
+            fprintf(stderr, "Error: PostGIS connection string has empty dbname\n");
+            return false;
+        }
+
+        return true;
+    }
 };
 
 class PostGISReader
@@ -52,6 +92,7 @@ public:
     ~PostGISReader();
 
     bool connect();
+    void disconnect();
     bool read_features(std::vector<struct serialization_state> &sst, size_t layer, const std::string &layername,
                        size_t thread_id = 0, size_t num_threads = 1);
 

@@ -1,4 +1,6 @@
 #include "mongo.hpp"
+#include <bsoncxx/builder/basic/document.hpp>
+#include <bsoncxx/builder/basic/kvp.hpp>
 #include <iostream>
 #include <cstring>
 #include <chrono>
@@ -18,7 +20,39 @@ static std::atomic<size_t> global_total_batches{0};
 static std::atomic<size_t> global_total_retries{0};
 static std::atomic<size_t> global_total_errors{0};
 
-std::atomic<size_t> MongoWriter::pending_writes{0};
+static std::unique_ptr<mongocxx::pool> global_pool;
+static mongo_config global_pool_config;
+static std::mutex pool_mutex;
+static bool pool_created = false;
+
+mongocxx::pool* MongoWriter::get_or_create_pool(const mongo_config &cfg) {
+    if (pool_created) {
+        return global_pool.get();
+    }
+
+    std::lock_guard<std::mutex> lock(pool_mutex);
+    if (pool_created) {
+        return global_pool.get();
+    }
+
+    try {
+        mongocxx::uri uri(cfg.uri());
+        global_pool = std::make_unique<mongocxx::pool>(uri);
+        global_pool_config = cfg;
+        pool_created = true;
+
+        extern int quiet;
+        if (!quiet) {
+            fprintf(stderr, "MongoDB connection pool created: %s.%s (maxPoolSize: %zu)\n",
+                    cfg.dbname.c_str(), cfg.collection.c_str(), cfg.connection_pool_size);
+        }
+    } catch (const std::exception &e) {
+        fprintf(stderr, "Error: Failed to create MongoDB connection pool: %s\n", e.what());
+        return nullptr;
+    }
+
+    return global_pool.get();
+}
 
 MongoWriter* MongoWriter::get_thread_local_instance(const mongo_config &cfg) {
     if (!tls_mongo_writer) {
@@ -26,6 +60,14 @@ MongoWriter* MongoWriter::get_thread_local_instance(const mongo_config &cfg) {
         tls_mongo_writer->initialize_thread();
     }
     return tls_mongo_writer.get();
+}
+
+MongoWriter* MongoWriter::get_shared_instance(const mongo_config &cfg) {
+    return get_thread_local_instance(cfg);
+}
+
+void MongoWriter::destroy_shared_instance() {
+    destroy_current_thread_instance();
 }
 
 size_t MongoWriter::get_global_total_tiles() {
@@ -44,32 +86,38 @@ size_t MongoWriter::get_global_total_errors() {
     return global_total_errors.load();
 }
 
+void MongoWriter::notify_pending_decreased() {
+}
+
 void MongoWriter::destroy_current_thread_instance() {
     if (tls_mongo_writer) {
+        tls_mongo_writer->flush_all();
+
         global_total_tiles += tls_mongo_writer->getTotalTilesWritten();
         global_total_batches += tls_mongo_writer->getTotalBatchesWritten();
         global_total_retries += tls_mongo_writer->getTotalRetries();
         global_total_errors += tls_mongo_writer->getTotalErrors();
 
-        tls_mongo_writer->close();
         tls_mongo_writer.reset();
     }
+}
+
+void MongoWriter::destroy_global_instance() {
+    global_pool.reset();
+    pool_created = false;
+    global_instance.reset();
 }
 
 extern int quiet;
 
 MongoWriter::MongoWriter(const mongo_config &cfg)
-    : config(cfg), use_upsert(!cfg.drop_collection_before_write)
+    : config(cfg), use_upsert(false)
 {
     if (config.dbname.empty()) {
         throw std::runtime_error("MongoDB database name is required");
     }
 
-    if (config.batch_size < MIN_MONGO_BATCH_SIZE) {
-        config.batch_size = MIN_MONGO_BATCH_SIZE;
-    } else if (config.batch_size > MAX_MONGO_BATCH_SIZE) {
-        config.batch_size = MAX_MONGO_BATCH_SIZE;
-    }
+    config.normalize();
 
     batch_buffer.reserve(config.batch_size);
     batch_coords.reserve(config.batch_size);
@@ -87,61 +135,62 @@ void MongoWriter::initialize_global()
     }
 }
 
+static std::atomic<bool> first_connection_reported{false};
+
 void MongoWriter::initialize_thread()
 {
-    try {
-        mongocxx::uri uri(config.uri());
-        client = std::make_unique<mongocxx::client>(uri);
+    auto pool = get_or_create_pool(config);
+    if (!pool) {
+        throw std::runtime_error("Failed to create MongoDB connection pool");
+    }
 
-        collection = (*client)[config.dbname][config.collection];
-
-        if (config.drop_collection_before_write) {
-            std::call_once(collection_drop_flag, [this]() {
-                try {
-                    collection.drop();
-                    if (!quiet) {
-                        fprintf(stderr, "MongoDB: dropped collection %s.%s\n",
-                                config.dbname.c_str(), config.collection.c_str());
-                    }
-                } catch (const std::exception &e) {
-                    fprintf(stderr, "Warning: failed to drop MongoDB collection %s.%s: %s\n",
-                            config.dbname.c_str(), config.collection.c_str(), e.what());
+    if (config.drop_collection_before_write) {
+        std::call_once(collection_drop_flag, [this]() {
+            try {
+                auto pool = get_or_create_pool(config);
+                if (!pool) return;
+                auto client = pool->acquire();
+                auto collection = (*client)[config.dbname][config.collection];
+                collection.drop();
+                if (!quiet) {
+                    fprintf(stderr, "MongoDB: dropped collection %s.%s\n",
+                            config.dbname.c_str(), config.collection.c_str());
                 }
-            });
-        }
+            } catch (const std::exception &e) {
+                fprintf(stderr, "Warning: failed to drop MongoDB collection %s.%s: %s\n",
+                        config.dbname.c_str(), config.collection.c_str(), e.what());
+            }
+        });
+    }
 
-        if (config.create_indexes) {
-            std::call_once(index_create_flag, [this]() {
-                create_indexes_if_needed();
-            });
-        }
+    if (config.create_indexes) {
+        std::call_once(index_create_flag, [this]() {
+            try {
+                auto pool = get_or_create_pool(config);
+                if (!pool) return;
+                auto client = pool->acquire();
+                auto collection = (*client)[config.dbname][config.collection];
+                create_indexes_if_needed(collection);
+            } catch (const std::exception &e) {
+                fprintf(stderr, "Warning: failed to create indexes: %s\n", e.what());
+            }
+        });
+    }
 
-        if (config.enable_progress_report && !quiet) {
-            fprintf(stderr, "MongoDB connected: %s.%s (pool: %zu, write concern: %d, mode: %s)\n",
-                    config.dbname.c_str(), config.collection.c_str(), config.connection_pool_size,
-                    static_cast<int>(config.write_concern_level),
-                    use_upsert ? "upsert" : "insert");
-        }
-    } catch (const std::exception &e) {
-        fprintf(stderr, "Error: MongoDB connection initialization failed: %s\n", e.what());
-        ErrorLogger::instance().log_error(ErrorSource::MONGO_CONNECT, 0, 0, 0,
-                                          std::string("MongoDB init failed: ") + e.what());
-        throw;
+    if (config.enable_progress_report && !quiet && !first_connection_reported.exchange(true)) {
+        fprintf(stderr, "MongoDB connected: %s.%s (pool: %zu, write concern: %d, mode: %s)\n",
+                config.dbname.c_str(), config.collection.c_str(), config.connection_pool_size,
+                static_cast<int>(config.write_concern_level),
+                use_upsert ? "upsert" : "insert");
     }
 }
 
 void MongoWriter::write_tile(int z, int x, int y, const char *data, size_t len)
 {
-    while (pending_writes.load(std::memory_order_relaxed) >= MAX_PENDING_WRITES) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-
-    pending_writes.fetch_add(1);
-
     auto doc = bsoncxx::builder::stream::document{}
+        << "z" << z
         << "x" << x
         << "y" << y
-        << "z" << z
         << "d" << bsoncxx::types::b_binary{
             bsoncxx::binary_sub_type::k_binary,
             static_cast<uint32_t>(len),
@@ -150,7 +199,6 @@ void MongoWriter::write_tile(int z, int x, int y, const char *data, size_t len)
         << bsoncxx::builder::stream::finalize;
 
     batch_buffer.push_back(std::move(doc));
-
     batch_coords.push_back({z, x, y});
 
     if (batch_buffer.size() >= config.batch_size) {
@@ -166,12 +214,8 @@ void MongoWriter::flush_all() noexcept
         }
     } catch (const std::exception &e) {
         total_errors++;
-        ErrorLogger::instance().log_error(ErrorSource::MONGO_FLUSH, 0, 0, 0,
-                                          std::string("flush_all failed: ") + e.what());
     } catch (...) {
         total_errors++;
-        ErrorLogger::instance().log_error(ErrorSource::MONGO_FLUSH, 0, 0, 0,
-                                          "flush_all failed (unknown error)");
     }
 }
 
@@ -179,14 +223,6 @@ void MongoWriter::close() noexcept
 {
     try {
         flush_all();
-    } catch (...) {
-        total_errors++;
-    }
-
-    try {
-        if (client) {
-            client.reset();
-        }
     } catch (...) {
         total_errors++;
     }
@@ -230,51 +266,45 @@ void MongoWriter::flush_batch()
 
     build_write_concern();
 
+    if (use_upsert) {
+        flush_batch_upsert();
+    } else {
+        flush_batch_insert();
+    }
+}
+
+void MongoWriter::flush_batch_insert()
+{
+    auto pool = get_or_create_pool(config);
+    if (!pool) {
+        batch_buffer.clear();
+        batch_coords.clear();
+        return;
+    }
+
     int attempts = 0;
 
     while (attempts < config.max_retries) {
         try {
-            if (use_upsert) {
-                mongocxx::options::bulk_write bulk_opts;
-                bulk_opts.ordered(false);
-                bulk_opts.write_concern(cached_wc);
-                auto bulk = collection.create_bulk_write(bulk_opts);
+            auto client = pool->acquire();
+            auto collection = (*client)[config.dbname][config.collection];
 
-                for (size_t i = 0; i < batch_buffer.size(); i++) {
-                    bsoncxx::document::view view = batch_buffer[i].view();
-                    const auto &coord = batch_coords[i];
+            mongocxx::options::insert insert_opts;
+            insert_opts.bypass_document_validation(false);
+            insert_opts.ordered(false);
+            insert_opts.write_concern(cached_wc);
 
-                    auto filter = bsoncxx::builder::stream::document{}
-                        << "z" << coord.z
-                        << "x" << coord.x
-                        << "y" << coord.y
-                        << bsoncxx::builder::stream::finalize;
-
-                    mongocxx::model::replace_one upsert_op(filter.view(), view);
-                    upsert_op.upsert(true);
-                    bulk.append(upsert_op);
-                }
-
-                bulk.execute();
-            } else {
-                mongocxx::options::insert insert_opts;
-                insert_opts.bypass_document_validation(false);
-                insert_opts.ordered(false);
-                insert_opts.write_concern(cached_wc);
-
-                std::vector<bsoncxx::document::view> views;
-                views.reserve(batch_buffer.size());
-                for (const auto &doc : batch_buffer) {
-                    views.push_back(doc.view());
-                }
-
-                collection.insert_many(views, insert_opts);
+            std::vector<bsoncxx::document::view> views;
+            views.reserve(batch_buffer.size());
+            for (const auto &doc : batch_buffer) {
+                views.push_back(doc.view());
             }
+
+            collection.insert_many(views, insert_opts);
 
             flush_failure_rounds = 0;
             total_tiles_written += batch_buffer.size();
             total_batches_written++;
-            pending_writes.fetch_sub(batch_buffer.size());
 
             batch_buffer.clear();
             batch_coords.clear();
@@ -285,79 +315,114 @@ void MongoWriter::flush_batch()
             total_errors++;
 
             if (!quiet) {
-                fprintf(stderr, "MongoDB flush_batch_%s failed (attempt %d/%d): %s\n",
-                        use_upsert ? "upsert" : "insert", attempts, config.max_retries, e.what());
-            }
-
-            for (size_t i = 0; i < batch_coords.size(); i++) {
-                const auto &coord = batch_coords[i];
-                ErrorLogger::instance().log_mongo_error(
-                    coord.z, coord.x, coord.y,
-                    use_upsert ? "flush_batch_upsert" : "flush_batch_insert",
-                    std::string("attempt ") + std::to_string(attempts) + "/" + std::to_string(config.max_retries) + ": " + e.what());
+                fprintf(stderr, "MongoDB flush_batch_insert failed (attempt %d/%d): %s\n",
+                        attempts, config.max_retries, e.what());
             }
 
             if (attempts >= config.max_retries) {
                 total_failed_batches++;
                 flush_failure_rounds++;
 
-                fprintf(stderr, "Error: MongoDB flush_batch_%s failed after %d attempts (round %zu). %zu tiles remain in buffer.\n",
-                        use_upsert ? "upsert" : "insert", config.max_retries, flush_failure_rounds.load(), batch_buffer.size());
-
-                if (flush_failure_rounds.load() >= 3) {
-                    fprintf(stderr, "Warning: Persistent MongoDB failures (%zu rounds). Discarding %zu tiles to prevent stall.\n",
-                            flush_failure_rounds.load(), batch_buffer.size());
-                    pending_writes.fetch_sub(batch_buffer.size());
+                if (flush_failure_rounds >= 2) {
+                    fprintf(stderr, "Error: MongoDB flush_batch_insert failed after %d attempts x %zu rounds. %zu tiles discarded.\n",
+                            config.max_retries, flush_failure_rounds.load(), batch_buffer.size());
                     batch_buffer.clear();
                     batch_coords.clear();
                     flush_failure_rounds = 0;
+                } else {
+                    fprintf(stderr, "Error: MongoDB flush_batch_insert failed after %d attempts (round %zu). %zu tiles remain in buffer.\n",
+                            config.max_retries, flush_failure_rounds.load(), batch_buffer.size());
                 }
-
-                throw;
+                return;
             }
 
-            try {
-                reconnect();
-                total_retries++;
-            } catch (const std::exception &reconnect_e) {
-                if (!quiet) {
-                    fprintf(stderr, "MongoDB reconnect failed: %s\n", reconnect_e.what());
-                }
-            }
+            total_retries++;
+            int wait_ms = 100 * attempts;
+            std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
         }
     }
 }
 
-void MongoWriter::reconnect()
+void MongoWriter::flush_batch_upsert()
 {
-    int shift = std::min(consecutive_reconnects, static_cast<size_t>(5));
-    int wait_ms = 100 * (1 << shift);
-    wait_ms = std::min(wait_ms, 5000);
-    consecutive_reconnects++;
-
-    if (!quiet && wait_ms > 100) {
-        fprintf(stderr, "MongoDB reconnecting in %d ms...\n", wait_ms);
+    auto pool = get_or_create_pool(config);
+    if (!pool) {
+        batch_buffer.clear();
+        batch_coords.clear();
+        return;
     }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
+    int attempts = 0;
 
-    try {
-        mongocxx::uri uri(config.uri());
-        client = std::make_unique<mongocxx::client>(uri);
-        collection = (*client)[config.dbname][config.collection];
-        consecutive_reconnects = 0;
+    while (attempts < config.max_retries) {
+        try {
+            auto client = pool->acquire();
+            auto collection = (*client)[config.dbname][config.collection];
 
-        if (!quiet) {
-            fprintf(stderr, "MongoDB reconnected successfully\n");
+            mongocxx::options::bulk_write bulk_opts;
+            bulk_opts.ordered(false);
+            bulk_opts.write_concern(cached_wc);
+            auto bulk = collection.create_bulk_write(bulk_opts);
+
+            for (size_t i = 0; i < batch_buffer.size(); i++) {
+                bsoncxx::document::view view = batch_buffer[i].view();
+                const auto &coord = batch_coords[i];
+
+                auto filter = bsoncxx::builder::stream::document{}
+                    << "z" << coord.z
+                    << "x" << coord.x
+                    << "y" << coord.y
+                    << bsoncxx::builder::stream::finalize;
+
+                mongocxx::model::replace_one upsert_op(filter.view(), view);
+                upsert_op.upsert(true);
+                bulk.append(upsert_op);
+            }
+
+            bulk.execute();
+
+            flush_failure_rounds = 0;
+            total_tiles_written += batch_buffer.size();
+            total_batches_written++;
+
+            batch_buffer.clear();
+            batch_coords.clear();
+            return;
+
+        } catch (const std::exception &e) {
+            attempts++;
+            total_errors++;
+
+            if (!quiet) {
+                fprintf(stderr, "MongoDB flush_batch_upsert failed (attempt %d/%d): %s\n",
+                        attempts, config.max_retries, e.what());
+            }
+
+            if (attempts >= config.max_retries) {
+                total_failed_batches++;
+                flush_failure_rounds++;
+
+                if (flush_failure_rounds >= 2) {
+                    fprintf(stderr, "Error: MongoDB flush_batch_upsert failed after %d attempts x %zu rounds. %zu tiles discarded.\n",
+                            config.max_retries, flush_failure_rounds.load(), batch_buffer.size());
+                    batch_buffer.clear();
+                    batch_coords.clear();
+                    flush_failure_rounds = 0;
+                } else {
+                    fprintf(stderr, "Error: MongoDB flush_batch_upsert failed after %d attempts (round %zu). %zu tiles remain in buffer.\n",
+                            config.max_retries, flush_failure_rounds.load(), batch_buffer.size());
+                }
+                return;
+            }
+
+            total_retries++;
+            int wait_ms = 100 * attempts;
+            std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
         }
-
-    } catch (const std::exception &e) {
-        fprintf(stderr, "MongoDB reconnect failed: %s\n", e.what());
-        throw;
     }
 }
 
-void MongoWriter::create_indexes_if_needed()
+void MongoWriter::create_indexes_if_needed(mongocxx::collection &collection)
 {
     try {
         auto index_view = collection.indexes();
@@ -440,6 +505,11 @@ void MongoWriter::create_indexes_if_needed()
 void MongoWriter::erase_zoom(int z)
 {
     try {
+        auto pool = get_or_create_pool(config);
+        if (!pool) return;
+        auto client = pool->acquire();
+        auto collection = (*client)[config.dbname][config.collection];
+
         auto filter = bsoncxx::builder::stream::document{}
             << "z" << z
             << bsoncxx::builder::stream::finalize;
@@ -454,7 +524,7 @@ void MongoWriter::erase_zoom(int z)
         if (!use_upsert) {
             use_upsert = true;
             if (!quiet) {
-                fprintf(stderr, "MongoDB: switched to upsert mode after erase_zoom(z=%d) to prevent duplicate key errors\n", z);
+                fprintf(stderr, "MongoDB: switched to upsert mode after erase_zoom(z=%d)\n", z);
             }
         }
     } catch (const std::exception &e) {
@@ -472,6 +542,9 @@ void MongoWriter::erase_zoom(int z)
 void MongoWriter::write_metadata(const std::string &json_metadata)
 {
     try {
+        auto pool = get_or_create_pool(config);
+        if (!pool) return;
+        auto client = pool->acquire();
         auto db = (*client)[config.dbname];
         std::string meta_collection_name = config.collection + "_metadata";
         auto meta_collection = db[meta_collection_name];
@@ -493,5 +566,62 @@ void MongoWriter::write_metadata(const std::string &json_metadata)
         }
     } catch (const std::exception &e) {
         fprintf(stderr, "Warning: failed to write MongoDB metadata: %s\n", e.what());
+    }
+}
+
+void MongoWriter::write_metadata_bson(const struct metadata &meta)
+{
+    try {
+        auto pool = get_or_create_pool(config);
+        if (!pool) return;
+        auto client = pool->acquire();
+        auto db = (*client)[config.dbname];
+        std::string meta_collection_name = config.collection + "_metadata";
+        auto meta_collection = db[meta_collection_name];
+
+        meta_collection.drop();
+
+        auto doc = bsoncxx::builder::basic::document{};
+
+        doc.append(bsoncxx::builder::basic::kvp("name", meta.name));
+        doc.append(bsoncxx::builder::basic::kvp("description", meta.description));
+        doc.append(bsoncxx::builder::basic::kvp("version", meta.version));
+        doc.append(bsoncxx::builder::basic::kvp("type", meta.type));
+        doc.append(bsoncxx::builder::basic::kvp("format", meta.format));
+        doc.append(bsoncxx::builder::basic::kvp("minzoom", meta.minzoom));
+        doc.append(bsoncxx::builder::basic::kvp("maxzoom", meta.maxzoom));
+
+        doc.append(bsoncxx::builder::basic::kvp("bounds",
+            [&meta](bsoncxx::builder::basic::sub_array sub) {
+                sub.append(meta.minlon, meta.minlat, meta.maxlon, meta.maxlat);
+            }));
+
+        doc.append(bsoncxx::builder::basic::kvp("center",
+            [&meta](bsoncxx::builder::basic::sub_array sub) {
+                sub.append(meta.center_lon, meta.center_lat, meta.center_z);
+            }));
+
+        if (!meta.attribution.empty()) {
+            doc.append(bsoncxx::builder::basic::kvp("attribution", meta.attribution));
+        }
+        if (!meta.generator.empty()) {
+            doc.append(bsoncxx::builder::basic::kvp("generator", meta.generator));
+        }
+
+        doc.append(bsoncxx::builder::basic::kvp("collection", config.collection));
+        doc.append(bsoncxx::builder::basic::kvp("timestamp",
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count()));
+
+        auto doc_value = doc.extract();
+
+        meta_collection.insert_one(doc_value.view());
+
+        if (!quiet) {
+            fprintf(stderr, "MongoDB: wrote metadata to %s.%s\n",
+                    config.dbname.c_str(), meta_collection_name.c_str());
+        }
+    } catch (const std::exception &e) {
+        fprintf(stderr, "Warning: failed to write MongoDB metadata (bson): %s\n", e.what());
     }
 }

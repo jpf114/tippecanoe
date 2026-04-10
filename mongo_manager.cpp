@@ -76,9 +76,15 @@ void initialize_global() {
 }
 
 void cleanup_global() {
-    DEBUG_LOG("Cleaning up MongoDB thread local instances...");
+    DEBUG_LOG("Cleaning up MongoDB thread-local instances...");
     MongoWriter::destroy_current_thread_instance();
     DEBUG_LOG("MongoDB cleanup done.");
+}
+
+void shutdown_global() {
+    DEBUG_LOG("Shutting down MongoDB global instance...");
+    MongoWriter::destroy_shared_instance();
+    DEBUG_LOG("MongoDB global instance shut down.");
 }
 
 GlobalStats get_global_stats() {

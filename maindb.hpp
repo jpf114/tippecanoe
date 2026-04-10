@@ -5,11 +5,9 @@
 #include "postgis.hpp"
 #include "mongo.hpp"
 
-// PostGIS configuration
 extern bool use_postgis;
 extern postgis_config postgis_cfg;
 
-// MongoDB configuration
 extern bool use_mongo;
 extern mongo_config mongo_cfg;
 
