@@ -54,6 +54,9 @@ struct mongo_config {
 
     bool enable_progress_report;
 
+    // If true, any discarded tiles cause a non-zero process exit code.
+    bool fail_on_discard;
+
     mongo_config()
         : host(""),
           port(0),
@@ -72,7 +75,8 @@ struct mongo_config {
           create_indexes(true),
           drop_collection_before_write(false),
           write_metadata(false),
-          enable_progress_report(true)
+          enable_progress_report(true),
+          fail_on_discard(true)
     {
     }
 
@@ -217,6 +221,12 @@ public:
     static size_t get_global_total_retries();
     static size_t get_global_total_errors();
     static size_t get_global_total_discarded();
+    static size_t get_global_pool_unavailable_batches();
+    static size_t get_global_retry_exhausted_batches();
+    static size_t get_global_insert_batches();
+    static size_t get_global_upsert_batches();
+    static size_t get_global_insert_discarded_tiles();
+    static size_t get_global_upsert_discarded_tiles();
 
     void initialize_thread();
 
@@ -229,6 +239,12 @@ public:
     size_t getCurrentBufferSize() const { return batch_buffer.size(); }
     size_t getTotalRetries() const { return total_retries.load(); }
     size_t getTotalErrors() const { return total_errors.load(); }
+    size_t getPoolUnavailableBatches() const { return total_pool_unavailable_batches.load(); }
+    size_t getRetryExhaustedBatches() const { return total_retry_exhausted_batches.load(); }
+    size_t getInsertBatches() const { return total_insert_batches.load(); }
+    size_t getUpsertBatches() const { return total_upsert_batches.load(); }
+    size_t getInsertDiscardedTiles() const { return total_insert_discarded_tiles.load(); }
+    size_t getUpsertDiscardedTiles() const { return total_upsert_discarded_tiles.load(); }
 
     void close() noexcept;
 
@@ -271,6 +287,12 @@ private:
     std::atomic<size_t> total_failed_batches{0};
     std::atomic<size_t> total_discarded_tiles{0};
     std::atomic<size_t> flush_failure_rounds{0};
+    std::atomic<size_t> total_pool_unavailable_batches{0};
+    std::atomic<size_t> total_retry_exhausted_batches{0};
+    std::atomic<size_t> total_insert_batches{0};
+    std::atomic<size_t> total_upsert_batches{0};
+    std::atomic<size_t> total_insert_discarded_tiles{0};
+    std::atomic<size_t> total_upsert_discarded_tiles{0};
 
     static std::unique_ptr<mongocxx::instance> global_instance;
     static std::atomic_flag initialized;

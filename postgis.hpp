@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 #include <atomic>
+#include <unordered_map>
+#include <mutex>
 #include "geometry.hpp"
 #include "serial.hpp"
 #include "config.hpp"
@@ -20,6 +22,13 @@ struct postgis_config
     std::string table;
     std::string geometry_field;
     std::string sql;
+    std::string shard_key;
+    std::string shard_mode;
+    std::string selected_columns_csv;
+    bool selected_columns_best_effort;
+    bool progress_with_exact_count;
+    bool canonical_attr_order;
+    bool profile;
 
     size_t batch_size;
     bool use_cursor;
@@ -36,6 +45,13 @@ struct postgis_config
           table(""),
           geometry_field("geometry"),
           sql(""),
+          shard_key(""),
+          shard_mode("auto"),
+          selected_columns_csv(""),
+          selected_columns_best_effort(false),
+          progress_with_exact_count(false),
+          canonical_attr_order(true),
+          profile(false),
           batch_size(DEFAULT_POSTGIS_BATCH_SIZE),
           use_cursor(true),
           max_memory_mb(MAX_POSTGIS_MEMORY_USAGE_MB),
@@ -85,7 +101,7 @@ public:
                        size_t thread_id = 0, size_t num_threads = 1);
 
     static int get_cached_srid(const postgis_config &cfg, void *conn);
-    static std::string build_select_query(const postgis_config &cfg, int srid);
+    static std::string build_select_query(const postgis_config &cfg, int srid, void *conn);
 
     size_t getTotalFeaturesProcessed() const { return total_features_processed.load(); }
     size_t getTotalBatchesProcessed() const { return total_batches_processed.load(); }
@@ -116,8 +132,8 @@ private:
     std::atomic<size_t> current_memory_usage{0};
     std::atomic<size_t> parse_errors_{0};
 
-    static int cached_srid_;
-    static bool srid_cached_;
+    static std::unordered_map<std::string, int> srid_cache_;
+    static std::mutex srid_cache_mutex_;
 };
 
 #endif

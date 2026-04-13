@@ -20,7 +20,7 @@ tippecanoe-db 是基于开源项目 tippecanoe 二次开发的定制化矢量切
 |------|-------------------|----------------------|
 | 数据输入 | GeoJSON/GeoBuf/FlatGeoBuf/CSV/PostGIS | 仅 PostGIS |
 | 数据输出 | MBTiles/Directory/PMTiles | MongoDB + MBTiles |
-| 并行策略 | 单线程或需 PK 字段 | 默认并行（ctid 哈希分片） |
+| 并行策略 | 单线程或需 PK 字段 | 默认并行（range/key-hash 优先，ctid 兜底） |
 | 几何格式 | WKT 文本 | WKB 二进制 |
 | 错误处理 | exit() 终止 | SQLite 错误日志 + 容错继续 |
 | 元数据 | MBTiles metadata 表 | MongoDB 元数据集合 |
@@ -106,7 +106,7 @@ maindb.cpp
 
 ```
 maindb()
-  ├── 1. 参数解析（--postgis, --mongo, --mongo-drop-collection, --mongo-metadata 等）
+  ├── 1. 参数解析（--postgis, --postgis-shard-key, --postgis-shard-mode, --mongo, --mongo-fail-on-discard 等）
   ├── 2. ErrorLogger::initialize() — 初始化 SQLite 错误日志
   ├── 3. MongoDB::initialize_global() — 初始化 mongocxx 全局实例
   ├── 4. read_input()
@@ -140,29 +140,31 @@ maindb()
 
 ```
 首次调用 get_cached_srid()
-  ├── 执行 "SELECT ST_SRID(geom) FROM table LIMIT 1"
-  ├── 缓存到 static cached_srid_
-  └── 后续调用直接返回缓存值
+  ├── 执行 SRID 探测 SQL
+  ├── 以连接维度 key（host|port|dbname|table|geometry|sql）缓存
+  └── 后续同 key 调用直接返回缓存值（线程安全，mutex 保护）
 ```
 
 **查询构建策略：**
 
 ```
 SRID == 4326:
-  SELECT ST_AsBinary(geom) AS wkb, * FROM "table"
+  SELECT ST_AsBinary(geom) AS wkb, <projection> FROM "table"
 
 SRID != 4326:
-  SELECT ST_AsBinary(ST_Transform(geom, 4326)) AS wkb, * FROM "table"
+  SELECT ST_AsBinary(ST_Transform(geom, 4326)) AS wkb, <projection> FROM "table"
 
 自定义 SQL:
-  SELECT ST_AsBinary((sql)::geometry) AS wkb, * FROM (sql) AS _subq
+  SELECT ST_AsBinary((sql)::geometry) AS wkb, <projection> FROM (sql) AS _subq
+
+其中 <projection> 默认是 `*`；当指定 `--postgis-columns` 时为列白名单投影。
 ```
 
 #### 2.2.3 postgis_manager.cpp — 并行读取管理
 
 **类：`PostGIS::ParallelReader`**
 
-**并行策略：ctid 哈希分片**
+**并行策略：可配置分片（range/key-hash/ctid）**
 
 ```
 线程 i (0 ≤ i < num_threads) 的查询条件:
@@ -462,6 +464,30 @@ merge():
   使用 mmap 访问临时文件
 ```
 
+### 3.6 字节级收敛策略（PostGIS 路径 vs 主线路径）
+
+为实现 `tippecanoe-db` 与主线 `tippecanoe` 的字节级一致，最终采用了以下对齐策略：
+
+1. **几何语义对齐：**  
+   在 WKB Polygon 解析后补充 `VT_CLOSEPATH` 终止标记，使后续 `fix_polygon()` 的外环/内环状态机与 `read_json.cpp` 路径一致，避免 tile 集合差异。
+
+2. **复杂属性文本对齐：**  
+   对 PostgreSQL 返回的复杂文本（数组/对象）做 JSON 风格规范化（如 `{100000}` → `[100000]`、去除无意义空白），消除不同输入通道的文本表示差异。
+
+3. **属性顺序对齐：**  
+   `process_feature()` 中对属性键采用稳定顺序策略（优先键 + 其余键稳定排序），避免 tag 序列顺序漂移导致 payload hash 不一致。
+
+4. **对比模式固定化：**  
+   回归对比统一使用 `--postgis-shard-mode none`，排除并行读取调度造成的非业务顺序波动。
+
+**最终验证结果（同源数据、同参数）：**
+
+- tile 坐标集合一致
+- `SUM(LENGTH(tile_data))` 一致
+- `hex(tile_data)` 全量排序后 `sha256` 一致
+
+这说明当前 PostGIS/WKB 输入路径在输出语义与序列化层面已与主线路径收敛到字节级等价。
+
 ---
 
 ## 4. 数据流程设计
@@ -555,12 +581,20 @@ PostGIS 输入参数:
 
   --postgis-host=HOST       数据库主机 (默认: localhost)
   --postgis-port=PORT       数据库端口 (默认: 5432)
-  --postgis-database=DB     数据库名
+  --postgis-dbname=DB       数据库名
   --postgis-user=USER       用户名
   --postgis-password=PASS   密码
-  --postgis-table=TABLE     表名
+  --postgis-table=TABLE     表名（与 --postgis-sql 二选一）
   --postgis-geometry-field=FIELD  几何列名 (默认: geometry)
-  --postgis-sql=SQL         自定义 SQL 查询
+  --postgis-sql=SQL         自定义 SQL 查询（与 --postgis-table 二选一）
+  --postgis-columns=CSV     属性列白名单（如 id,name,level）
+  --postgis-columns-best-effort  非严格列模式：非法/不存在列跳过并告警
+  --postgis-canonical-attr-order    启用主线一致性属性顺序（默认开启）
+  --postgis-no-canonical-attr-order 关闭主线一致性属性顺序（按键名通用排序）
+  --postgis-profile       输出 PostGIS 读取性能摘要（默认关闭）
+  --postgis-shard-key=COL   并行分片字段（建议整数主键）
+  --postgis-shard-mode=MODE 分片模式: auto|range|key|none
+  --postgis-progress-count  开启精确进度（执行 COUNT(*)，默认关闭）
 
 MongoDB 输出参数:
   --mongo=host:port:dbname:user:password:auth_source:collection
@@ -569,15 +603,19 @@ MongoDB 输出参数:
 
   --mongo-host=HOST         MongoDB 主机
   --mongo-port=PORT         MongoDB 端口
-  --mongo-database=DB       数据库名
-  --mongo-user=USER         用户名
+  --mongo-dbname=DB         数据库名
+  --mongo-username=USER     用户名
   --mongo-password=PASS     密码
   --mongo-auth-source=DB    认证数据库
   --mongo-collection=NAME   集合名
+  --mongo-pool-size=N       连接池大小 (默认: 10, 上限: 50)
+  --mongo-timeout=MS        超时毫秒 (默认: 30000)
   --mongo-batch-size=N      批量写入大小 (默认: 100, 范围: 10-1000)
   --mongo-drop-collection   写入前删除集合 (使用 insert 模式)
   --mongo-no-indexes        不创建索引
   --mongo-metadata          写入元数据到 {collection}_metadata
+  --mongo-fail-on-discard   瓦片丢弃视为失败退出（默认）
+  --mongo-no-fail-on-discard 有丢弃仅告警，不失败退出
 
 瓦片生成参数:
   -z/--maximum-zoom=Z       最大缩放级别 (默认: 14)
@@ -675,7 +713,7 @@ class ErrorLogger {
 |------|-----------|-------------|
 | 前提条件 | 需要整数主键 | 无需任何前提 |
 | 均匀性 | 依赖 PK 分布 | 依赖 hashtest 分布 |
-| 配置复杂度 | 需指定 --postgis-pk | 自动分片 |
+| 配置复杂度 | 需指定 `--postgis-shard-key` | `--postgis-shard-mode auto` 自动回退 |
 | 兼容性 | 所有表 | 不支持分区表/子查询 |
 
 **选型结论：** ctid 分片零配置、通用性强，配合 fallback 机制兼顾兼容性。

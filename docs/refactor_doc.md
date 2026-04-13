@@ -36,6 +36,16 @@
 
 **总计**：净减少约 200 行代码，代码质量显著提升。
 
+### 1.3 2026-04 增量更新（PostGIS 参数与一致性）
+
+本轮在不改变核心切片算法的前提下，补充了参数语义与健壮性：
+
+1. `--postgis-columns` 默认严格校验（非法/不存在列直接失败）
+2. `--postgis-columns-best-effort` 增加宽松模式（跳过并告警）
+3. `--postgis-progress-count` 增加精确进度开关（默认关闭以减少 `COUNT(*)` 负担）
+4. 分片与列校验相关逻辑去重，减少重复代码分支
+5. 参数命名统一为 `--postgis-dbname`、`--mongo-dbname`、`--mongo-username`
+
 ---
 
 ## 2. 架构变更
@@ -436,7 +446,7 @@ if (stats.total_discarded > 0) {
 
 ### 8.3 退出码
 
-新增情况：当 MongoDB 写入过程中有瓦片被丢弃时，退出码为 `EXIT_MONGO (17)`。
+新增情况：当 MongoDB 写入过程中有瓦片被丢弃时，默认退出码为 `EXIT_MONGO (121)`；可通过 `--mongo-no-fail-on-discard` 切换为仅告警。
 
 ---
 

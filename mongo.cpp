@@ -23,6 +23,12 @@ static std::atomic<size_t> global_total_batches{0};
 static std::atomic<size_t> global_total_retries{0};
 static std::atomic<size_t> global_total_errors{0};
 static std::atomic<size_t> global_total_discarded{0};
+static std::atomic<size_t> global_pool_unavailable_batches{0};
+static std::atomic<size_t> global_retry_exhausted_batches{0};
+static std::atomic<size_t> global_insert_batches{0};
+static std::atomic<size_t> global_upsert_batches{0};
+static std::atomic<size_t> global_insert_discarded_tiles{0};
+static std::atomic<size_t> global_upsert_discarded_tiles{0};
 
 static std::unique_ptr<mongocxx::pool> global_pool;
 static std::mutex pool_mutex;
@@ -51,6 +57,8 @@ mongocxx::pool* MongoWriter::get_or_create_pool(const mongo_config &cfg) {
         }
     } catch (const std::exception &e) {
         fprintf(stderr, "Error: Failed to create MongoDB connection pool: %s\n", e.what());
+        ErrorLogger::instance().log_error(ErrorSource::MONGO_CONNECT, 0, 0, 0,
+                                          "Failed to create MongoDB connection pool", e.what());
         return nullptr;
     }
 
@@ -93,6 +101,30 @@ size_t MongoWriter::get_global_total_discarded() {
     return global_total_discarded.load();
 }
 
+size_t MongoWriter::get_global_pool_unavailable_batches() {
+    return global_pool_unavailable_batches.load();
+}
+
+size_t MongoWriter::get_global_retry_exhausted_batches() {
+    return global_retry_exhausted_batches.load();
+}
+
+size_t MongoWriter::get_global_insert_batches() {
+    return global_insert_batches.load();
+}
+
+size_t MongoWriter::get_global_upsert_batches() {
+    return global_upsert_batches.load();
+}
+
+size_t MongoWriter::get_global_insert_discarded_tiles() {
+    return global_insert_discarded_tiles.load();
+}
+
+size_t MongoWriter::get_global_upsert_discarded_tiles() {
+    return global_upsert_discarded_tiles.load();
+}
+
 void MongoWriter::destroy_current_thread_instance() {
     if (tls_mongo_writer) {
         tls_mongo_writer->flush_all();
@@ -102,6 +134,12 @@ void MongoWriter::destroy_current_thread_instance() {
         global_total_retries += tls_mongo_writer->getTotalRetries();
         global_total_errors += tls_mongo_writer->getTotalErrors();
         global_total_discarded += tls_mongo_writer->total_discarded_tiles.load();
+        global_pool_unavailable_batches += tls_mongo_writer->getPoolUnavailableBatches();
+        global_retry_exhausted_batches += tls_mongo_writer->getRetryExhaustedBatches();
+        global_insert_batches += tls_mongo_writer->getInsertBatches();
+        global_upsert_batches += tls_mongo_writer->getUpsertBatches();
+        global_insert_discarded_tiles += tls_mongo_writer->getInsertDiscardedTiles();
+        global_upsert_discarded_tiles += tls_mongo_writer->getUpsertDiscardedTiles();
 
         tls_mongo_writer.reset();
     }
@@ -317,13 +355,32 @@ static int exponential_backoff_with_jitter(int attempt) {
     return max_wait / 2 + dist(gen);
 }
 
+static bool should_log_retry_attempt(int attempts, int max_retries) {
+    return attempts == 1 || attempts == max_retries || (attempts % 4 == 0);
+}
+
 void MongoWriter::flush_batch_with_retry(bool upsert_mode,
     std::vector<bsoncxx::document::value> batch_buf,
     std::vector<tile_coords> batch_coord)
 {
     auto pool = get_or_create_pool(config);
     if (!pool) {
+        total_errors++;
+        total_failed_batches++;
+        total_pool_unavailable_batches++;
         total_discarded_tiles += batch_buf.size();
+        if (upsert_mode) {
+            total_upsert_discarded_tiles += batch_buf.size();
+        } else {
+            total_insert_discarded_tiles += batch_buf.size();
+        }
+        ErrorLogger::instance().log_error(
+            ErrorSource::MONGO_CONNECT,
+            batch_coord.empty() ? 0 : batch_coord[0].z,
+            batch_coord.empty() ? 0 : batch_coord[0].x,
+            batch_coord.empty() ? 0 : batch_coord[0].y,
+            upsert_mode ? "MongoDB pool unavailable for upsert batch" : "MongoDB pool unavailable for insert batch",
+            "Discarded batch due to unavailable connection pool");
         return;
     }
 
@@ -378,6 +435,11 @@ void MongoWriter::flush_batch_with_retry(bool upsert_mode,
             flush_failure_rounds = 0;
             total_tiles_written += batch_buf.size();
             total_batches_written++;
+            if (upsert_mode) {
+                total_upsert_batches++;
+            } else {
+                total_insert_batches++;
+            }
 
             return;
 
@@ -385,7 +447,7 @@ void MongoWriter::flush_batch_with_retry(bool upsert_mode,
             attempts++;
             total_errors++;
 
-            if (!quiet) {
+            if (!quiet && should_log_retry_attempt(attempts, config.max_retries)) {
                 fprintf(stderr, "MongoDB flush_batch_%s failed (attempt %d/%d): %s\n",
                         upsert_mode ? "upsert" : "insert", attempts, config.max_retries, e.what());
             }
@@ -395,10 +457,23 @@ void MongoWriter::flush_batch_with_retry(bool upsert_mode,
                 flush_failure_rounds++;
 
                 if (flush_failure_rounds >= 2) {
+                    total_retry_exhausted_batches++;
                     fprintf(stderr, "Error: MongoDB flush_batch_%s failed after %d attempts x %zu rounds. %zu tiles discarded.\n",
                             upsert_mode ? "upsert" : "insert",
                             config.max_retries, flush_failure_rounds.load(), batch_buf.size());
                     total_discarded_tiles += batch_buf.size();
+                    if (upsert_mode) {
+                        total_upsert_discarded_tiles += batch_buf.size();
+                    } else {
+                        total_insert_discarded_tiles += batch_buf.size();
+                    }
+                    ErrorLogger::instance().log_error(
+                        ErrorSource::MONGO_FLUSH,
+                        batch_coord.empty() ? 0 : batch_coord[0].z,
+                        batch_coord.empty() ? 0 : batch_coord[0].x,
+                        batch_coord.empty() ? 0 : batch_coord[0].y,
+                        upsert_mode ? "MongoDB upsert batch discarded after retries" : "MongoDB insert batch discarded after retries",
+                        "Batch discarded after repeated flush failures");
                     flush_failure_rounds = 0;
                 } else {
                     fprintf(stderr, "Error: MongoDB flush_batch_%s failed after %d attempts (round %zu). %zu tiles remain in buffer.\n",

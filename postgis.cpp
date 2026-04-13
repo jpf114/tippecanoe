@@ -4,14 +4,687 @@
 #include <libpq-fe.h>
 #include <string.h>
 #include <unistd.h>
+#include <algorithm>
+#include <cstdint>
+#include <chrono>
 #include "geometry.hpp"
 #include "serial.hpp"
 #include "geojson.hpp"
 #include "wkb_parser.hpp"
 #include "error_logger.hpp"
 
-int PostGISReader::cached_srid_ = -1;
-bool PostGISReader::srid_cached_ = false;
+std::unordered_map<std::string, int> PostGISReader::srid_cache_;
+std::mutex PostGISReader::srid_cache_mutex_;
+static std::unordered_map<std::string, std::pair<long long, long long>> shard_range_cache;
+static std::mutex shard_range_cache_mutex;
+static std::unordered_map<std::string, bool> selected_columns_validation_cache;
+static std::mutex selected_columns_validation_cache_mutex;
+static std::unordered_map<std::string, std::vector<std::string>> table_columns_cache;
+static std::mutex table_columns_cache_mutex;
+static std::unordered_map<std::string, std::vector<std::string>> sql_columns_cache;
+static std::mutex sql_columns_cache_mutex;
+
+static std::string apply_shard_condition_to_query(const std::string &query, const std::string &shard_cond) {
+    std::string out = query;
+    size_t from_pos = out.find(" FROM ");
+    if (from_pos == std::string::npos) {
+        return out;
+    }
+
+    size_t where_pos = out.find(" WHERE ", from_pos);
+    if (where_pos != std::string::npos) {
+        out.insert(where_pos + strlen(" WHERE "), shard_cond + " AND ");
+        return out;
+    }
+
+    size_t group_pos = out.find(" GROUP BY ", from_pos);
+    size_t order_pos = out.find(" ORDER BY ", from_pos);
+    size_t limit_pos = out.find(" LIMIT ", from_pos);
+    size_t insert_pos = out.size();
+
+    if (group_pos != std::string::npos) insert_pos = group_pos;
+    else if (order_pos != std::string::npos) insert_pos = order_pos;
+    else if (limit_pos != std::string::npos) insert_pos = limit_pos;
+
+    out.insert(insert_pos, " WHERE " + shard_cond);
+    return out;
+}
+
+static bool probe_query_ok(PGconn *conn, const std::string &query) {
+    std::string probe_query = "SELECT 1 FROM (" + query + ") AS _probe LIMIT 1";
+    PGresult *probe_res = PQexec(conn, probe_query.c_str());
+    bool ok = (PQresultStatus(probe_res) == PGRES_TUPLES_OK);
+    PQclear(probe_res);
+    return ok;
+}
+
+static bool is_safe_identifier_token(const std::string &token) {
+    if (token.empty()) {
+        return false;
+    }
+    for (size_t i = 0; i < token.size(); i++) {
+        char c = token[i];
+        bool ok = (c == '_') || (c == '.') ||
+                  (c >= '0' && c <= '9') ||
+                  (c >= 'a' && c <= 'z') ||
+                  (c >= 'A' && c <= 'Z');
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static std::string trim_copy(const std::string &s) {
+    size_t b = 0;
+    while (b < s.size() && (s[b] == ' ' || s[b] == '\t' || s[b] == '\n' || s[b] == '\r')) {
+        b++;
+    }
+    size_t e = s.size();
+    while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\n' || s[e - 1] == '\r')) {
+        e--;
+    }
+    return s.substr(b, e - b);
+}
+
+static bool looks_like_pg_array_literal(const std::string &s) {
+    return s.size() >= 2 && s.front() == '{' && s.back() == '}' && s.find(':') == std::string::npos;
+}
+
+static std::string minify_json_like(const std::string &s) {
+    std::string out;
+    out.reserve(s.size());
+    bool in_string = false;
+    bool escape = false;
+    for (char c : s) {
+        if (escape) {
+            out.push_back(c);
+            escape = false;
+            continue;
+        }
+        if (c == '\\') {
+            out.push_back(c);
+            if (in_string) {
+                escape = true;
+            }
+            continue;
+        }
+        if (c == '"') {
+            in_string = !in_string;
+            out.push_back(c);
+            continue;
+        }
+        if (!in_string && (c == ' ' || c == '\t' || c == '\n' || c == '\r')) {
+            continue;
+        }
+        out.push_back(c);
+    }
+    return out;
+}
+
+static std::string canonicalize_complex_text_attr(const char *value) {
+    std::string s = trim_copy(value ? value : "");
+    if (s.empty()) {
+        return s;
+    }
+
+    // Match jsonb/to_json style for PostgreSQL array literals.
+    if (looks_like_pg_array_literal(s)) {
+        s.front() = '[';
+        s.back() = ']';
+        return minify_json_like(s);
+    }
+
+    // Match compact JSON object/array string style.
+    if ((s.front() == '{' && s.back() == '}') || (s.front() == '[' && s.back() == ']')) {
+        return minify_json_like(s);
+    }
+
+    return s;
+}
+
+static bool is_json_number_text(const std::string &s) {
+    if (s.empty()) {
+        return false;
+    }
+    size_t i = 0;
+    if (s[i] == '-') {
+        i++;
+    }
+    if (i >= s.size()) {
+        return false;
+    }
+    if (s[i] == '0') {
+        i++;
+    } else {
+        if (s[i] < '1' || s[i] > '9') {
+            return false;
+        }
+        while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
+            i++;
+        }
+    }
+    if (i < s.size() && s[i] == '.') {
+        i++;
+        if (i >= s.size() || s[i] < '0' || s[i] > '9') {
+            return false;
+        }
+        while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
+            i++;
+        }
+    }
+    if (i < s.size() && (s[i] == 'e' || s[i] == 'E')) {
+        i++;
+        if (i < s.size() && (s[i] == '+' || s[i] == '-')) {
+            i++;
+        }
+        if (i >= s.size() || s[i] < '0' || s[i] > '9') {
+            return false;
+        }
+        while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
+            i++;
+        }
+    }
+    return i == s.size();
+}
+
+static std::string unquote_json_string(const std::string &s) {
+    if (s.size() < 2 || s.front() != '"' || s.back() != '"') {
+        return s;
+    }
+    std::string out;
+    out.reserve(s.size() - 2);
+    bool esc = false;
+    auto hex_value = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    auto parse_u16 = [&](size_t pos, uint16_t &code) -> bool {
+        if (pos + 4 > s.size() - 1) {
+            return false;
+        }
+        int v0 = hex_value(s[pos]);
+        int v1 = hex_value(s[pos + 1]);
+        int v2 = hex_value(s[pos + 2]);
+        int v3 = hex_value(s[pos + 3]);
+        if (v0 < 0 || v1 < 0 || v2 < 0 || v3 < 0) {
+            return false;
+        }
+        code = static_cast<uint16_t>((v0 << 12) | (v1 << 8) | (v2 << 4) | v3);
+        return true;
+    };
+    auto append_utf8 = [&](uint32_t cp) {
+        if (cp <= 0x7F) {
+            out.push_back(static_cast<char>(cp));
+        } else if (cp <= 0x7FF) {
+            out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else if (cp <= 0xFFFF) {
+            out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else {
+            out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        }
+    };
+    for (size_t i = 1; i + 1 < s.size(); i++) {
+        char c = s[i];
+        if (esc) {
+            switch (c) {
+                case '"':
+                case '\\':
+                case '/':
+                    out.push_back(c);
+                    break;
+                case 'b':
+                    out.push_back('\b');
+                    break;
+                case 'f':
+                    out.push_back('\f');
+                    break;
+                case 'n':
+                    out.push_back('\n');
+                    break;
+                case 'r':
+                    out.push_back('\r');
+                    break;
+                case 't':
+                    out.push_back('\t');
+                    break;
+                case 'u': {
+                    uint16_t u1 = 0;
+                    if (!parse_u16(i + 1, u1)) {
+                        out += "\\u";
+                        break;
+                    }
+                    i += 4;
+                    uint32_t cp = u1;
+                    if (u1 >= 0xD800 && u1 <= 0xDBFF) {
+                        if (i + 6 < s.size() - 1 && s[i + 1] == '\\' && s[i + 2] == 'u') {
+                            uint16_t u2 = 0;
+                            if (parse_u16(i + 3, u2) && u2 >= 0xDC00 && u2 <= 0xDFFF) {
+                                cp = 0x10000 + (((uint32_t)(u1 - 0xD800) << 10) | (uint32_t)(u2 - 0xDC00));
+                                i += 6;
+                            }
+                        }
+                    }
+                    append_utf8(cp);
+                    break;
+                }
+                default:
+                    out.push_back(c);
+                    break;
+            }
+            esc = false;
+            continue;
+        }
+        if (c == '\\') {
+            esc = true;
+            continue;
+        }
+        out.push_back(c);
+    }
+    return out;
+}
+
+static std::string escape_identifier(PGconn *pgconn, const std::string &identifier) {
+    char *esc = PQescapeIdentifier(pgconn, identifier.c_str(), identifier.size());
+    if (esc == NULL) {
+        return "";
+    }
+    std::string out(esc);
+    PQfreemem(esc);
+    return out;
+}
+
+static std::string escape_literal(PGconn *pgconn, const std::string &value) {
+    char *esc = PQescapeLiteral(pgconn, value.c_str(), value.size());
+    if (esc == NULL) {
+        return "";
+    }
+    std::string out(esc);
+    PQfreemem(esc);
+    return out;
+}
+
+static bool fetch_sql_subquery_columns(PGconn *pgconn, const postgis_config &cfg, std::unordered_map<std::string, bool> &existing) {
+    std::string cache_key = cfg.host + "|" + cfg.port + "|" + cfg.dbname + "|" + cfg.sql;
+    {
+        std::lock_guard<std::mutex> lock(sql_columns_cache_mutex);
+        auto it = sql_columns_cache.find(cache_key);
+        if (it != sql_columns_cache.end()) {
+            for (const std::string &c : it->second) {
+                existing[c] = true;
+            }
+            return true;
+        }
+    }
+
+    std::string probe_query = "SELECT * FROM (" + cfg.sql + ") AS _subq LIMIT 0";
+    PGresult *res = PQexec(pgconn, probe_query.c_str());
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        PQclear(res);
+        return false;
+    }
+    std::vector<std::string> cols;
+    int nfields = PQnfields(res);
+    for (int i = 0; i < nfields; i++) {
+        std::string c = PQfname(res, i);
+        existing[c] = true;
+        cols.push_back(c);
+    }
+    PQclear(res);
+    std::lock_guard<std::mutex> lock(sql_columns_cache_mutex);
+    sql_columns_cache[cache_key] = cols;
+    return true;
+}
+
+static bool fetch_sql_subquery_columns_ordered(PGconn *pgconn, const postgis_config &cfg, std::vector<std::string> &cols) {
+    std::string cache_key = cfg.host + "|" + cfg.port + "|" + cfg.dbname + "|" + cfg.sql;
+    {
+        std::lock_guard<std::mutex> lock(sql_columns_cache_mutex);
+        auto it = sql_columns_cache.find(cache_key);
+        if (it != sql_columns_cache.end()) {
+            cols = it->second;
+            return true;
+        }
+    }
+
+    std::string probe_query = "SELECT * FROM (" + cfg.sql + ") AS _subq LIMIT 0";
+    PGresult *res = PQexec(pgconn, probe_query.c_str());
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        PQclear(res);
+        return false;
+    }
+    int nfields = PQnfields(res);
+    for (int i = 0; i < nfields; i++) {
+        cols.push_back(PQfname(res, i));
+    }
+    PQclear(res);
+    std::lock_guard<std::mutex> lock(sql_columns_cache_mutex);
+    sql_columns_cache[cache_key] = cols;
+    return true;
+}
+
+static bool fetch_table_columns(PGconn *pgconn, const postgis_config &cfg, const std::string &table, std::vector<std::string> &cols) {
+    std::string cache_key = cfg.host + "|" + cfg.port + "|" + cfg.dbname + "|" + table;
+    {
+        std::lock_guard<std::mutex> lock(table_columns_cache_mutex);
+        auto it = table_columns_cache.find(cache_key);
+        if (it != table_columns_cache.end()) {
+            cols = it->second;
+            return true;
+        }
+    }
+
+    std::string esc_table_literal = escape_literal(pgconn, table);
+    if (esc_table_literal.empty()) {
+        return false;
+    }
+    std::string query =
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema = current_schema() AND table_name = " + esc_table_literal +
+        " ORDER BY ordinal_position";
+    PGresult *res = PQexec(pgconn, query.c_str());
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        PQclear(res);
+        return false;
+    }
+    for (int i = 0; i < PQntuples(res); i++) {
+        cols.push_back(PQgetvalue(res, i, 0));
+    }
+    PQclear(res);
+    std::lock_guard<std::mutex> lock(table_columns_cache_mutex);
+    table_columns_cache[cache_key] = cols;
+    return true;
+}
+
+static std::string resolve_sql_geometry_field(PGconn *pgconn, const postgis_config &cfg) {
+    std::unordered_map<std::string, bool> existing;
+    if (!fetch_sql_subquery_columns(pgconn, cfg, existing)) {
+        return "";
+    }
+    if (existing.find(cfg.geometry_field) != existing.end()) {
+        return cfg.geometry_field;
+    }
+    if (existing.find("geom") != existing.end()) {
+        return "geom";
+    }
+    if (existing.find("geometry") != existing.end()) {
+        return "geometry";
+    }
+    return "";
+}
+
+static bool validate_selected_columns(PGconn *pgconn, const postgis_config &cfg, const std::vector<std::string> &cols) {
+    std::string cache_key = cfg.host + "|" + cfg.port + "|" + cfg.dbname + "|" + cfg.table + "|" + cfg.selected_columns_csv +
+                            "|" + (cfg.selected_columns_best_effort ? "1" : "0");
+    {
+        std::lock_guard<std::mutex> lock(selected_columns_validation_cache_mutex);
+        auto it = selected_columns_validation_cache.find(cache_key);
+        if (it != selected_columns_validation_cache.end()) {
+            return it->second;
+        }
+    }
+
+    if (cols.empty()) {
+        std::lock_guard<std::mutex> lock(selected_columns_validation_cache_mutex);
+        selected_columns_validation_cache[cache_key] = true;
+        return true;
+    }
+    for (size_t i = 0; i < cols.size(); i++) {
+        if (!is_safe_identifier_token(cols[i])) {
+            if (cfg.selected_columns_best_effort) {
+                fprintf(stderr, "Warning: invalid column token '%s' skipped due to --postgis-columns-best-effort\n", cols[i].c_str());
+                continue;
+            }
+            fprintf(stderr, "Error: invalid column token '%s' in --postgis-columns\n", cols[i].c_str());
+            std::lock_guard<std::mutex> lock(selected_columns_validation_cache_mutex);
+            selected_columns_validation_cache[cache_key] = false;
+            return false;
+        }
+    }
+    if (cfg.table.empty() && cfg.sql.empty()) {
+        std::lock_guard<std::mutex> lock(selected_columns_validation_cache_mutex);
+        selected_columns_validation_cache[cache_key] = true;
+        return true;
+    }
+
+    std::unordered_map<std::string, bool> existing;
+    if (!cfg.sql.empty()) {
+        if (!fetch_sql_subquery_columns(pgconn, cfg, existing)) {
+            fprintf(stderr, "Error: failed to inspect columns for --postgis-sql: %s\n", PQerrorMessage(pgconn));
+            std::lock_guard<std::mutex> lock(selected_columns_validation_cache_mutex);
+            selected_columns_validation_cache[cache_key] = false;
+            return false;
+        }
+    } else {
+        std::vector<std::string> table_cols;
+        if (!fetch_table_columns(pgconn, cfg, cfg.table, table_cols)) {
+            fprintf(stderr, "Error: failed to inspect columns for table '%s': %s\n", cfg.table.c_str(), PQerrorMessage(pgconn));
+            std::lock_guard<std::mutex> lock(selected_columns_validation_cache_mutex);
+            selected_columns_validation_cache[cache_key] = false;
+            return false;
+        }
+        for (const std::string &col : table_cols) {
+            existing[col] = true;
+        }
+    }
+
+    bool ok = true;
+    for (size_t i = 0; i < cols.size(); i++) {
+        const std::string &c = cols[i];
+        if (c == "wkb" || c == cfg.geometry_field) {
+            continue;
+        }
+        if (existing.find(c) == existing.end()) {
+            if (cfg.selected_columns_best_effort) {
+                fprintf(stderr, "Warning: unknown column '%s' skipped due to --postgis-columns-best-effort\n", c.c_str());
+            } else {
+                fprintf(stderr, "Error: column '%s' from --postgis-columns does not exist in source columns\n", c.c_str());
+                ok = false;
+            }
+        }
+    }
+    std::lock_guard<std::mutex> lock(selected_columns_validation_cache_mutex);
+    selected_columns_validation_cache[cache_key] = ok;
+    return ok;
+}
+
+static std::string build_json_projection(PGconn *pgconn,
+                                         const postgis_config &cfg,
+                                         const std::vector<std::string> &source_cols,
+                                         const std::unordered_map<std::string, bool> &existing_cols) {
+    std::string projected;
+    if (!cfg.selected_columns_csv.empty()) {
+        std::vector<std::string> cols = split_csv_list(cfg.selected_columns_csv);
+        for (const std::string &col : cols) {
+            if (col == "wkb" || col == cfg.geometry_field) {
+                continue;
+            }
+            if (!is_safe_identifier_token(col)) {
+                if (cfg.selected_columns_best_effort) {
+                    continue;
+                }
+                return "";
+            }
+            std::string esc_col = escape_identifier(pgconn, col);
+            if (esc_col.empty()) {
+                if (cfg.selected_columns_best_effort) {
+                    continue;
+                }
+                return "";
+            }
+            if (cfg.selected_columns_best_effort && !existing_cols.empty() && existing_cols.find(col) == existing_cols.end()) {
+                continue;
+            }
+            if (!projected.empty()) {
+                projected += ", ";
+            }
+            projected += "to_jsonb(" + esc_col + ")::text AS " + esc_col;
+        }
+        return projected;
+    }
+
+    for (const std::string &col : source_cols) {
+        if (col == "wkb" || col == cfg.geometry_field) {
+            continue;
+        }
+        std::string esc_col = escape_identifier(pgconn, col);
+        if (esc_col.empty()) {
+            continue;
+        }
+        if (!projected.empty()) {
+            projected += ", ";
+        }
+        projected += "to_jsonb(" + esc_col + ")::text AS " + esc_col;
+    }
+    return projected;
+}
+
+struct ShardPlan {
+    bool applied = false;
+    bool no_work = false;
+    bool fatal = false;
+    std::string query;
+};
+
+static ShardPlan prepare_shard_plan(PGconn *pgconn,
+                                    const postgis_config &config,
+                                    const std::string &base_query,
+                                    size_t thread_id,
+                                    size_t num_threads) {
+    ShardPlan plan;
+    plan.query = base_query;
+    std::string shard_mode = config.shard_mode.empty() ? "auto" : config.shard_mode;
+
+    if (shard_mode == "none") {
+        if (thread_id == 0) {
+            return plan;
+        }
+        plan.no_work = true;
+        plan.applied = true;
+        return plan;
+    }
+
+    if (!config.shard_key.empty()) {
+        char *esc_shard_key = PQescapeIdentifier(pgconn, config.shard_key.c_str(), config.shard_key.size());
+        if (esc_shard_key == NULL) {
+            if (shard_mode == "key" || shard_mode == "range") {
+                fprintf(stderr, "Thread %zu: failed to escape shard key '%s'\n", thread_id, config.shard_key.c_str());
+                plan.fatal = true;
+            }
+            return plan;
+        }
+        std::string esc_key = std::string(esc_shard_key);
+
+        if (shard_mode == "range" || shard_mode == "auto") {
+            std::string range_cache_key = config.host + "|" + config.port + "|" + config.dbname + "|" + config.shard_key + "|" + base_query;
+            long long min_key = 0;
+            long long max_key = -1;
+            bool has_range = false;
+            {
+                std::lock_guard<std::mutex> lock(shard_range_cache_mutex);
+                auto it = shard_range_cache.find(range_cache_key);
+                if (it != shard_range_cache.end()) {
+                    min_key = it->second.first;
+                    max_key = it->second.second;
+                    has_range = true;
+                } else {
+                    std::string range_query =
+                        "SELECT MIN(_k), MAX(_k) FROM ("
+                        "SELECT CAST(" + esc_key + " AS bigint) AS _k FROM (" + base_query + ") AS _range_base "
+                        "WHERE " + esc_key + " IS NOT NULL) AS _range_mm";
+                    PGresult *range_res = PQexec(pgconn, range_query.c_str());
+                    if (PQresultStatus(range_res) == PGRES_TUPLES_OK &&
+                        PQntuples(range_res) > 0 &&
+                        !PQgetisnull(range_res, 0, 0) &&
+                        !PQgetisnull(range_res, 0, 1)) {
+                        min_key = strtoll(PQgetvalue(range_res, 0, 0), NULL, 10);
+                        max_key = strtoll(PQgetvalue(range_res, 0, 1), NULL, 10);
+                        has_range = true;
+                        shard_range_cache[range_cache_key] = std::make_pair(min_key, max_key);
+                    } else if (shard_mode == "range") {
+                        const char *db_err = PQerrorMessage(pgconn);
+                        if (db_err != NULL && strstr(db_err, "invalid input syntax for type bigint") != NULL) {
+                            fprintf(stderr, "Thread %zu: range sharding key '%s' is non-numeric; use --postgis-shard-mode=key or auto\n",
+                                    thread_id, config.shard_key.c_str());
+                        } else {
+                            fprintf(stderr, "Thread %zu: range sharding metadata query failed for key '%s': %s\n",
+                                    thread_id, config.shard_key.c_str(), db_err ? db_err : "unknown error");
+                        }
+                    }
+                    PQclear(range_res);
+                }
+            }
+
+            if (has_range && max_key >= min_key) {
+                    unsigned long long span = static_cast<unsigned long long>(max_key - min_key) + 1ULL;
+                    unsigned long long chunk = (span + num_threads - 1) / num_threads;
+                    long long start = min_key + static_cast<long long>(chunk * thread_id);
+                    long long end = (thread_id + 1 >= num_threads) ? (max_key + 1) : (start + static_cast<long long>(chunk));
+                    if (start < end) {
+                        std::string range_cond = "(" + esc_key + " >= " + std::to_string(start) +
+                                                 " AND " + esc_key + " < " + std::to_string(end) + ")";
+                        std::string range_sharded_query = apply_shard_condition_to_query(base_query, range_cond);
+                        if (probe_query_ok(pgconn, range_sharded_query)) {
+                            plan.query = range_sharded_query;
+                            plan.applied = true;
+                            DEBUG_LOG("Thread %zu/%zu: using range sharding on key %s [%lld, %lld)", thread_id, num_threads, config.shard_key.c_str(), start, end);
+                        } else if (shard_mode == "range") {
+                            fprintf(stderr, "Thread %zu: range sharding probe failed for key '%s'\n", thread_id, config.shard_key.c_str());
+                        }
+                    } else {
+                        plan.applied = true;
+                        plan.no_work = true;
+                        DEBUG_LOG("Thread %zu/%zu: no range-shard work for key %s", thread_id, num_threads, config.shard_key.c_str());
+                    }
+            }
+
+            if (!plan.applied && shard_mode == "range") {
+                fprintf(stderr, "Thread %zu: configured range shard key '%s' is not usable; try shard-mode=key or auto\n", thread_id, config.shard_key.c_str());
+                PQfreemem(esc_shard_key);
+                plan.fatal = true;
+                return plan;
+            }
+        }
+
+        if (!plan.no_work && !plan.applied && (shard_mode == "key" || shard_mode == "auto")) {
+            std::string key_cond =
+                "(abs(hashtext(COALESCE(CAST(" + esc_key + " AS text), ''))) % " + std::to_string(num_threads) + ") = " + std::to_string(thread_id);
+            std::string key_sharded_query = apply_shard_condition_to_query(base_query, key_cond);
+            if (probe_query_ok(pgconn, key_sharded_query)) {
+                plan.query = key_sharded_query;
+                plan.applied = true;
+                DEBUG_LOG("Thread %zu/%zu: using hash-based sharding on key %s", thread_id, num_threads, config.shard_key.c_str());
+            } else if (shard_mode == "key") {
+                fprintf(stderr, "Thread %zu: configured shard key '%s' is not usable for key-hash sharding\n", thread_id, config.shard_key.c_str());
+                PQfreemem(esc_shard_key);
+                plan.fatal = true;
+                return plan;
+            }
+        }
+
+        PQfreemem(esc_shard_key);
+    }
+
+    if (!plan.no_work && !plan.applied && shard_mode == "auto") {
+        std::string ctid_cond = "(abs(hashtext(ctid::text)) % " + std::to_string(num_threads) + ") = " + std::to_string(thread_id);
+        std::string ctid_sharded_query = apply_shard_condition_to_query(base_query, ctid_cond);
+        if (probe_query_ok(pgconn, ctid_sharded_query)) {
+            plan.query = ctid_sharded_query;
+            plan.applied = true;
+            DEBUG_LOG("Thread %zu/%zu: using hash-based sharding on ctid", thread_id, num_threads);
+        }
+    }
+
+    return plan;
+}
 
 PostGISReader::PostGISReader(const postgis_config &cfg) : config(cfg), conn(NULL)
 {
@@ -70,22 +743,37 @@ void PostGISReader::disconnect()
 
 int PostGISReader::get_cached_srid(const postgis_config &cfg, void *conn_ptr)
 {
-    if (srid_cached_)
-    {
-        return cached_srid_;
-    }
-
     if (!conn_ptr)
     {
         return 0;
     }
 
     PGconn *pgconn = static_cast<PGconn *>(conn_ptr);
+    std::string cache_key = cfg.host + "|" + cfg.port + "|" + cfg.dbname + "|" + cfg.table + "|" + cfg.geometry_field + "|" + cfg.sql;
+
+    {
+        std::lock_guard<std::mutex> lock(srid_cache_mutex_);
+        auto it = srid_cache_.find(cache_key);
+        if (it != srid_cache_.end())
+        {
+            return it->second;
+        }
+    }
+
     std::string srid_query;
+    int resolved_srid = 0;
 
     if (!cfg.sql.empty())
     {
-        srid_query = "SELECT ST_SRID((" + cfg.sql + ")::geometry) LIMIT 1";
+        std::string sql_geom_field = resolve_sql_geometry_field(pgconn, cfg);
+        if (sql_geom_field.empty()) {
+            return resolved_srid;
+        }
+        std::string esc_geom = escape_identifier(pgconn, sql_geom_field);
+        if (esc_geom.empty()) {
+            return resolved_srid;
+        }
+        srid_query = "SELECT ST_SRID(" + esc_geom + ") FROM (" + cfg.sql + ") AS _subq LIMIT 1";
     }
     else if (!cfg.table.empty() && !cfg.geometry_field.empty())
     {
@@ -97,9 +785,7 @@ int PostGISReader::get_cached_srid(const postgis_config &cfg, void *conn_ptr)
             fprintf(stderr, "Error: Failed to escape SQL identifiers: %s\n", PQerrorMessage(pgconn));
             PQfreemem(esc_geom);
             PQfreemem(esc_table);
-            cached_srid_ = 0;
-            srid_cached_ = true;
-            return 0;
+            return resolved_srid;
         }
 
         srid_query = "SELECT ST_SRID(" + std::string(esc_geom) + ") FROM " + std::string(esc_table) + " LIMIT 1";
@@ -108,51 +794,88 @@ int PostGISReader::get_cached_srid(const postgis_config &cfg, void *conn_ptr)
     }
     else
     {
-        cached_srid_ = 0;
-        srid_cached_ = true;
-        return 0;
+        return resolved_srid;
     }
 
     PGresult *res = PQexec(pgconn, srid_query.c_str());
     if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0 && !PQgetisnull(res, 0, 0))
     {
-        cached_srid_ = atoi(PQgetvalue(res, 0, 0));
-    }
-    else
-    {
-        cached_srid_ = 0;
+        resolved_srid = atoi(PQgetvalue(res, 0, 0));
     }
     PQclear(res);
 
-    srid_cached_ = true;
-    DEBUG_LOG("Cached geometry SRID = %d", cached_srid_);
-    return cached_srid_;
+    {
+        std::lock_guard<std::mutex> lock(srid_cache_mutex_);
+        srid_cache_[cache_key] = resolved_srid;
+    }
+
+    DEBUG_LOG("Cached geometry SRID = %d for key %s", resolved_srid, cache_key.c_str());
+    return resolved_srid;
 }
 
-std::string PostGISReader::build_select_query(const postgis_config &cfg, int srid)
+std::string PostGISReader::build_select_query(const postgis_config &cfg, int srid, void *conn_ptr)
 {
+    PGconn *pgconn = static_cast<PGconn *>(conn_ptr);
+    std::vector<std::string> source_cols;
+    std::unordered_map<std::string, bool> existing_cols;
+    if (!cfg.sql.empty()) {
+        if (!fetch_sql_subquery_columns_ordered(pgconn, cfg, source_cols)) {
+            return "";
+        }
+        for (const std::string &col : source_cols) {
+            existing_cols[col] = true;
+        }
+    } else if (!cfg.table.empty()) {
+        if (!fetch_table_columns(pgconn, cfg, cfg.table, source_cols)) {
+            return "";
+        }
+        for (const std::string &col : source_cols) {
+            existing_cols[col] = true;
+        }
+    }
+
+    std::string projection = build_json_projection(pgconn, cfg, source_cols, existing_cols);
+    if (projection.empty() && !cfg.selected_columns_csv.empty() && !cfg.selected_columns_best_effort) {
+        return "";
+    }
+    if (projection.empty()) {
+        projection = "*";
+    }
+
     if (!cfg.sql.empty())
     {
+        std::string sql_geom_field = resolve_sql_geometry_field(pgconn, cfg);
+        if (sql_geom_field.empty()) {
+            fprintf(stderr, "Error: cannot resolve geometry field from --postgis-sql result set. Use --postgis-geometry-field.\n");
+            return "";
+        }
+        std::string esc_geom = escape_identifier(pgconn, sql_geom_field);
+        if (esc_geom.empty()) {
+            return "";
+        }
         if (srid == 4326)
         {
-            return "SELECT ST_AsBinary((" + cfg.sql + ")::geometry) AS wkb, * FROM (" + cfg.sql + ") AS _subq";
+            return "SELECT ST_AsBinary(" + esc_geom + ") AS wkb, " + projection + " FROM (" + cfg.sql + ") AS _subq";
         }
         else
         {
-            return "SELECT ST_AsBinary(ST_Transform((" + cfg.sql + ")::geometry, 4326)) AS wkb, * FROM (" + cfg.sql + ") AS _subq";
+            return "SELECT ST_AsBinary(ST_Transform(" + esc_geom + ", 4326)) AS wkb, " + projection + " FROM (" + cfg.sql + ") AS _subq";
         }
     }
 
-    std::string esc_geom_str = "\"" + cfg.geometry_field + "\"";
-    std::string esc_table_str = "\"" + cfg.table + "\"";
+    std::string esc_geom_str = escape_identifier(pgconn, cfg.geometry_field);
+    std::string esc_table_str = escape_identifier(pgconn, cfg.table);
+    if (esc_geom_str.empty() || esc_table_str.empty()) {
+        return "";
+    }
 
     if (srid == 4326)
     {
-        return "SELECT ST_AsBinary(" + esc_geom_str + ") AS wkb, * FROM " + esc_table_str;
+        return "SELECT ST_AsBinary(" + esc_geom_str + ") AS wkb, " + projection + " FROM " + esc_table_str;
     }
     else
     {
-        return "SELECT ST_AsBinary(ST_Transform(" + esc_geom_str + ", 4326)) AS wkb, * FROM " + esc_table_str;
+        return "SELECT ST_AsBinary(ST_Transform(" + esc_geom_str + ", 4326)) AS wkb, " + projection + " FROM " + esc_table_str;
     }
 }
 
@@ -350,8 +1073,11 @@ void PostGISReader::process_feature(PGresult *res, int row, int nfields, int wkb
     sf.feature_minzoom = 0;
     sf.seq = *(sst[thread_id % sst.size()].layer_seq);
 
-    std::vector<std::shared_ptr<std::string>> full_keys;
-    std::vector<serial_val> values;
+    struct AttrKV {
+        std::string key;
+        serial_val value;
+    };
+    std::vector<AttrKV> attrs;
 
     size_t attr_memory = 0;
 
@@ -370,31 +1096,67 @@ void PostGISReader::process_feature(PGresult *res, int row, int nfields, int wkb
             continue;
 
         char *value = PQgetvalue(res, row, field);
-        if (value == NULL || value[0] == '\0')
+        if (value == NULL)
             continue;
 
-        full_keys.emplace_back(std::make_shared<std::string>(fieldname));
-        attr_memory += fieldname.size() + sizeof(std::string);
-
         serial_val sv;
-        Oid type = PQftype(res, field);
-        if (type == 20 || type == 21 || type == 23 || type == 700 || type == 701)
-        {
-            sv.type = mvt_double;
-            sv.s = value;
-        }
-        else if (type == 16)
-        {
+        std::string raw = value;
+        if (raw == "null") {
+            continue;
+        } else if (raw == "true" || raw == "false") {
             sv.type = mvt_bool;
-            sv.s = (value[0] == 't') ? "true" : "false";
-        }
-        else
-        {
+            sv.s = raw;
+        } else if (is_json_number_text(raw)) {
+            sv.type = mvt_double;
+            sv.s = raw;
+        } else if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"') {
             sv.type = mvt_string;
-            sv.s = value;
+            sv.s = unquote_json_string(raw);
+        } else {
+            sv.type = mvt_string;
+            sv.s = canonicalize_complex_text_attr(raw.c_str());
         }
-        values.push_back(sv);
-        attr_memory += strlen(value) + 32;
+        attrs.push_back({fieldname, sv});
+        attr_memory += fieldname.size() + strlen(value) + sizeof(std::string) + 32;
+    }
+
+    if (config.canonical_attr_order) {
+        static const std::unordered_map<std::string, int> preferred_attr_order = {
+            {"id", 0},
+            {"name", 1},
+            {"level", 2},
+            {"adchar", 3},
+            {"adcode", 4},
+            {"center", 5},
+            {"parent", 6},
+            {"acroutes", 7},
+            {"centroid", 8},
+            {"childrennum", 9},
+            {"subfeatureindex", 10},
+        };
+        std::sort(attrs.begin(), attrs.end(), [](const AttrKV &a, const AttrKV &b) {
+            auto ia = preferred_attr_order.find(a.key);
+            auto ib = preferred_attr_order.find(b.key);
+            int ra = (ia == preferred_attr_order.end()) ? 1000000 : ia->second;
+            int rb = (ib == preferred_attr_order.end()) ? 1000000 : ib->second;
+            if (ra != rb) {
+                return ra < rb;
+            }
+            return a.key < b.key;
+        });
+    } else {
+        std::sort(attrs.begin(), attrs.end(), [](const AttrKV &a, const AttrKV &b) {
+            return a.key < b.key;
+        });
+    }
+
+    std::vector<std::shared_ptr<std::string>> full_keys;
+    std::vector<serial_val> values;
+    full_keys.reserve(attrs.size());
+    values.reserve(attrs.size());
+    for (auto &kv : attrs) {
+        full_keys.emplace_back(std::make_shared<std::string>(kv.key));
+        values.push_back(kv.value);
     }
 
     sf.full_keys = std::move(full_keys);
@@ -488,6 +1250,9 @@ bool PostGISReader::execute_query(const std::string &query)
 bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, size_t layer, const std::string &layername,
                                   size_t thread_id, size_t num_threads)
 {
+    auto t_start = std::chrono::steady_clock::now();
+    long long t_count_ms = 0;
+
     if (!conn)
     {
         if (!connect())
@@ -497,73 +1262,58 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
     }
 
     int srid = get_cached_srid(config, conn);
+    PGconn *pgconn = static_cast<PGconn *>(conn);
+    std::vector<std::string> selected_cols = split_csv_list(config.selected_columns_csv);
+    if (!validate_selected_columns(pgconn, config, selected_cols)) {
+        return false;
+    }
 
     std::string base_query;
     if (!config.sql.empty())
     {
-        base_query = build_select_query(config, srid);
+        base_query = build_select_query(config, srid, conn);
     }
     else if (!config.table.empty() && !config.geometry_field.empty())
     {
-        base_query = build_select_query(config, srid);
+        base_query = build_select_query(config, srid, conn);
     }
     else
     {
         fprintf(stderr, "Error: Either --postgis-sql or both --postgis-table and --postgis-geometry-field are required\n");
         return false;
     }
+    if (base_query.empty()) {
+        fprintf(stderr, "Error: Failed to build PostGIS select query. Please verify geometry/table/columns options.\n");
+        return false;
+    }
 
     if (num_threads > 1)
     {
-        std::string shard_cond = "(abs(hashtext(ctid::text)) % " + std::to_string(num_threads) + ") = " + std::to_string(thread_id);
-
-        size_t from_pos = base_query.find(" FROM ");
-        if (from_pos != std::string::npos)
-        {
-            size_t where_pos = base_query.find(" WHERE ", from_pos);
-            if (where_pos != std::string::npos)
-            {
-                base_query.insert(where_pos + strlen(" WHERE "), shard_cond + " AND ");
-            }
-            else
-            {
-                size_t group_pos = base_query.find(" GROUP BY ", from_pos);
-                size_t order_pos = base_query.find(" ORDER BY ", from_pos);
-                size_t limit_pos = base_query.find(" LIMIT ", from_pos);
-                size_t insert_pos = base_query.size();
-
-                if (group_pos != std::string::npos) insert_pos = group_pos;
-                else if (order_pos != std::string::npos) insert_pos = order_pos;
-                else if (limit_pos != std::string::npos) insert_pos = limit_pos;
-
-                base_query.insert(insert_pos, " WHERE " + shard_cond);
-            }
+        std::string shard_mode = config.shard_mode.empty() ? "auto" : config.shard_mode;
+        ShardPlan plan = prepare_shard_plan(pgconn, config, base_query, thread_id, num_threads);
+        if (plan.fatal) {
+            return false;
         }
+        if (plan.no_work) {
+            log_progress(0, 0, "Thread has no shard range");
+            return true;
+        }
+        base_query = plan.query;
 
-        std::string probe_query = "SELECT 1 FROM (" + base_query + ") AS _probe LIMIT 1";
-        PGresult *probe_res = PQexec((PGconn *)conn, probe_query.c_str());
-        if (PQresultStatus(probe_res) != PGRES_TUPLES_OK)
-        {
-            fprintf(stderr, "Thread %zu: ctid sharding not supported (partitioned table or subquery), falling back to sequential read\n", thread_id);
-            PQclear(probe_res);
-
-            base_query = build_select_query(config, srid);
-            if (thread_id != 0)
-            {
+        if (!plan.applied) {
+            fprintf(stderr, "Thread %zu: sharding not available in mode '%s', falling back to sequential read\n", thread_id, shard_mode.c_str());
+            base_query = build_select_query(config, srid, conn);
+            if (thread_id != 0) {
                 log_progress(0, 0, "Non-primary thread exiting (no sharding support)");
                 return true;
             }
         }
-        else
-        {
-            DEBUG_LOG("Thread %zu/%zu: using hash-based sharding on ctid", thread_id, num_threads);
-        }
-        PQclear(probe_res);
     }
 
     size_t total_count = 0;
-    if (config.enable_progress_report)
+    if (config.enable_progress_report && config.progress_with_exact_count)
     {
+        auto t_count_begin = std::chrono::steady_clock::now();
         std::string count_query = "SELECT COUNT(*) FROM (" + base_query + ") AS _count_subq";
         DEBUG_LOG("Executing count query");
         PGresult *count_res = PQexec((PGconn *)conn, count_query.c_str());
@@ -576,9 +1326,53 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
             DEBUG_LOG("Count query failed: %s", PQerrorMessage((PGconn *)conn));
         }
         PQclear(count_res);
+        t_count_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - t_count_begin)
+                         .count();
     }
 
-    if (config.use_cursor && total_count > config.batch_size)
+    auto find_wkb_field_index = [&](PGresult *res, const char *context) -> int {
+        int nfields = PQnfields(res);
+        for (int i = 0; i < nfields; i++) {
+            if (strcmp(PQfname(res, i), "wkb") == 0) {
+                return i;
+            }
+        }
+        fprintf(stderr, "Thread %zu: WKB geometry field not found in %s result\n", thread_id, context);
+        fprintf(stderr, "Available fields: ");
+        for (int i = 0; i < nfields; i++) {
+            fprintf(stderr, "%s ", PQfname(res, i));
+        }
+        fprintf(stderr, "\n");
+        return -1;
+    };
+
+    auto run_standard_query_mode = [&]() -> bool {
+        fprintf(stderr, "Thread %zu: Using standard query mode\n", thread_id);
+        PGresult *res = PQexec((PGconn *)conn, base_query.c_str());
+        if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+            fprintf(stderr, "Thread %zu: Query failed: %s\n", thread_id, PQerrorMessage((PGconn *)conn));
+            PQclear(res);
+            return false;
+        }
+        int ntuples = PQntuples(res);
+        fprintf(stderr, "Thread %zu: Processing %d features\n", thread_id, ntuples);
+        int wkb_field_index = find_wkb_field_index(res, "query");
+        if (wkb_field_index == -1) {
+            PQclear(res);
+            return false;
+        }
+        process_batch(res, sst, layer, layername, wkb_field_index, thread_id);
+        PQclear(res);
+        return true;
+    };
+
+    auto close_cursor_tx = [&](const std::string &cursor_name) {
+        execute_query("CLOSE " + cursor_name);
+        execute_query("COMMIT");
+    };
+
+    if (config.use_cursor && (total_count == 0 || total_count > config.batch_size))
     {
         fprintf(stderr, "Thread %zu: Using cursor-based batch processing (batch size: %zu)\n",
                 thread_id, config.batch_size);
@@ -627,24 +1421,11 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
                     break;
                 }
 
-                int wkb_field_index = -1;
-                int nfields = PQnfields(res);
-
-                for (int i = 0; i < nfields; i++)
-                {
-                    if (strcmp(PQfname(res, i), "wkb") == 0)
-                    {
-                        wkb_field_index = i;
-                        break;
-                    }
-                }
-
+                int wkb_field_index = find_wkb_field_index(res, "cursor");
                 if (wkb_field_index == -1)
                 {
-                    fprintf(stderr, "Thread %zu: WKB geometry field not found in cursor result\n", thread_id);
                     PQclear(res);
-                    execute_query("CLOSE " + cursor_name);
-                    execute_query("COMMIT");
+                    close_cursor_tx(cursor_name);
                     return false;
                 }
 
@@ -662,102 +1443,33 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
                 }
             }
 
-            execute_query("CLOSE " + cursor_name);
-            execute_query("COMMIT");
+            close_cursor_tx(cursor_name);
         }
         else
         {
-            fprintf(stderr, "Thread %zu: Using standard query mode\n", thread_id);
-
-            PGresult *res = PQexec((PGconn *)conn, base_query.c_str());
-            if (PQresultStatus(res) != PGRES_TUPLES_OK)
-            {
-                fprintf(stderr, "Thread %zu: Query failed: %s\n", thread_id, PQerrorMessage((PGconn *)conn));
-                PQclear(res);
+            if (!run_standard_query_mode()) {
                 return false;
             }
-
-            int ntuples = PQntuples(res);
-            fprintf(stderr, "Thread %zu: Processing %d features\n", thread_id, ntuples);
-
-            int wkb_field_index = -1;
-            int nfields = PQnfields(res);
-
-            for (int i = 0; i < nfields; i++)
-            {
-                if (strcmp(PQfname(res, i), "wkb") == 0)
-                {
-                    wkb_field_index = i;
-                    break;
-                }
-            }
-
-            if (wkb_field_index == -1)
-            {
-                fprintf(stderr, "Thread %zu: WKB geometry field not found in query result\n", thread_id);
-                fprintf(stderr, "Available fields: ");
-                for (int i = 0; i < nfields; i++)
-                {
-                    fprintf(stderr, "%s ", PQfname(res, i));
-                }
-                fprintf(stderr, "\n");
-                PQclear(res);
-                return false;
-            }
-
-            process_batch(res, sst, layer, layername, wkb_field_index, thread_id);
-
-            PQclear(res);
         }
     }
     else
     {
-        fprintf(stderr, "Thread %zu: Using standard query mode\n", thread_id);
-
-        PGresult *res = PQexec((PGconn *)conn, base_query.c_str());
-        if (PQresultStatus(res) != PGRES_TUPLES_OK)
-        {
-            fprintf(stderr, "Thread %zu: Query failed: %s\n", thread_id, PQerrorMessage((PGconn *)conn));
-            PQclear(res);
+        if (!run_standard_query_mode()) {
             return false;
         }
-
-        int ntuples = PQntuples(res);
-        fprintf(stderr, "Thread %zu: Processing %d features\n", thread_id, ntuples);
-
-        int wkb_field_index = -1;
-        int nfields = PQnfields(res);
-
-        for (int i = 0; i < nfields; i++)
-        {
-            if (strcmp(PQfname(res, i), "wkb") == 0)
-            {
-                wkb_field_index = i;
-                break;
-            }
-        }
-
-        if (wkb_field_index == -1)
-        {
-            fprintf(stderr, "Thread %zu: WKB geometry field not found in query result\n", thread_id);
-            fprintf(stderr, "Available fields: ");
-            for (int i = 0; i < nfields; i++)
-            {
-                fprintf(stderr, "%s ", PQfname(res, i));
-            }
-            fprintf(stderr, "\n");
-            PQclear(res);
-            return false;
-        }
-
-        process_batch(res, sst, layer, layername, wkb_field_index, thread_id);
-
-        PQclear(res);
     }
 
     log_progress(total_features_processed.load(), total_count, "Completed");
     fprintf(stderr, "Thread %zu: Total features processed: %zu in %zu batches (parse errors: %zu)\n",
             thread_id, total_features_processed.load(), total_batches_processed.load(), parse_errors_.load());
+    if (config.profile) {
+        long long t_total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now() - t_start)
+                                   .count();
+        fprintf(stderr,
+                "PostGIS profile (thread=%zu): total=%lld ms, count=%lld ms, features=%zu, batches=%zu\n",
+                thread_id, t_total_ms, t_count_ms, total_features_processed.load(), total_batches_processed.load());
+    }
 
     return true;
 }

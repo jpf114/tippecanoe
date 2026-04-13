@@ -23,6 +23,12 @@ struct GlobalStats {
     size_t total_retries;
     size_t total_errors;
     size_t total_discarded;
+    size_t pool_unavailable_batches;
+    size_t retry_exhausted_batches;
+    size_t insert_batches;
+    size_t upsert_batches;
+    size_t insert_discarded_tiles;
+    size_t upsert_discarded_tiles;
 };
 
 GlobalStats get_global_stats();

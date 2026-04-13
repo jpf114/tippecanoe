@@ -1,7 +1,7 @@
-BUILDTYPE ?= Debug
-BUILD_INFO ?= ./build/$(BUILDTYPE)
-PREFIX ?= ./bin/$(BUILDTYPE)
+PREFIX ?= /usr/local
 MANDIR ?= $(PREFIX)/share/man/man1/
+BUILDTYPE ?= Release
+BUILD_INFO ?=
 SHELL = /bin/sh
 
 
@@ -30,11 +30,13 @@ else
 	FINAL_FLAGS := -g $(WARNING_FLAGS) $(DEBUG_FLAGS)
 endif
 
-all: tippecanoe tippecanoe-enumerate tippecanoe-decode tile-join unit tippecanoe-json-tool tippecanoe-overzoom tippecanoe-db
+all: tippecanoe tippecanoe-enumerate tippecanoe-decode tile-join unit tippecanoe-json-tool tippecanoe-overzoom
+
+all-db: all tippecanoe-db
 
 docs: man/tippecanoe.1
 
-install: tippecanoe tippecanoe-enumerate tippecanoe-decode tile-join tippecanoe-json-tool tippecanoe-overzoom tippecanoe-db
+install: tippecanoe tippecanoe-enumerate tippecanoe-decode tile-join tippecanoe-json-tool tippecanoe-overzoom
 	mkdir -p $(PREFIX)/bin
 	mkdir -p $(MANDIR)
 	cp tippecanoe $(PREFIX)/bin/tippecanoe
@@ -42,12 +44,15 @@ install: tippecanoe tippecanoe-enumerate tippecanoe-decode tile-join tippecanoe-
 	cp tippecanoe-decode $(PREFIX)/bin/tippecanoe-decode
 	cp tippecanoe-json-tool $(PREFIX)/bin/tippecanoe-json-tool
 	cp tippecanoe-overzoom $(PREFIX)/bin/tippecanoe-overzoom
-	cp tippecanoe-db $(PREFIX)/bin/tippecanoe-db
 	cp tile-join $(PREFIX)/bin/tile-join
 	cp man/tippecanoe.1 $(MANDIR)/tippecanoe.1
 
+install-db: all-db
+	mkdir -p $(PREFIX)/bin
+	cp tippecanoe-db $(PREFIX)/bin/tippecanoe-db
+
 uninstall:
-	 rm $(PREFIX)/bin/tippecanoe $(PREFIX)/bin/tippecanoe-enumerate $(PREFIX)/bin/tippecanoe-decode $(PREFIX)/bin/tile-join $(MANDIR)/tippecanoe.1 $(PREFIX)/bin/tippecanoe-json-tool $(PREFIX)/bin/tippecanoe-overzoom $(PREFIX)/bin/tippecanoe-db
+	rm $(PREFIX)/bin/tippecanoe $(PREFIX)/bin/tippecanoe-enumerate $(PREFIX)/bin/tippecanoe-decode $(PREFIX)/bin/tile-join $(MANDIR)/tippecanoe.1 $(PREFIX)/bin/tippecanoe-json-tool $(PREFIX)/bin/tippecanoe-overzoom $(PREFIX)/bin/tippecanoe-db
 
 man/tippecanoe.1: README.md
 	md2man-roff README.md > man/tippecanoe.1
@@ -63,8 +68,8 @@ PGIS_LIB = -L/usr/lib
 INCLUDES = -I/usr/local/include -I. -Iclipper2/include
 LIBS = -L/usr/local/lib
 
-tippecanoe: geojson.o jsonpull/jsonpull.o tile.o pool.o mbtiles.o geometry.o projection.o memfile.o mvt.o serial.o main.o common_main.o platform.o text.o dirtiles.o pmtiles_file.o plugin.o read_json.o write_json.o geobuf.o flatgeobuf.o evaluator.o geocsv.o csv.o geojson-loop.o json_logger.o visvalingam.o compression.o clip.o sort.o attribute.o thread.o shared_borders.o postgis.o wkb_parser.o error_logger.o clipper2/src/clipper.engine.o
-	$(CXX) $(PG) $(LIBS) $(PGIS_LIB) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lm -lz -lsqlite3 -lpthread -lpq
+tippecanoe: geojson.o jsonpull/jsonpull.o tile.o pool.o mbtiles.o geometry.o projection.o memfile.o mvt.o serial.o main.o platform.o text.o dirtiles.o pmtiles_file.o plugin.o read_json.o write_json.o geobuf.o flatgeobuf.o evaluator.o geocsv.o csv.o geojson-loop.o json_logger.o visvalingam.o compression.o clip.o sort.o attribute.o thread.o shared_borders.o clipper2/src/clipper.engine.o
+	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lm -lz -lsqlite3 -lpthread
 
 tippecanoe-db: geojson.o jsonpull/jsonpull.o tile-db.o pool.o mbtiles.o geometry.o projection.o memfile.o mvt.o serial.o maindb.o common_main.o platform.o text.o dirtiles.o plugin.o read_json.o write_json.o evaluator.o geojson-loop.o json_logger.o visvalingam.o compression.o clip.o sort.o attribute.o thread.o shared_borders.o postgis.o wkb_parser.o error_logger.o mongo.o postgis_manager.o mongo_manager.o clipper2/src/clipper.engine.o
 	$(CXX) $(PG) $(LIBS) $(PGIS_LIB) -I/usr/local/include/libmongoc-1.0 -I/usr/local/include/bson-1.0 -I/usr/local/include/bsoncxx/v_noabi -I/usr/local/include/mongocxx/v_noabi -L/usr/local/lib $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lm -lz -lsqlite3 -lpthread -lpq -lmongocxx -lbsoncxx
@@ -90,6 +95,14 @@ tippecanoe-overzoom: overzoom.o mvt.o clip.o evaluator.o jsonpull/jsonpull.o tex
 -include $(wildcard *.d)
 
 # Special rules must come before generic rules
+# Special rule for postgis.o with PostgreSQL headers
+postgis.o: postgis.cpp
+	$(CXX) -MMD $(PG) $(PGIS_INCLUDE) $(INCLUDES) $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
+
+# Special rule for postgis_manager.o with PostgreSQL headers
+postgis_manager.o: postgis_manager.cpp
+	$(CXX) -MMD $(PG) $(PGIS_INCLUDE) $(INCLUDES) $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
+
 # Special rule for mongo.o with MongoDB headers
 mongo.o: mongo.cpp
 	$(CXX) -MMD $(PG) $(PGIS_INCLUDE) $(INCLUDES) -I/usr/local/include/libmongoc-1.0 -I/usr/local/include/bson-1.0 -I/usr/local/include/bsoncxx/v_noabi -I/usr/local/include/mongocxx/v_noabi $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
@@ -107,13 +120,13 @@ maindb.o: maindb.cpp
 	$(CXX) -MMD $(PG) $(PGIS_INCLUDE) $(INCLUDES) -I/usr/local/include/libmongoc-1.0 -I/usr/local/include/bson-1.0 -I/usr/local/include/bsoncxx/v_noabi -I/usr/local/include/mongocxx/v_noabi $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
 
 %.o: %.c
-	$(CC) -MMD $(PG) $(PGIS_INCLUDE) $(INCLUDES) $(FINAL_FLAGS) $(CFLAGS) -c -o $@ $<
+	$(CC) -MMD $(PG) $(INCLUDES) $(FINAL_FLAGS) $(CFLAGS) -c -o $@ $<
 
 %.o: %.cpp
-	$(CXX) -MMD $(PG) $(PGIS_INCLUDE) $(INCLUDES) $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
+	$(CXX) -MMD $(PG) $(INCLUDES) $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
 
 clean:
-	 rm -f ./tippecanoe ./tippecanoe-* ./tippecanoe-db ./tile-join ./unit *.o *.d */*.o */*.d tests/**/*.mbtiles tests/**/*.check
+	rm -f ./tippecanoe ./tippecanoe-* ./tippecanoe-db ./tile-join ./unit *.o *.d */*.o */*.d tests/**/*.mbtiles tests/**/*.check
 
 indent:
 	clang-format -i -style="{BasedOnStyle: Google, IndentWidth: 8, UseTab: Always, AllowShortIfStatementsOnASingleLine: false, ColumnLimit: 0, ContinuationIndentWidth: 8, SpaceAfterCStyleCast: true, IndentCaseLabels: false, AllowShortBlocksOnASingleLine: false, AllowShortFunctionsOnASingleLine: false, SortIncludes: false}" $(filter-out flatgeobuf.cpp,$(C)) $(H) jsonpull/*.[ch]

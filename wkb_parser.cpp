@@ -108,6 +108,11 @@ class WKBReader {
         for (uint32_t i = 0; i < nrings; i++) {
             parse_polygon_ring(out, has_z, has_m);
         }
+        // Match GeoJSON ingestion semantics: one CLOSEPATH terminator per polygon
+        // so downstream fix_polygon() can reset outer/inner ring state correctly.
+        if (nrings > 0) {
+            out.push_back(draw(VT_CLOSEPATH, 0, 0));
+        }
     }
 
     int parse_geometry(drawvec& out, bool top_level = true) {

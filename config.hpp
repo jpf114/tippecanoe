@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include <cctype>
 
 // PostgreSQL/PostGIS Configuration
 constexpr size_t MAX_POSTGRES_CONNECTIONS = 50;
@@ -48,6 +49,27 @@ inline std::vector<std::string> split_by_delimiter(const std::string &str, char 
     }
     parts.push_back(current);
     return parts;
+}
+
+inline std::vector<std::string> split_csv_list(const std::string &csv) {
+    std::vector<std::string> parts = split_by_delimiter(csv, ',');
+    std::vector<std::string> out;
+    out.reserve(parts.size());
+    for (size_t i = 0; i < parts.size(); i++) {
+        const std::string &s = parts[i];
+        size_t start = 0;
+        while (start < s.size() && std::isspace(static_cast<unsigned char>(s[start]))) {
+            start++;
+        }
+        size_t end = s.size();
+        while (end > start && std::isspace(static_cast<unsigned char>(s[end - 1]))) {
+            end--;
+        }
+        if (end > start) {
+            out.push_back(s.substr(start, end - start));
+        }
+    }
+    return out;
 }
 
 // Debug Configuration

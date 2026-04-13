@@ -99,6 +99,12 @@ GlobalStats get_global_stats() {
     stats.total_retries = MongoWriter::get_global_total_retries();
     stats.total_errors = MongoWriter::get_global_total_errors();
     stats.total_discarded = MongoWriter::get_global_total_discarded();
+    stats.pool_unavailable_batches = MongoWriter::get_global_pool_unavailable_batches();
+    stats.retry_exhausted_batches = MongoWriter::get_global_retry_exhausted_batches();
+    stats.insert_batches = MongoWriter::get_global_insert_batches();
+    stats.upsert_batches = MongoWriter::get_global_upsert_batches();
+    stats.insert_discarded_tiles = MongoWriter::get_global_insert_discarded_tiles();
+    stats.upsert_discarded_tiles = MongoWriter::get_global_upsert_discarded_tiles();
     return stats;
 }
 
@@ -110,6 +116,12 @@ void print_stats(const GlobalStats& stats, bool quiet) {
         fprintf(stderr, "  Total retries: %zu\n", stats.total_retries);
         fprintf(stderr, "  Total errors: %zu\n", stats.total_errors);
         fprintf(stderr, "  Total tiles discarded: %zu\n", stats.total_discarded);
+        fprintf(stderr, "  Pool-unavailable batches: %zu\n", stats.pool_unavailable_batches);
+        fprintf(stderr, "  Retry-exhausted batches: %zu\n", stats.retry_exhausted_batches);
+        fprintf(stderr, "  Insert batches written: %zu\n", stats.insert_batches);
+        fprintf(stderr, "  Upsert batches written: %zu\n", stats.upsert_batches);
+        fprintf(stderr, "  Insert discarded tiles: %zu\n", stats.insert_discarded_tiles);
+        fprintf(stderr, "  Upsert discarded tiles: %zu\n", stats.upsert_discarded_tiles);
     }
 }
 

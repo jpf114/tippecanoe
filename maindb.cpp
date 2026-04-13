@@ -156,8 +156,35 @@ static void validate_mongo_config() {
 	mongo_cfg.normalize();
 
 	if (!quiet) {
-		fprintf(stderr, "MongoDB output enabled: %s.%s (batch size: %zu)\n",
-				mongo_cfg.dbname.c_str(), mongo_cfg.collection.c_str(), mongo_cfg.batch_size);
+		fprintf(stderr, "MongoDB output enabled: %s.%s (batch size: %zu, fail-on-discard: %s)\n",
+				mongo_cfg.dbname.c_str(), mongo_cfg.collection.c_str(), mongo_cfg.batch_size,
+				mongo_cfg.fail_on_discard ? "true" : "false");
+	}
+}
+
+static void validate_runtime_config() {
+	if (use_postgis) {
+		if (!postgis_cfg.selected_columns_csv.empty() && split_csv_list(postgis_cfg.selected_columns_csv).empty()) {
+			fprintf(stderr, "Error: --postgis-columns is empty after parsing\n");
+			exit(EXIT_ARGS);
+		}
+		if (postgis_cfg.selected_columns_best_effort && postgis_cfg.selected_columns_csv.empty()) {
+			fprintf(stderr, "Error: --postgis-columns-best-effort requires --postgis-columns\n");
+			exit(EXIT_ARGS);
+		}
+
+		if ((postgis_cfg.shard_mode == "key" || postgis_cfg.shard_mode == "range") && postgis_cfg.shard_key.empty()) {
+			fprintf(stderr, "Error: --postgis-shard-key is required when --postgis-shard-mode=%s\n", postgis_cfg.shard_mode.c_str());
+			exit(EXIT_ARGS);
+		}
+
+		if (!postgis_cfg.shard_key.empty() && postgis_cfg.shard_mode == "none" && !quiet) {
+			fprintf(stderr, "Warning: --postgis-shard-key is ignored when --postgis-shard-mode=none\n");
+		}
+	}
+
+	if (use_mongo && !mongo_cfg.fail_on_discard && !quiet) {
+		fprintf(stderr, "Warning: MongoDB is running in best-effort mode (--mongo-no-fail-on-discard)\n");
 	}
 }
 
@@ -192,6 +219,10 @@ static void read_postgis_data(std::string &layername, const char *fname,
                               const char *tmpdir,
                               const char *prefilter, const char *postfilter,
                               double &dist_sum, size_t &dist_count, double &area_sum) {
+	(void) fname;
+	(void) gamma;
+	(void) tmpdir;
+
 	if (!quiet) {
 		fprintf(stderr, "Reading from PostGIS database: %s@%s:%s/%s\n",
 			postgis_cfg.user.c_str(), postgis_cfg.host.c_str(), postgis_cfg.port.c_str(), postgis_cfg.dbname.c_str());
@@ -407,6 +438,7 @@ std::pair<int, metadata> read_input(std::string &layername, const char *fname, i
 
 	validate_postgis_config();
 	validate_mongo_config();
+	validate_runtime_config();
 
 	double dist_sum = 0;
 	size_t dist_count = 0;
@@ -1390,7 +1422,7 @@ std::pair<int, metadata> read_input(std::string &layername, const char *fname, i
 	metadata m = make_metadata(fname, minzoom, maxzoom, minlat, minlon, maxlat, maxlon, minlat2, minlon2, maxlat2, maxlon2, midlat, midlon, attribution, merged_lm, true, description, !prevent[P_TILE_STATS], attribute_descriptions, "tippecanoe-db", commandline, strategies, basezoom, droprate, retain_points_multiplier);
 	if (outdb != NULL) {
 		mbtiles_write_metadata(outdb, m, forcetable);
-	} else {
+	} else if (outdir != NULL) {
 		dir_write_metadata(outdir, m);
 	}
 
@@ -1558,6 +1590,14 @@ int maindb(int argc, char **argv) {
 		{"postgis-table", required_argument, 0, '~'},
 		{"postgis-geometry-field", required_argument, 0, '~'},
 		{"postgis-sql", required_argument, 0, '~'},
+		{"postgis-columns", required_argument, 0, '~'},
+		{"postgis-columns-best-effort", no_argument, 0, '~'},
+		{"postgis-canonical-attr-order", no_argument, 0, '~'},
+		{"postgis-no-canonical-attr-order", no_argument, 0, '~'},
+		{"postgis-profile", no_argument, 0, '~'},
+		{"postgis-shard-key", required_argument, 0, '~'},
+		{"postgis-shard-mode", required_argument, 0, '~'},
+		{"postgis-progress-count", no_argument, 0, '~'},
 
 		{"MongoDB output", 0, 0, 0},
 		{"mongo", required_argument, 0, '~'},
@@ -1574,6 +1614,8 @@ int maindb(int argc, char **argv) {
 		{"mongo-no-indexes", no_argument, 0, '~'},
 		{"mongo-drop-collection", no_argument, 0, '~'},
 		{"mongo-metadata", no_argument, 0, '~'},
+		{"mongo-fail-on-discard", no_argument, 0, '~'},
+		{"mongo-no-fail-on-discard", no_argument, 0, '~'},
 
 		{"Projection of input", 0, 0, 0},
 		{"projection", required_argument, 0, 's'},
@@ -1877,6 +1919,37 @@ int maindb(int argc, char **argv) {
 			} else if (strcmp(opt, "postgis-sql") == 0) {
 				postgis_cfg.sql = optarg;
 				use_postgis = true;
+			} else if (strcmp(opt, "postgis-columns") == 0) {
+				postgis_cfg.selected_columns_csv = optarg;
+				use_postgis = true;
+			} else if (strcmp(opt, "postgis-columns-best-effort") == 0) {
+				postgis_cfg.selected_columns_best_effort = true;
+				use_postgis = true;
+			} else if (strcmp(opt, "postgis-canonical-attr-order") == 0) {
+				postgis_cfg.canonical_attr_order = true;
+				use_postgis = true;
+			} else if (strcmp(opt, "postgis-no-canonical-attr-order") == 0) {
+				postgis_cfg.canonical_attr_order = false;
+				use_postgis = true;
+			} else if (strcmp(opt, "postgis-profile") == 0) {
+				postgis_cfg.profile = true;
+				use_postgis = true;
+			} else if (strcmp(opt, "postgis-shard-key") == 0) {
+				postgis_cfg.shard_key = optarg;
+				use_postgis = true;
+			} else if (strcmp(opt, "postgis-shard-mode") == 0) {
+				postgis_cfg.shard_mode = optarg;
+				if (postgis_cfg.shard_mode != "auto" &&
+				    postgis_cfg.shard_mode != "none" &&
+				    postgis_cfg.shard_mode != "key" &&
+				    postgis_cfg.shard_mode != "range") {
+					fprintf(stderr, "%s: --postgis-shard-mode must be one of auto|none|key|range (got %s)\n", argv[0], optarg);
+					exit(EXIT_ARGS);
+				}
+				use_postgis = true;
+			} else if (strcmp(opt, "postgis-progress-count") == 0) {
+				postgis_cfg.progress_with_exact_count = true;
+				use_postgis = true;
 			} else if (strcmp(opt, "mongo") == 0) {
 				// 解析单行配置：host:port:dbname:user:password:auth_source:collection
 				if (!mongo_cfg.parse_connection_string(optarg)) {
@@ -1922,6 +1995,12 @@ int maindb(int argc, char **argv) {
 				use_mongo = true;
 			} else if (strcmp(opt, "mongo-metadata") == 0) {
 				mongo_cfg.write_metadata = true;
+				use_mongo = true;
+			} else if (strcmp(opt, "mongo-fail-on-discard") == 0) {
+				mongo_cfg.fail_on_discard = true;
+				use_mongo = true;
+			} else if (strcmp(opt, "mongo-no-fail-on-discard") == 0) {
+				mongo_cfg.fail_on_discard = false;
 				use_mongo = true;
 			} else {
 				fprintf(stderr, "%s: Unrecognized option --%s\n", argv[0], opt);
@@ -2408,8 +2487,9 @@ int maindb(int argc, char **argv) {
 	// 2. 调用 read_input() 读取 PostGIS 数据并写入瓦片
 	// read_input 内部会调用 traverse_zooms 进行瓦片写入
 	std::string postgis_layer = postgis_cfg.table.empty() ? "postgis" : postgis_cfg.table;
+	const char *read_input_name = out_mbtiles ? out_mbtiles : (out_dir ? out_dir : "mongo-output");
 	DEBUG_LOG("Layer configuration: %s", postgis_layer.c_str());
-	auto input_ret = read_input(postgis_layer, out_mbtiles ? out_mbtiles : out_dir,
+	auto input_ret = read_input(postgis_layer, read_input_name,
 		    maxzoom, minzoom, basezoom, basezoom_marker_width, outdb, out_dir, &exclude, &include, exclude_all, filter, droprate, buffer, tmpdir, gamma, forcetable, NULL, gamma != 0, file_bbox, file_bbox1, file_bbox2, prefilter, postfilter, NULL, guess_maxzoom, guess_cluster_maxzoom, &attribute_types, argv[0], &attribute_accum, attribute_descriptions, commandline, minimum_maxzoom);
 
 	ret = std::get<0>(input_ret);
@@ -2436,13 +2516,6 @@ int maindb(int argc, char **argv) {
 	muntrace();
 #endif
 
-	i = open(get_null_device(), O_RDONLY | O_CLOEXEC);
-	// i < files_open_at_start is not an error, because reading from a pipe closes stdin
-	if (i > files_open_at_start) {
-		fprintf(stderr, "Internal error: did not close all files: %d\n", i);
-		exit(EXIT_IMPOSSIBLE);
-	}
-
 	if (filter != NULL) {
 		json_free(filter);
 	}
@@ -2456,20 +2529,31 @@ int maindb(int argc, char **argv) {
 		MongoDB::print_stats(stats, quiet);
 
 		if (stats.total_errors > 0) {
-			fprintf(stderr, "Error: MongoDB had %zu errors during write operations\n", stats.total_errors);
-			if (ret == 0) {
+			fprintf(stderr, "%s: MongoDB had %zu errors during write operations\n",
+				mongo_cfg.fail_on_discard ? "Error" : "Warning",
+				stats.total_errors);
+			if (mongo_cfg.fail_on_discard && ret == 0) {
 				ret = EXIT_MONGO;
 			}
 		}
 
 		if (stats.total_discarded > 0) {
 			fprintf(stderr, "Warning: MongoDB discarded %zu tiles due to persistent write failures\n", stats.total_discarded);
-			if (ret == 0) {
+			if (mongo_cfg.fail_on_discard && ret == 0) {
 				ret = EXIT_MONGO;
 			}
 		}
 
 		MongoDB::shutdown_global();
+	}
+
+	if (!use_mongo) {
+		i = open(get_null_device(), O_RDONLY | O_CLOEXEC);
+		// i < files_open_at_start is not an error, because reading from a pipe closes stdin
+		if (i > files_open_at_start) {
+			fprintf(stderr, "Internal error: did not close all files: %d\n", i);
+			exit(EXIT_IMPOSSIBLE);
+		}
 	}
 
 	ErrorLogger::instance().print_summary(quiet);
