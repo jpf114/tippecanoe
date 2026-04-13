@@ -1,7 +1,7 @@
 # tippecanoe-db 详细设计文档
 
-> 版本：1.0  
-> 最后更新：2026-04-09  
+> 版本：2.0  
+> 最后更新：2026-04-13  
 > 适用范围：tippecanoe-db 定制化切片工具
 
 ---
@@ -236,56 +236,87 @@ WKBResult parse_wkb_hex(const std::string& hex);
 
 **类：`MongoWriter`**
 
+**连接池架构（v2.0 重构）：**
+
+```
+全局共享:
+  mongocxx::pool (连接池)
+    ├── 由 get_or_create_pool() 创建
+    ├── pool_created (atomic<bool>) 保护
+    └── 多线程共享连接
+
+线程局部 (TLS):
+  thread_local MongoWriter*
+    ├── batch_buffer (每线程独立)
+    ├── batch_coords (每线程独立)
+    └── 统计计数器 (atomic)
+
+全局状态 (mutex 保护):
+  erased_zooms (set<int>)
+    ├── 记录已删除的 zoom 级别
+    └── 用于选择性 upsert
+```
+
 **写入模式：**
 
 | 模式 | 触发条件 | 实现方式 | 性能 |
 |------|---------|---------|------|
-| insert | `drop_collection_before_write=true` | `insert_many(ordered=false)` | 高（无需索引查找） |
-| upsert | `drop_collection_before_write=false` | `bulk_write(replace_one, upsert=true)` | 中（需索引匹配） |
+| insert | zoom 未被 erase | `insert_many(ordered=false)` | 高（无需索引查找） |
+| upsert | zoom 已被 erase | `bulk_write(replace_one, upsert=true)` | 中（需索引匹配） |
 
-**批量写入流程：**
+**批量写入流程（v2.0 重构）：**
 
 ```
 write_tile(z, x, y, data, len)
-  ├── 背压检查: pending_writes >= MAX_PENDING_WRITES(5000) → sleep
   ├── 构建 BSON 文档: {z, x, y, d: Binary(gzip_compressed_data)}
   ├── 加入 batch_buffer
   └── buffer 满 (≥ batch_size) → flush_batch()
 
 flush_batch()
+  ├── get_erased_zooms_snapshot() — 一次加锁获取快照
+  ├── 单次遍历分离 insert_buf / upsert_buf
+  ├── flush_batch_with_retry(false, insert_buf) — insert 模式
+  └── flush_batch_with_retry(true, upsert_buf) — upsert 模式
+
+flush_batch_with_retry(upsert_mode, batch_buf, coords)
   ├── build_write_concern() — 构建写入关注级别
   ├── insert 模式: collection.insert_many(views, ordered=false)
   ├── upsert 模式: collection.create_bulk_write() + replace_one(upsert=true)
-  ├── 成功: pending_writes -= batch_size, 清空 buffer
-  └── 失败: 重试 max_retries 次, 记录到 ErrorLogger
-      ├── 重连: 指数退避 (100ms → 200ms → ... → 5000ms)
-      └── 持续失败 (≥3轮): 丢弃数据防止卡死
+  ├── 成功: 更新统计计数器
+  └── 失败: 重试 max_retries 次
+      ├── 指数退避 + 随机抖动 (100ms → ... → 30000ms 上限)
+      └── 持续失败 (≥2轮): 丢弃数据并记录 total_discarded_tiles
 ```
 
-**线程安全设计：**
+**线程安全设计（v2.0 重构）：**
 
 ```
 全局:
   mongocxx::instance (单例, initialize_global())
+  mongocxx::pool (连接池, mutex + atomic 保护)
+  erased_zooms (set<int>, mutex 保护)
   std::once_flag (collection_drop_flag, index_create_flag)
 
 线程局部:
   thread_local std::unique_ptr<MongoWriter> tls_mongo_writer
-  每个工作线程独立的 client、collection、batch_buffer
+  每个工作线程独立的 batch_buffer、batch_coords
 
 原子计数器:
-  std::atomic<size_t> pending_writes (全局背压)
   std::atomic<size_t> total_tiles_written (TLS 统计)
+  std::atomic<size_t> total_discarded_tiles (丢弃统计)
   std::atomic<size_t> global_total_tiles (全局统计汇总)
 ```
 
-**元数据写入：**
+**元数据写入（v2.0 重构）：**
 
 ```cpp
-void write_metadata(const std::string &json_metadata);
+void write_metadata_bson(const struct metadata &meta);
 // 写入到 {collection}_metadata 集合
-// 文档结构: { metadata: JSON字符串, collection: 集合名, timestamp: 毫秒时间戳 }
-// 每次写入前先 drop 旧集合
+// 文档结构: BSON 原生构建，包含完整字段：
+//   - name, description, version, type, format
+//   - minzoom, maxzoom, bounds, center
+//   - vector_layers, tilestats (v2.0 新增)
+//   - collection, timestamp
 ```
 
 **索引创建：**
@@ -589,13 +620,26 @@ namespace PostGIS {
 // MongoDB 写入
 class MongoWriter {
     static void initialize_global();
-    static MongoWriter* get_thread_local_instance(const mongo_config& cfg);
-    static void destroy_current_thread_instance();
+    static MongoWriter* get_writer_instance(const mongo_config& cfg);
+    static void destroy_writer_instance();
     void write_tile(int z, int x, int y, const char* data, size_t len);
     void flush_all() noexcept;
-    void write_metadata(const std::string& json_metadata);
+    void write_metadata_bson(const struct metadata& meta);
     void erase_zoom(int z);
+    bool should_use_upsert_for_zoom(int z) const;
+    
+    struct tile_coords { int z, x, y; };
 };
+
+// MongoDB 统计
+struct GlobalStats {
+    size_t total_tiles;
+    size_t total_batches;
+    size_t total_retries;
+    size_t total_errors;
+    size_t total_discarded;  // v2.0 新增
+};
+GlobalStats get_global_stats();
 
 // 错误日志
 class ErrorLogger {
