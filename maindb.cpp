@@ -33,6 +33,7 @@
 #include <set>
 #include <map>
 #include <cmath>
+#include <memory>
 
 #if defined(__APPLE__) || defined(__FreeBSD__)
 #include <sys/types.h>
@@ -160,6 +161,24 @@ static void validate_mongo_config() {
 	}
 }
 
+static void auto_adjust_mongo_batch_size(size_t total_features, int maxzoom) {
+	if (mongo_cfg.batch_size != DEFAULT_MONGO_BATCH_SIZE) {
+		return;
+	}
+
+	size_t estimated_tiles = MongoDB::estimate_tile_count(total_features, 0, maxzoom);
+	size_t suggested_batch = MongoDB::suggest_batch_size(estimated_tiles);
+
+	mongo_cfg.batch_size = suggested_batch;
+	mongo_cfg.normalize();
+
+	if (!quiet) {
+		fprintf(stderr, "Auto-adjusted MongoDB batch size to %zu "
+				"(processed %zu features, estimated %zu tiles)\n",
+				mongo_cfg.batch_size, total_features, estimated_tiles);
+	}
+}
+
 static void read_postgis_data(std::string &layername, const char *fname,
                               std::vector<struct reader> &readers,
                               std::atomic<long long> &progress_seq,
@@ -178,13 +197,6 @@ static void read_postgis_data(std::string &layername, const char *fname,
 			postgis_cfg.user.c_str(), postgis_cfg.host.c_str(), postgis_cfg.port.c_str(), postgis_cfg.dbname.c_str());
 	}
 
-	PostGISReader reader(postgis_cfg);
-	if (!reader.connect()) {
-		fprintf(stderr, "Failed to connect to PostGIS database\n");
-		exit(EXIT_OPEN);
-	}
-	reader.disconnect();
-
 	layermap_entry e = layermap_entry(0);
 	e.description = "PostGIS layer";
 	std::map<std::string, layermap_entry> layermap;
@@ -197,17 +209,17 @@ static void read_postgis_data(std::string &layername, const char *fname,
 	std::vector<struct serialization_state> sst;
 	sst.resize(CPUS);
 
-	std::vector<std::atomic<long long>> layer_seq_v(CPUS);
+	auto layer_seq_arr = std::make_unique<std::atomic<long long>[]>(CPUS);
 	std::vector<double> dist_sums_v(CPUS, 0);
 	std::vector<size_t> dist_counts_v(CPUS, 0);
 	std::vector<double> area_sums_v(CPUS, 0);
-	std::atomic<long long> *layer_seq = layer_seq_v.data();
+	std::atomic<long long> *layer_seq = layer_seq_arr.get();
 	double *dist_sums = dist_sums_v.data();
 	size_t *dist_counts = dist_counts_v.data();
 	double *area_sums = area_sums_v.data();
 
 	for (size_t i = 0; i < CPUS; i++) {
-		layer_seq[i] = overall_offset;
+		layer_seq[i].store(overall_offset);
 
 		sst[i].fname = "PostGIS";
 		sst[i].line = 0;
@@ -242,19 +254,7 @@ static void read_postgis_data(std::string &layername, const char *fname,
 	}
 	total_features = parallel_reader.get_total_features();
 
-	if (mongo_cfg.batch_size == DEFAULT_MONGO_BATCH_SIZE) {
-		size_t estimated_tiles = MongoDB::estimate_tile_count(total_features.load(), 0, maxzoom);
-		size_t suggested_batch = MongoDB::suggest_batch_size(estimated_tiles);
-
-		mongo_cfg.batch_size = suggested_batch;
-		mongo_cfg.normalize();
-
-		if (!quiet) {
-			fprintf(stderr, "Auto-adjusted MongoDB batch size to %zu "
-					"(processed %zu features, estimated %zu tiles)\n",
-					mongo_cfg.batch_size, total_features.load(), estimated_tiles);
-		}
-	}
+	auto_adjust_mongo_batch_size(total_features.load(), maxzoom);
 
 	for (size_t i = 0; i < CPUS; i++) {
 		dist_sum += dist_sums[i];
@@ -2415,11 +2415,11 @@ int maindb(int argc, char **argv) {
 	ret = std::get<0>(input_ret);
 
 	// Write metadata to MongoDB if requested
-	if (use_mongo && mongo_cfg.write_metadata && mongo_cfg.dbname != "") {
+	if (use_mongo && mongo_cfg.write_metadata) {
 		struct metadata meta = std::get<1>(input_ret);
 
 		try {
-			MongoWriter* meta_writer = MongoWriter::get_shared_instance(mongo_cfg);
+			MongoWriter* meta_writer = MongoWriter::get_writer_instance(mongo_cfg);
 			if (meta_writer) {
 				meta_writer->write_metadata_bson(meta);
 			}
@@ -2451,12 +2451,19 @@ int maindb(int argc, char **argv) {
 	// 注意：工作线程使用 TLS 实例，需要通过 cleanup_global() 获取统计
 	if (use_mongo) {
 		MongoDB::cleanup_global();
-		
+
 		auto stats = MongoDB::get_global_stats();
 		MongoDB::print_stats(stats, quiet);
-		
+
 		if (stats.total_errors > 0) {
 			fprintf(stderr, "Error: MongoDB had %zu errors during write operations\n", stats.total_errors);
+			if (ret == 0) {
+				ret = EXIT_MONGO;
+			}
+		}
+
+		if (stats.total_discarded > 0) {
+			fprintf(stderr, "Warning: MongoDB discarded %zu tiles due to persistent write failures\n", stats.total_discarded);
 			if (ret == 0) {
 				ret = EXIT_MONGO;
 			}

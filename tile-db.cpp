@@ -2876,11 +2876,11 @@ long long write_tile(decompressor *geoms, std::atomic<long long> *geompos_in, ch
 				// across all worker threads.
 				if (use_mongo) {
 					try {
-						MongoWriter* writer = MongoWriter::get_shared_instance(mongo_cfg);
+						MongoWriter* writer = MongoWriter::get_writer_instance(mongo_cfg);
 						if (writer) {
 							writer->write_tile(z, tx, ty, compressed.data(), compressed.size());
 						} else {
-							fprintf(stderr, "Error: Failed to get MongoDB shared instance for tile %d/%u/%u\n",
+							fprintf(stderr, "Error: Failed to get MongoDB writer instance for tile %d/%u/%u\n",
 							        z, tx, ty);
 						}
 					} catch (const std::exception &e) {
@@ -3377,7 +3377,7 @@ int traverse_zooms(int *geomfd, off_t *geom_size, char *global_stringpool, std::
 				}
 				// MongoDB 也需要删除已生成的 zoom 级别
 				if (use_mongo) {
-					MongoWriter* writer = MongoWriter::get_shared_instance(mongo_cfg);
+					MongoWriter* writer = MongoWriter::get_writer_instance(mongo_cfg);
 					if (writer) {
 						writer->erase_zoom(z);
 					}

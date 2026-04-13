@@ -45,19 +45,7 @@ struct postgis_config
     }
 
     bool parse_connection_string(const std::string &conn_str) {
-        std::vector<std::string> parts;
-        std::string current;
-
-        for (size_t i = 0; i < conn_str.size(); i++) {
-            char c = conn_str[i];
-            if (c == ':') {
-                parts.push_back(current);
-                current.clear();
-            } else {
-                current += c;
-            }
-        }
-        parts.push_back(current);
+        std::vector<std::string> parts = split_by_delimiter(conn_str, ':');
 
         if (parts.size() < 3) {
             fprintf(stderr, "Error: PostGIS connection string must have at least 3 parts\n");

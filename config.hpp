@@ -3,6 +3,8 @@
 
 #include <cstddef>
 #include <cstdio>
+#include <string>
+#include <vector>
 
 // PostgreSQL/PostGIS Configuration
 constexpr size_t MAX_POSTGRES_CONNECTIONS = 50;
@@ -21,6 +23,32 @@ constexpr size_t MAX_MONGO_CONNECTION_POOL_SIZE = 50;
 constexpr size_t DEFAULT_MONGO_CONNECTION_POOL_SIZE = 10;
 constexpr int MONGO_TIMEOUT_MS = 30000;
 constexpr int MONGO_MAX_RETRIES = 3;
+
+// MongoDB Batch Size Thresholds
+constexpr size_t MONGO_BATCH_TIER_1 = 10000;
+constexpr size_t MONGO_BATCH_TIER_2 = 100000;
+constexpr size_t MONGO_BATCH_TIER_3 = 500000;
+constexpr size_t MONGO_BATCH_TIER_4 = 2000000;
+constexpr size_t MONGO_BATCH_SIZE_TIER_1 = 100;
+constexpr size_t MONGO_BATCH_SIZE_TIER_2 = 200;
+constexpr size_t MONGO_BATCH_SIZE_TIER_3 = 500;
+constexpr size_t MONGO_BATCH_SIZE_TIER_4 = 800;
+constexpr size_t MONGO_BATCH_SIZE_TIER_5 = 1000;
+
+inline std::vector<std::string> split_by_delimiter(const std::string &str, char delim) {
+    std::vector<std::string> parts;
+    std::string current;
+    for (size_t i = 0; i < str.size(); i++) {
+        if (str[i] == delim) {
+            parts.push_back(current);
+            current.clear();
+        } else {
+            current += str[i];
+        }
+    }
+    parts.push_back(current);
+    return parts;
+}
 
 // Debug Configuration
 #ifdef DEBUG

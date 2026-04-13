@@ -7,6 +7,8 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <random>
+#include <set>
 #include <bsoncxx/builder/stream/document.hpp>
 #include <bsoncxx/document/view.hpp>
 #include <mongocxx/client.hpp>
@@ -83,19 +85,7 @@ struct mongo_config {
     }
 
     bool parse_connection_string(const std::string &conn_str) {
-        std::vector<std::string> parts;
-        std::string current;
-
-        for (size_t i = 0; i < conn_str.size(); i++) {
-            char c = conn_str[i];
-            if (c == ':') {
-                parts.push_back(current);
-                current.clear();
-            } else {
-                current += c;
-            }
-        }
-        parts.push_back(current);
+        std::vector<std::string> parts = split_by_delimiter(conn_str, ':');
 
         if (parts.size() != 7) {
             fprintf(stderr, "Error: MongoDB connection string must have exactly 7 parts\n");
@@ -191,6 +181,17 @@ struct mongo_config {
 
         return uri_str;
     }
+
+    std::string safe_uri() const {
+        std::string uri_str = "mongodb://";
+
+        if (!username.empty()) {
+            uri_str += username + ":****@";
+        }
+
+        uri_str += host + ":" + std::to_string(port) + "/" + dbname;
+        return uri_str;
+    }
 };
 
 class MongoWriter {
@@ -203,20 +204,19 @@ public:
 
     static MongoWriter* get_thread_local_instance(const mongo_config &cfg);
 
-    static MongoWriter* get_shared_instance(const mongo_config &cfg);
+    static MongoWriter* get_writer_instance(const mongo_config &cfg);
 
     static void destroy_current_thread_instance();
 
     static void destroy_global_instance();
 
-    static void destroy_shared_instance();
+    static void destroy_writer_instance();
 
     static size_t get_global_total_tiles();
     static size_t get_global_total_batches();
     static size_t get_global_total_retries();
     static size_t get_global_total_errors();
-
-    static void notify_pending_decreased();
+    static size_t get_global_total_discarded();
 
     void initialize_thread();
 
@@ -234,22 +234,24 @@ public:
 
     void erase_zoom(int z);
 
-    void write_metadata(const std::string &json_metadata);
-
     void write_metadata_bson(const struct metadata &meta);
+
+    bool should_use_upsert_for_zoom(int z) const;
+
+    struct tile_coords {
+        int z, x, y;
+    };
 
 private:
     static mongocxx::pool* get_or_create_pool(const mongo_config &cfg);
 
     void flush_batch();
-    void flush_batch_insert();
-    void flush_batch_upsert();
+    void flush_batch_with_retry(bool upsert_mode,
+        std::vector<bsoncxx::document::value> batch_buf,
+        std::vector<tile_coords> batch_coord);
     void create_indexes_if_needed(mongocxx::collection &collection);
     void build_write_concern();
-
-    struct tile_coords {
-        int z, x, y;
-    };
+    std::set<int> get_erased_zooms_snapshot() const;
 
     mongo_config config;
 
@@ -258,14 +260,16 @@ private:
 
     mongocxx::write_concern cached_wc;
     bool wc_initialized{false};
-    bool use_upsert{false};
-    bool indexes_created{false};
+
+    static std::mutex erased_zooms_mutex;
+    static std::set<int> erased_zooms;
 
     std::atomic<size_t> total_tiles_written{0};
     std::atomic<size_t> total_batches_written{0};
     std::atomic<size_t> total_retries{0};
     std::atomic<size_t> total_errors{0};
     std::atomic<size_t> total_failed_batches{0};
+    std::atomic<size_t> total_discarded_tiles{0};
     std::atomic<size_t> flush_failure_rounds{0};
 
     static std::unique_ptr<mongocxx::instance> global_instance;

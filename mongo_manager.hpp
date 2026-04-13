@@ -22,6 +22,7 @@ struct GlobalStats {
     size_t total_batches;
     size_t total_retries;
     size_t total_errors;
+    size_t total_discarded;
 };
 
 GlobalStats get_global_stats();

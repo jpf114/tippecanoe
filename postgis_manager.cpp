@@ -64,6 +64,7 @@ bool ParallelReader::read_parallel(std::vector<struct serialization_state>& sst,
             fprintf(stderr, "Failed to connect to PostGIS database\n");
             ErrorLogger::instance().log_error(ErrorSource::POSTGIS_READ, 0, 0, 0,
                                               "Failed to connect to PostGIS database");
+            reader.disconnect();
             return false;
         }
 
@@ -92,6 +93,7 @@ bool ParallelReader::read_parallel(std::vector<struct serialization_state>& sst,
                 ErrorLogger::instance().log_error(ErrorSource::POSTGIS_READ, 0, 0, 0,
                                                   "Thread " + std::to_string(i) + ": connection failed");
                 thread_errors.fetch_add(1);
+                t_reader.disconnect();
                 return;
             }
 
@@ -113,13 +115,14 @@ bool ParallelReader::read_parallel(std::vector<struct serialization_state>& sst,
     }
 
     if (thread_errors.load() > 0) {
-        fprintf(stderr, "Warning: %zu threads encountered errors during parallel read\n", thread_errors.load());
+        fprintf(stderr, "Warning: %zu of %zu threads encountered errors during parallel read\n",
+                thread_errors.load(), num_threads);
     }
 
     fprintf(stderr, "Parallel read complete: %zu features, %zu parse errors\n",
             total_features.load(), total_parse_errors.load());
 
-    return thread_errors.load() < num_threads;
+    return thread_errors.load() == 0;
 }
 
 }
