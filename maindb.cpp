@@ -2482,6 +2482,9 @@ int maindb(int argc, char **argv) {
 	if (use_mongo) {
 		MongoDB::initialize_global();
 	}
+	if (use_postgis) {
+		PostGISReader::reset_runtime_caches();
+	}
 
 	DEBUG_LOG("Starting data ingestion pipeline (read_input)...");
 	// 2. 调用 read_input() 读取 PostGIS 数据并写入瓦片

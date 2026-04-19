@@ -11,8 +11,6 @@
 
 std::unique_ptr<mongocxx::instance> MongoWriter::global_instance = nullptr;
 std::atomic_flag MongoWriter::initialized = ATOMIC_FLAG_INIT;
-std::once_flag MongoWriter::collection_drop_flag;
-std::once_flag MongoWriter::index_create_flag;
 std::mutex MongoWriter::erased_zooms_mutex;
 std::set<int> MongoWriter::erased_zooms;
 
@@ -33,6 +31,10 @@ static std::atomic<size_t> global_upsert_discarded_tiles{0};
 static std::unique_ptr<mongocxx::pool> global_pool;
 static std::mutex pool_mutex;
 static std::atomic<bool> pool_created{false};
+static std::mutex global_state_mutex;
+static bool collection_dropped = false;
+static bool indexes_created = false;
+static std::atomic<bool> first_connection_reported{false};
 
 mongocxx::pool* MongoWriter::get_or_create_pool(const mongo_config &cfg) {
     if (pool_created.load(std::memory_order_acquire)) {
@@ -128,27 +130,26 @@ size_t MongoWriter::get_global_upsert_discarded_tiles() {
 void MongoWriter::destroy_current_thread_instance() {
     if (tls_mongo_writer) {
         tls_mongo_writer->flush_all();
-
-        global_total_tiles += tls_mongo_writer->getTotalTilesWritten();
-        global_total_batches += tls_mongo_writer->getTotalBatchesWritten();
-        global_total_retries += tls_mongo_writer->getTotalRetries();
-        global_total_errors += tls_mongo_writer->getTotalErrors();
-        global_total_discarded += tls_mongo_writer->total_discarded_tiles.load();
-        global_pool_unavailable_batches += tls_mongo_writer->getPoolUnavailableBatches();
-        global_retry_exhausted_batches += tls_mongo_writer->getRetryExhaustedBatches();
-        global_insert_batches += tls_mongo_writer->getInsertBatches();
-        global_upsert_batches += tls_mongo_writer->getUpsertBatches();
-        global_insert_discarded_tiles += tls_mongo_writer->getInsertDiscardedTiles();
-        global_upsert_discarded_tiles += tls_mongo_writer->getUpsertDiscardedTiles();
-
+        tls_mongo_writer->merge_stats_once();
         tls_mongo_writer.reset();
     }
+}
+
+bool MongoWriter::flush_current_thread_instance() {
+    if (!tls_mongo_writer) {
+        return true;
+    }
+
+    tls_mongo_writer->flush_all();
+    return tls_mongo_writer->getCurrentBufferSize() == 0;
 }
 
 void MongoWriter::destroy_global_instance() {
     global_pool.reset();
     pool_created.store(false, std::memory_order_release);
     global_instance.reset();
+    initialized.clear(std::memory_order_release);
+    reset_global_runtime_state();
 }
 
 extern int quiet;
@@ -169,6 +170,26 @@ MongoWriter::MongoWriter(const mongo_config &cfg)
 MongoWriter::~MongoWriter() noexcept
 {
     close();
+    merge_stats_once();
+}
+
+void MongoWriter::merge_stats_once() {
+    if (stats_merged_) {
+        return;
+    }
+
+    global_total_tiles += getTotalTilesWritten();
+    global_total_batches += getTotalBatchesWritten();
+    global_total_retries += getTotalRetries();
+    global_total_errors += getTotalErrors();
+    global_total_discarded += getTotalDiscardedTiles();
+    global_pool_unavailable_batches += getPoolUnavailableBatches();
+    global_retry_exhausted_batches += getRetryExhaustedBatches();
+    global_insert_batches += getInsertBatches();
+    global_upsert_batches += getUpsertBatches();
+    global_insert_discarded_tiles += getInsertDiscardedTiles();
+    global_upsert_discarded_tiles += getUpsertDiscardedTiles();
+    stats_merged_ = true;
 }
 
 void MongoWriter::initialize_global()
@@ -176,9 +197,28 @@ void MongoWriter::initialize_global()
     if (!initialized.test_and_set(std::memory_order_acquire)) {
         global_instance = std::make_unique<mongocxx::instance>();
     }
+    reset_global_runtime_state();
 }
 
-static std::atomic<bool> first_connection_reported{false};
+void MongoWriter::reset_global_runtime_state() {
+    std::lock_guard<std::mutex> lock(global_state_mutex);
+    collection_dropped = false;
+    indexes_created = false;
+    global_total_tiles.store(0);
+    global_total_batches.store(0);
+    global_total_retries.store(0);
+    global_total_errors.store(0);
+    global_total_discarded.store(0);
+    global_pool_unavailable_batches.store(0);
+    global_retry_exhausted_batches.store(0);
+    global_insert_batches.store(0);
+    global_upsert_batches.store(0);
+    global_insert_discarded_tiles.store(0);
+    global_upsert_discarded_tiles.store(0);
+    first_connection_reported.store(false, std::memory_order_release);
+    std::lock_guard<std::mutex> erased_lock(erased_zooms_mutex);
+    erased_zooms.clear();
+}
 
 void MongoWriter::initialize_thread()
 {
@@ -188,7 +228,15 @@ void MongoWriter::initialize_thread()
     }
 
     if (config.drop_collection_before_write) {
-        std::call_once(collection_drop_flag, [this]() {
+        bool should_drop = false;
+        {
+            std::lock_guard<std::mutex> lock(global_state_mutex);
+            if (!collection_dropped) {
+                collection_dropped = true;
+                should_drop = true;
+            }
+        }
+        if (should_drop) {
             try {
                 auto inner_pool = get_or_create_pool(config);
                 if (!inner_pool) return;
@@ -203,11 +251,19 @@ void MongoWriter::initialize_thread()
                 fprintf(stderr, "Warning: failed to drop MongoDB collection %s.%s: %s\n",
                         config.dbname.c_str(), config.collection.c_str(), e.what());
             }
-        });
+        }
     }
 
     if (config.create_indexes) {
-        std::call_once(index_create_flag, [this]() {
+        bool should_create_indexes = false;
+        {
+            std::lock_guard<std::mutex> lock(global_state_mutex);
+            if (!indexes_created) {
+                indexes_created = true;
+                should_create_indexes = true;
+            }
+        }
+        if (should_create_indexes) {
             try {
                 auto inner_pool = get_or_create_pool(config);
                 if (!inner_pool) return;
@@ -217,7 +273,7 @@ void MongoWriter::initialize_thread()
             } catch (const std::exception &e) {
                 fprintf(stderr, "Warning: failed to create indexes: %s\n", e.what());
             }
-        });
+        }
     }
 
     if (config.enable_progress_report && !quiet && !first_connection_reported.exchange(true)) {
@@ -251,13 +307,43 @@ void MongoWriter::write_tile(int z, int x, int y, const char *data, size_t len)
 void MongoWriter::flush_all() noexcept
 {
     try {
-        if (!batch_buffer.empty()) {
+        while (!batch_buffer.empty()) {
+            size_t before = batch_buffer.size();
             flush_batch();
+            if (batch_buffer.size() == before) {
+                break;
+            }
         }
     } catch (const std::exception &e) {
         total_errors++;
     } catch (...) {
         total_errors++;
+    }
+
+    if (!batch_buffer.empty()) {
+        total_errors++;
+        size_t leftover_insert = 0;
+        size_t leftover_upsert = 0;
+        std::set<int> local_erased = get_erased_zooms_snapshot();
+        for (const auto &coord : batch_coords) {
+            if (local_erased.count(coord.z) > 0) {
+                leftover_upsert++;
+            } else {
+                leftover_insert++;
+            }
+        }
+        total_discarded_tiles += batch_buffer.size();
+        total_insert_discarded_tiles += leftover_insert;
+        total_upsert_discarded_tiles += leftover_upsert;
+        ErrorLogger::instance().log_error(
+            ErrorSource::MONGO_FLUSH,
+            batch_coords.empty() ? 0 : batch_coords[0].z,
+            batch_coords.empty() ? 0 : batch_coords[0].x,
+            batch_coords.empty() ? 0 : batch_coords[0].y,
+            "MongoDB flush_all left buffered tiles",
+            "Tiles remained buffered after final flush attempt");
+        batch_buffer.clear();
+        batch_coords.clear();
     }
 }
 

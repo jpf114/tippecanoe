@@ -211,6 +211,7 @@ public:
     static MongoWriter* get_writer_instance(const mongo_config &cfg);
 
     static void destroy_current_thread_instance();
+    static bool flush_current_thread_instance();
 
     static void destroy_global_instance();
 
@@ -243,6 +244,7 @@ public:
     size_t getRetryExhaustedBatches() const { return total_retry_exhausted_batches.load(); }
     size_t getInsertBatches() const { return total_insert_batches.load(); }
     size_t getUpsertBatches() const { return total_upsert_batches.load(); }
+    size_t getTotalDiscardedTiles() const { return total_discarded_tiles.load(); }
     size_t getInsertDiscardedTiles() const { return total_insert_discarded_tiles.load(); }
     size_t getUpsertDiscardedTiles() const { return total_upsert_discarded_tiles.load(); }
 
@@ -260,6 +262,7 @@ public:
 
 private:
     static mongocxx::pool* get_or_create_pool(const mongo_config &cfg);
+    static void reset_global_runtime_state();
 
     void flush_batch();
     void flush_batch_with_retry(bool upsert_mode,
@@ -268,6 +271,7 @@ private:
     void create_indexes_if_needed(mongocxx::collection &collection);
     void build_write_concern();
     std::set<int> get_erased_zooms_snapshot() const;
+    void merge_stats_once();
 
     mongo_config config;
 
@@ -293,6 +297,7 @@ private:
     std::atomic<size_t> total_upsert_batches{0};
     std::atomic<size_t> total_insert_discarded_tiles{0};
     std::atomic<size_t> total_upsert_discarded_tiles{0};
+    bool stats_merged_{false};
 
     static std::unique_ptr<mongocxx::instance> global_instance;
     static std::atomic_flag initialized;

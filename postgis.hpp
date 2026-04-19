@@ -102,6 +102,8 @@ public:
 
     static int get_cached_srid(const postgis_config &cfg, void *conn);
     static std::string build_select_query(const postgis_config &cfg, int srid, void *conn);
+    static std::string build_sharded_query(const std::string &base_query, const std::string &shard_condition);
+    static void reset_runtime_caches();
 
     size_t getTotalFeaturesProcessed() const { return total_features_processed.load(); }
     size_t getTotalBatchesProcessed() const { return total_batches_processed.load(); }

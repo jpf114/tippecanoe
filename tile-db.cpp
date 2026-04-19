@@ -2882,13 +2882,18 @@ long long write_tile(decompressor *geoms, std::atomic<long long> *geompos_in, ch
 						} else {
 							fprintf(stderr, "Error: Failed to get MongoDB writer instance for tile %d/%u/%u\n",
 							        z, tx, ty);
+							ErrorLogger::instance().log_mongo_error(z, tx, ty,
+								"get_writer_instance", "Failed to get MongoDB writer instance");
 						}
 					} catch (const std::exception &e) {
 						fprintf(stderr, "Error: MongoDB write failed for tile %d/%u/%u: %s\n",
 						        z, tx, ty, e.what());
+						ErrorLogger::instance().log_mongo_error(z, tx, ty, "write_tile", e.what());
 					} catch (...) {
 						fprintf(stderr, "Error: MongoDB write failed with unknown error for tile %d/%u/%u\n",
 						        z, tx, ty);
+						ErrorLogger::instance().log_mongo_error(z, tx, ty,
+							"write_tile", "Unknown MongoDB write error");
 					}
 				}
 

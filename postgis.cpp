@@ -24,30 +24,31 @@ static std::mutex table_columns_cache_mutex;
 static std::unordered_map<std::string, std::vector<std::string>> sql_columns_cache;
 static std::mutex sql_columns_cache_mutex;
 
+void PostGISReader::reset_runtime_caches() {
+    {
+        std::lock_guard<std::mutex> lock(srid_cache_mutex_);
+        srid_cache_.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(shard_range_cache_mutex);
+        shard_range_cache.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(selected_columns_validation_cache_mutex);
+        selected_columns_validation_cache.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(table_columns_cache_mutex);
+        table_columns_cache.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(sql_columns_cache_mutex);
+        sql_columns_cache.clear();
+    }
+}
+
 static std::string apply_shard_condition_to_query(const std::string &query, const std::string &shard_cond) {
-    std::string out = query;
-    size_t from_pos = out.find(" FROM ");
-    if (from_pos == std::string::npos) {
-        return out;
-    }
-
-    size_t where_pos = out.find(" WHERE ", from_pos);
-    if (where_pos != std::string::npos) {
-        out.insert(where_pos + strlen(" WHERE "), shard_cond + " AND ");
-        return out;
-    }
-
-    size_t group_pos = out.find(" GROUP BY ", from_pos);
-    size_t order_pos = out.find(" ORDER BY ", from_pos);
-    size_t limit_pos = out.find(" LIMIT ", from_pos);
-    size_t insert_pos = out.size();
-
-    if (group_pos != std::string::npos) insert_pos = group_pos;
-    else if (order_pos != std::string::npos) insert_pos = order_pos;
-    else if (limit_pos != std::string::npos) insert_pos = limit_pos;
-
-    out.insert(insert_pos, " WHERE " + shard_cond);
-    return out;
+    return PostGISReader::build_sharded_query(query, shard_cond);
 }
 
 static bool probe_query_ok(PGconn *conn, const std::string &query) {
@@ -409,20 +410,38 @@ static std::string resolve_sql_geometry_field(PGconn *pgconn, const postgis_conf
     if (!fetch_sql_subquery_columns(pgconn, cfg, existing)) {
         return "";
     }
+
+    bool has_geom = existing.find("geom") != existing.end();
+    bool has_geometry = existing.find("geometry") != existing.end();
+
     if (existing.find(cfg.geometry_field) != existing.end()) {
         return cfg.geometry_field;
     }
-    if (existing.find("geom") != existing.end()) {
+
+    // Only fall back automatically when there is a single obvious geometry candidate.
+    if (cfg.geometry_field != "geometry" && !cfg.geometry_field.empty()) {
+        fprintf(stderr, "Error: geometry field '%s' was not found in --postgis-sql result set\n",
+                cfg.geometry_field.c_str());
+        return "";
+    }
+
+    if (has_geom && !has_geometry) {
         return "geom";
     }
-    if (existing.find("geometry") != existing.end()) {
+    if (has_geometry && !has_geom) {
         return "geometry";
     }
+
+    if (has_geom && has_geometry) {
+        fprintf(stderr, "Error: --postgis-sql result set contains both 'geom' and 'geometry'. Use --postgis-geometry-field explicitly.\n");
+    }
+
     return "";
 }
 
 static bool validate_selected_columns(PGconn *pgconn, const postgis_config &cfg, const std::vector<std::string> &cols) {
-    std::string cache_key = cfg.host + "|" + cfg.port + "|" + cfg.dbname + "|" + cfg.table + "|" + cfg.selected_columns_csv +
+    std::string cache_key = cfg.host + "|" + cfg.port + "|" + cfg.dbname + "|" + cfg.table + "|" +
+                            cfg.geometry_field + "|" + cfg.sql + "|" + cfg.selected_columns_csv +
                             "|" + (cfg.selected_columns_best_effort ? "1" : "0");
     {
         std::lock_guard<std::mutex> lock(selected_columns_validation_cache_mutex);
@@ -1472,4 +1491,11 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
     }
 
     return true;
+}
+std::string PostGISReader::build_sharded_query(const std::string &base_query, const std::string &shard_condition) {
+    if (base_query.empty() || shard_condition.empty()) {
+        return base_query;
+    }
+
+    return "SELECT * FROM (" + base_query + ") AS _shard_src WHERE " + shard_condition;
 }

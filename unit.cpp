@@ -6,6 +6,7 @@
 #include "mvt.hpp"
 #include "projection.hpp"
 #include "geometry.hpp"
+#include "postgis.hpp"
 #include <unistd.h>
 #include <limits.h>
 
@@ -135,4 +136,14 @@ TEST_CASE("line_is_too_small") {
 	dv.emplace_back(VT_MOVETO, -51867587, 2683872952);
 	dv.emplace_back(VT_LINETO, -51864809, 2683873977);
 	REQUIRE(line_is_too_small(dv, 0, 10));
+}
+
+TEST_CASE("PostGIS shard condition wraps outer query", "[postgis]") {
+	std::string base = "SELECT ST_AsBinary(geom) AS wkb, name FROM (SELECT geom, name FROM roads WHERE type = 'highway' ORDER BY id) AS _subq";
+	std::string shard = "(abs(hashtext(ctid::text)) % 4) = 1";
+	std::string wrapped = PostGISReader::build_sharded_query(base, shard);
+
+	REQUIRE(wrapped == "SELECT * FROM (" + base + ") AS _shard_src WHERE " + shard);
+	REQUIRE(wrapped.find("WHERE type = 'highway' ORDER BY id) AS _subq") != std::string::npos);
+	REQUIRE(wrapped.find("_shard_src WHERE " + shard) != std::string::npos);
 }
