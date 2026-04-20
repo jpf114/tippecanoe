@@ -761,20 +761,66 @@ For more detailed information about PostGIS support and `tippecanoe-db`, see the
 Development
 -----------
 
-Requires sqlite3 and zlib (should already be installed on MacOS). Rebuilding the manpage
-uses md2man (`gem install md2man`).
+Tippecanoe now builds against dependencies provided by vcpkg.
+Rebuilding the manpage uses md2man (`gem install md2man`).
 
-Linux:
+Install build tools (Linux):
 
-    sudo apt-get install gcc g++ make libsqlite3-dev zlib1g-dev
+    sudo apt-get install gcc g++ make git curl zip unzip tar pkg-config
 
-Then build:
+Install vcpkg and required libraries:
 
-    make
+```sh
+git clone https://github.com/microsoft/vcpkg.git "$HOME/vcpkg"
+"$HOME/vcpkg/bootstrap-vcpkg.sh"
+"$HOME/vcpkg/vcpkg" install sqlite3 zlib libpq mongo-cxx-driver
+```
 
-and perhaps
+Then build from this repository:
 
-    make install
+```sh
+make VCPKG_ROOT="$HOME/vcpkg"
+```
+
+To install binaries:
+
+```sh
+make VCPKG_ROOT="$HOME/vcpkg" install
+```
+
+If you need a non-default triplet, pass `VCPKG_TRIPLET`, for example:
+
+```sh
+make VCPKG_ROOT="$HOME/vcpkg" VCPKG_TRIPLET=x64-linux
+```
+
+On Linux, `x64-linux-dynamic` can be simpler for runtime linkage of `tippecanoe-db`
+dependencies (`libpq`, `mongocxx`, `bsoncxx`, OpenSSL):
+
+```sh
+make VCPKG_ROOT="$HOME/vcpkg" VCPKG_TRIPLET=x64-linux-dynamic -j tippecanoe-db
+```
+
+Run `tippecanoe-db` with the matching vcpkg runtime library path:
+
+```sh
+LD_LIBRARY_PATH="$HOME/vcpkg/installed/x64-linux-dynamic/lib:$HOME/vcpkg/installed/x64-linux-dynamic/debug/lib:${LD_LIBRARY_PATH}" \
+./tippecanoe-db [options]
+```
+
+Example (PostGIS input + MongoDB output):
+
+```sh
+LD_LIBRARY_PATH="$HOME/vcpkg/installed/x64-linux-dynamic/lib:$HOME/vcpkg/installed/x64-linux-dynamic/debug/lib:${LD_LIBRARY_PATH}" \
+./tippecanoe-db \
+  --postgis "localhost:5432:TippTest:postgres:pg:china:geom" \
+  --mongo "localhost:27017:test:admin:admin:admin:china" \
+  -o china.mbtiles \
+  -z12 -Z5
+```
+
+The build now resolves third-party headers and libraries from vcpkg instead of
+system paths such as `/usr/include/postgresql` or `/usr/local/include`.
 
 Tippecanoe now requires features from the 2011 C++ standard. If your compiler is older than
 that, you will need to install a newer one. On MacOS, updating to the latest XCode should

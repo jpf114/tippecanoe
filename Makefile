@@ -62,17 +62,28 @@ PG =
 H = $(wildcard *.h) $(wildcard *.hpp)
 C = $(wildcard *.c) $(wildcard *.cpp)
 
-PGIS_INCLUDE = -I/usr/include/postgresql
-PGIS_LIB = -L/usr/lib
+VCPKG_ROOT ?= $(HOME)/vcpkg
+VCPKG_TRIPLET ?= x64-linux
+VCPKG_INSTALLED := $(VCPKG_ROOT)/installed/$(VCPKG_TRIPLET)
+VCPKG_INCLUDE = -I$(VCPKG_INSTALLED)/include
+VCPKG_LIB = -L$(VCPKG_INSTALLED)/lib
+VCPKG_RUNTIME_LIB_PATH = $(VCPKG_INSTALLED)/lib:$(VCPKG_INSTALLED)/debug/lib
+MONGO_CXX_INCLUDE = -I$(VCPKG_INSTALLED)/include/libmongoc-1.0 -I$(VCPKG_INSTALLED)/include/bson-1.0 -I$(VCPKG_INSTALLED)/include/bsoncxx/v_noabi -I$(VCPKG_INSTALLED)/include/mongocxx/v_noabi
 
-INCLUDES = -I/usr/local/include -I. -Iclipper2/include
-LIBS = -L/usr/local/lib
+PGIS_INCLUDE = $(VCPKG_INCLUDE) -I$(VCPKG_INSTALLED)/include/postgresql
+PGIS_LIB = $(VCPKG_LIB)
+
+INCLUDES = $(VCPKG_INCLUDE) -I. -Iclipper2/include
+LIBS = $(VCPKG_LIB)
+
+COMMON_LIBS = -lm -lz -lsqlite3 -lpthread
+DB_EXTRA_LIBS = -lpq -lmongocxx -lbsoncxx -lssl -lcrypto
 
 tippecanoe: geojson.o jsonpull/jsonpull.o tile.o pool.o mbtiles.o geometry.o projection.o memfile.o mvt.o serial.o main.o platform.o text.o dirtiles.o pmtiles_file.o plugin.o read_json.o write_json.o geobuf.o flatgeobuf.o evaluator.o geocsv.o csv.o geojson-loop.o json_logger.o visvalingam.o compression.o clip.o sort.o attribute.o thread.o shared_borders.o clipper2/src/clipper.engine.o
-	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lm -lz -lsqlite3 -lpthread
+	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(COMMON_LIBS)
 
 tippecanoe-db: geojson.o jsonpull/jsonpull.o tile-db.o pool.o mbtiles.o geometry.o projection.o memfile.o mvt.o serial.o maindb.o common_main.o platform.o text.o dirtiles.o plugin.o read_json.o write_json.o evaluator.o geojson-loop.o json_logger.o visvalingam.o compression.o clip.o sort.o attribute.o thread.o shared_borders.o postgis.o wkb_parser.o error_logger.o mongo.o postgis_manager.o mongo_manager.o clipper2/src/clipper.engine.o
-	$(CXX) $(PG) $(LIBS) $(PGIS_LIB) -I/usr/local/include/libmongoc-1.0 -I/usr/local/include/bson-1.0 -I/usr/local/include/bsoncxx/v_noabi -I/usr/local/include/mongocxx/v_noabi -L/usr/local/lib $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lm -lz -lsqlite3 -lpthread -lpq -lmongocxx -lbsoncxx
+	$(CXX) $(PG) $(LIBS) $(PGIS_LIB) $(MONGO_CXX_INCLUDE) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(COMMON_LIBS) $(DB_EXTRA_LIBS)
 
 tippecanoe-enumerate: enumerate.o
 	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lsqlite3
@@ -81,16 +92,16 @@ tippecanoe-decode: decode.o projection.o mvt.o write_json.o text.o jsonpull/json
 	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lm -lz -lsqlite3
 
 tile-join: tile-join.o platform.o projection.o mbtiles.o mvt.o memfile.o dirtiles.o jsonpull/jsonpull.o text.o evaluator.o csv.o write_json.o pmtiles_file.o clip.o attribute.o thread.o read_json.o clipper2/src/clipper.engine.o
-	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lm -lz -lsqlite3 -lpthread
+	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(COMMON_LIBS)
 
 tippecanoe-json-tool: jsontool.o jsonpull/jsonpull.o csv.o text.o geojson-loop.o
-	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lm -lz -lsqlite3 -lpthread
+	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(COMMON_LIBS)
 
 unit: unit.o text.o sort.o mvt.o projection.o clip.o attribute.o jsonpull/jsonpull.o evaluator.o read_json.o postgis.o wkb_parser.o serial.o geometry.o clipper2/src/clipper.engine.o
-	$(CXX) $(PG) $(LIBS) $(PGIS_LIB) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lm -lz -lsqlite3 -lpthread -lpq
+	$(CXX) $(PG) $(LIBS) $(PGIS_LIB) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(COMMON_LIBS) -lpq
 
 tippecanoe-overzoom: overzoom.o mvt.o clip.o evaluator.o jsonpull/jsonpull.o text.o attribute.o read_json.o projection.o read_json.o clipper2/src/clipper.engine.o
-	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lm -lz -lsqlite3 -lpthread
+	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(COMMON_LIBS)
 
 -include $(wildcard *.d)
 
@@ -105,25 +116,28 @@ postgis_manager.o: postgis_manager.cpp
 
 # Special rule for mongo.o with MongoDB headers
 mongo.o: mongo.cpp
-	$(CXX) -MMD $(PG) $(PGIS_INCLUDE) $(INCLUDES) -I/usr/local/include/libmongoc-1.0 -I/usr/local/include/bson-1.0 -I/usr/local/include/bsoncxx/v_noabi -I/usr/local/include/mongocxx/v_noabi $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
+	$(CXX) -MMD $(PG) $(PGIS_INCLUDE) $(INCLUDES) $(MONGO_CXX_INCLUDE) $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
 
 # Special rule for mongo_manager.o with MongoDB headers
 mongo_manager.o: mongo_manager.cpp
-	$(CXX) -MMD $(PG) $(PGIS_INCLUDE) $(INCLUDES) -I/usr/local/include/libmongoc-1.0 -I/usr/local/include/bson-1.0 -I/usr/local/include/bsoncxx/v_noabi -I/usr/local/include/mongocxx/v_noabi $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
+	$(CXX) -MMD $(PG) $(PGIS_INCLUDE) $(INCLUDES) $(MONGO_CXX_INCLUDE) $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
 
 # Special rule for tile-db.o with MongoDB headers (includes mongo.hpp) - for tippecanoe-db only
 tile-db.o: tile-db.cpp
-	$(CXX) -MMD $(PG) $(PGIS_INCLUDE) $(INCLUDES) -I/usr/local/include/libmongoc-1.0 -I/usr/local/include/bson-1.0 -I/usr/local/include/bsoncxx/v_noabi -I/usr/local/include/mongocxx/v_noabi $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
+	$(CXX) -MMD $(PG) $(PGIS_INCLUDE) $(INCLUDES) $(MONGO_CXX_INCLUDE) $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
 
 # Special rule for maindb.o with MongoDB headers (includes mongo.hpp)
 maindb.o: maindb.cpp
-	$(CXX) -MMD $(PG) $(PGIS_INCLUDE) $(INCLUDES) -I/usr/local/include/libmongoc-1.0 -I/usr/local/include/bson-1.0 -I/usr/local/include/bsoncxx/v_noabi -I/usr/local/include/mongocxx/v_noabi $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
+	$(CXX) -MMD $(PG) $(PGIS_INCLUDE) $(INCLUDES) $(MONGO_CXX_INCLUDE) $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
 
 %.o: %.c
 	$(CC) -MMD $(PG) $(INCLUDES) $(FINAL_FLAGS) $(CFLAGS) -c -o $@ $<
 
 %.o: %.cpp
 	$(CXX) -MMD $(PG) $(INCLUDES) $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
+
+run-db: tippecanoe-db
+	LD_LIBRARY_PATH="$(VCPKG_RUNTIME_LIB_PATH):$${LD_LIBRARY_PATH}" ./tippecanoe-db $(ARGS)
 
 clean:
 	rm -f ./tippecanoe ./tippecanoe-* ./tippecanoe-db ./tile-join ./unit *.o *.d */*.o */*.d tests/**/*.mbtiles tests/**/*.check
