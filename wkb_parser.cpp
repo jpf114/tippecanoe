@@ -9,6 +9,7 @@ class WKBReader {
     size_t pos_;
     size_t len_;
     bool little_endian_;
+    int recursion_depth_;
 
     uint8_t read_byte() {
         if (pos_ >= len_) {
@@ -71,6 +72,10 @@ class WKBReader {
 
     void parse_linestring(drawvec& out, bool has_z, bool has_m) {
         uint32_t npoints = read_uint32();
+        if (npoints > WKB_MAX_POINTS_PER_RING) {
+            throw std::runtime_error("Too many points in linestring: " + std::to_string(npoints) +
+                                     " (max " + std::to_string(WKB_MAX_POINTS_PER_RING) + ")");
+        }
         if (npoints == 0) return;
         double lon = read_double();
         double lat = read_double();
@@ -88,6 +93,10 @@ class WKBReader {
 
     void parse_polygon_ring(drawvec& out, bool has_z, bool has_m) {
         uint32_t npoints = read_uint32();
+        if (npoints > WKB_MAX_POINTS_PER_RING) {
+            throw std::runtime_error("Too many points in polygon ring: " + std::to_string(npoints) +
+                                     " (max " + std::to_string(WKB_MAX_POINTS_PER_RING) + ")");
+        }
         if (npoints == 0) return;
         double lon = read_double();
         double lat = read_double();
@@ -105,17 +114,24 @@ class WKBReader {
 
     void parse_polygon(drawvec& out, bool has_z, bool has_m) {
         uint32_t nrings = read_uint32();
+        if (nrings > WKB_MAX_RINGS_PER_POLYGON) {
+            throw std::runtime_error("Too many rings in polygon: " + std::to_string(nrings) +
+                                     " (max " + std::to_string(WKB_MAX_RINGS_PER_POLYGON) + ")");
+        }
         for (uint32_t i = 0; i < nrings; i++) {
             parse_polygon_ring(out, has_z, has_m);
         }
-        // Match GeoJSON ingestion semantics: one CLOSEPATH terminator per polygon
-        // so downstream fix_polygon() can reset outer/inner ring state correctly.
         if (nrings > 0) {
             out.push_back(draw(VT_CLOSEPATH, 0, 0));
         }
     }
 
-    int parse_geometry(drawvec& out, bool top_level = true) {
+    int parse_geometry(drawvec& out, int depth = 0) {
+        if (depth > WKB_MAX_RECURSION_DEPTH) {
+            throw std::runtime_error("WKB recursion depth exceeded (max " +
+                                     std::to_string(WKB_MAX_RECURSION_DEPTH) + ")");
+        }
+
         uint8_t byte_order = read_byte();
         little_endian_ = (byte_order == 1);
 
@@ -155,8 +171,12 @@ class WKBReader {
             case WKB_MULTIPOINT: {
                 geom_type = GEOM_MULTIPOINT;
                 uint32_t ngeoms = read_uint32();
+                if (ngeoms > WKB_MAX_SUBGEOMETRIES) {
+                    throw std::runtime_error("Too many sub-geometries in multipoint: " + std::to_string(ngeoms) +
+                                             " (max " + std::to_string(WKB_MAX_SUBGEOMETRIES) + ")");
+                }
                 for (uint32_t i = 0; i < ngeoms; i++) {
-                    parse_geometry(out, false);
+                    parse_geometry(out, depth + 1);
                 }
                 break;
             }
@@ -164,8 +184,12 @@ class WKBReader {
             case WKB_MULTILINESTRING: {
                 geom_type = GEOM_MULTILINESTRING;
                 uint32_t ngeoms = read_uint32();
+                if (ngeoms > WKB_MAX_SUBGEOMETRIES) {
+                    throw std::runtime_error("Too many sub-geometries in multilinestring: " + std::to_string(ngeoms) +
+                                             " (max " + std::to_string(WKB_MAX_SUBGEOMETRIES) + ")");
+                }
                 for (uint32_t i = 0; i < ngeoms; i++) {
-                    parse_geometry(out, false);
+                    parse_geometry(out, depth + 1);
                 }
                 break;
             }
@@ -173,8 +197,12 @@ class WKBReader {
             case WKB_MULTIPOLYGON: {
                 geom_type = GEOM_MULTIPOLYGON;
                 uint32_t ngeoms = read_uint32();
+                if (ngeoms > WKB_MAX_SUBGEOMETRIES) {
+                    throw std::runtime_error("Too many sub-geometries in multipolygon: " + std::to_string(ngeoms) +
+                                             " (max " + std::to_string(WKB_MAX_SUBGEOMETRIES) + ")");
+                }
                 for (uint32_t i = 0; i < ngeoms; i++) {
-                    parse_geometry(out, false);
+                    parse_geometry(out, depth + 1);
                 }
                 break;
             }
@@ -182,8 +210,12 @@ class WKBReader {
             case WKB_GEOMETRYCOLLECTION: {
                 geom_type = GEOM_TYPES;
                 uint32_t ngeoms = read_uint32();
+                if (ngeoms > WKB_MAX_SUBGEOMETRIES) {
+                    throw std::runtime_error("Too many sub-geometries in collection: " + std::to_string(ngeoms) +
+                                             " (max " + std::to_string(WKB_MAX_SUBGEOMETRIES) + ")");
+                }
                 for (uint32_t i = 0; i < ngeoms; i++) {
-                    parse_geometry(out, false);
+                    parse_geometry(out, depth + 1);
                 }
                 break;
             }
@@ -192,9 +224,6 @@ class WKBReader {
                 throw std::runtime_error("Unknown WKB geometry type: " + std::to_string(base_type));
         }
 
-        if (top_level) {
-            return geom_type;
-        }
         return geom_type;
     }
 
@@ -204,8 +233,10 @@ public:
         pos_ = 0;
         len_ = len;
         little_endian_ = false;
+        recursion_depth_ = 0;
 
         WKBResult result;
+        result.geometry_type = -1;
         result.valid = false;
         result.srid = 0;
         result.has_z = false;
@@ -223,6 +254,10 @@ public:
         } catch (const std::exception& e) {
             result.error = std::string("WKB parse error at byte ") +
                           std::to_string(pos_) + ": " + e.what();
+            DEBUG_LOG("WKB parse failed: %s", result.error.c_str());
+        } catch (...) {
+            result.error = std::string("WKB parse error at byte ") +
+                          std::to_string(pos_) + ": unknown exception";
             DEBUG_LOG("WKB parse failed: %s", result.error.c_str());
         }
 
@@ -245,6 +280,7 @@ static uint8_t hex_char_val(char c) {
 WKBResult parse_wkb_hex(const std::string& hex) {
     if (hex.empty()) {
         WKBResult result;
+        result.geometry_type = -1;
         result.valid = false;
         result.error = "Empty hex string";
         return result;
@@ -252,6 +288,7 @@ WKBResult parse_wkb_hex(const std::string& hex) {
 
     if (hex.size() < 2 || hex.size() % 2 != 0) {
         WKBResult result;
+        result.geometry_type = -1;
         result.valid = false;
         result.error = "Invalid hex string length: " + std::to_string(hex.size());
         return result;

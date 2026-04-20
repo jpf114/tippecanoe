@@ -1,6 +1,7 @@
 #include "mongo_manager.hpp"
 #include "config.hpp"
 #include <cstdio>
+#include <climits>
 
 namespace MongoDB {
 
@@ -63,7 +64,7 @@ size_t estimate_tile_count(size_t feature_count, int min_zoom, int max_zoom) {
             total_tiles += feature_count;
             continue;
         }
-        size_t tiles_at_zoom = 1ULL << (2 * z);
+        size_t tiles_at_zoom = (2 * z < 64) ? (1ULL << (2 * z)) : ULLONG_MAX;
         double coverage_ratio = std::min(1.0, feature_count * 4.0 / static_cast<double>(tiles_at_zoom));
         total_tiles += static_cast<size_t>(tiles_at_zoom * coverage_ratio * 0.3);
     }

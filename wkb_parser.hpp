@@ -26,7 +26,13 @@
 #define GEOM_POLYGON 4
 #define GEOM_MULTIPOLYGON 5
 #define GEOM_TYPES 6
+#define GEOM_GEOMETRYCOLLECTION 6
 #endif
+
+constexpr uint32_t WKB_MAX_POINTS_PER_RING = 10000000;
+constexpr uint32_t WKB_MAX_RINGS_PER_POLYGON = 100000;
+constexpr uint32_t WKB_MAX_SUBGEOMETRIES = 100000;
+constexpr int WKB_MAX_RECURSION_DEPTH = 16;
 
 extern const int mb_geometry[GEOM_TYPES];
 

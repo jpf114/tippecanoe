@@ -29,6 +29,8 @@ class ErrorLogger {
 public:
     static ErrorLogger& instance();
 
+    static void set_quiet(int q);
+
     bool initialize(const std::string& exec_path);
     void close();
 

@@ -559,11 +559,26 @@ MongoDB flush 失败 ───┤
 
 ```json
 {
-  "metadata": "{ JSON字符串: name, bounds, center, vector_layers, ... }",
+  "_id": ObjectId("..."),
+  "name": "china",
+  "description": "",
+  "version": 2,
+  "type": "overlay",
+  "format": "pbf",
+  "minzoom": 5,
+  "maxzoom": 10,
+  "bounds": [73.502355, 3.397162, 135.09567, 53.563269],
+  "center": [104.299013, 28.480216, 7],
+  "vector_layers": "[{\"id\":\"china\",\"fields\":{\"name\":\"String\"},\"minzoom\":5,\"maxzoom\":10}]",
+  "tilestats": "{\"layerCount\":1,\"layers\":[{\"layer\":\"china\",\"count\":14182,\"geometry\":\"Polygon\"}]}",
+  "attribution": "",
+  "generator": "tippecanoe-db v2.0",
   "collection": "china",
   "timestamp": 1775724846722
 }
 ```
+
+> **注意：** v2.0 版本起，元数据使用 BSON 原生构建，`vector_layers` 和 `tilestats` 字段以 JSON 字符串形式存储，读取端需先解析 JSON。
 
 ---
 

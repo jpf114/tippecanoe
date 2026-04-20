@@ -2475,6 +2475,7 @@ int maindb(int argc, char **argv) {
 				exec_dir = cwd_buf;
 			}
 		}
+		ErrorLogger::set_quiet(quiet);
 		ErrorLogger::instance().initialize(exec_dir);
 	}
 

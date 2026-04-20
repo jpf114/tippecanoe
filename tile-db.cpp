@@ -2519,7 +2519,7 @@ long long write_tile(decompressor *geoms, std::atomic<long long> *geompos_in, ch
 			mvt_layer layer;
 			layer.name = layer_iterator->first;
 			layer.version = 2;
-			layer.extent = 1 << tile_detail;
+			layer.extent = 1U << tile_detail;
 
 			for (size_t x = 0; x < layer_features.size(); x++) {
 				mvt_feature feature;

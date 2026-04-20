@@ -316,8 +316,14 @@ void MongoWriter::flush_all() noexcept
         }
     } catch (const std::exception &e) {
         total_errors++;
+        if (!quiet) {
+            fprintf(stderr, "Warning: MongoDB flush_all exception: %s\n", e.what());
+        }
     } catch (...) {
         total_errors++;
+        if (!quiet) {
+            fprintf(stderr, "Warning: MongoDB flush_all unknown exception\n");
+        }
     }
 
     if (!batch_buffer.empty()) {
@@ -351,8 +357,16 @@ void MongoWriter::close() noexcept
 {
     try {
         flush_all();
+    } catch (const std::exception &e) {
+        total_errors++;
+        if (!quiet) {
+            fprintf(stderr, "Warning: MongoDB close exception: %s\n", e.what());
+        }
     } catch (...) {
         total_errors++;
+        if (!quiet) {
+            fprintf(stderr, "Warning: MongoDB close unknown exception\n");
+        }
     }
 }
 
@@ -408,20 +422,25 @@ void MongoWriter::flush_batch()
 
     std::set<int> local_erased = get_erased_zooms_snapshot();
 
+    // Swap batch data to local variables first, ensuring batch_buffer/batch_coords
+    // are empty and available for flush_batch_with_retry to push back on failure
+    std::vector<bsoncxx::document::value> local_buffer;
+    std::vector<tile_coords> local_coords;
+    local_buffer.swap(batch_buffer);
+    local_coords.swap(batch_coords);
+
     std::vector<bsoncxx::document::value> insert_buf, upsert_buf;
     std::vector<tile_coords> insert_coord, upsert_coord;
 
-    for (size_t i = 0; i < batch_buffer.size(); i++) {
-        if (local_erased.count(batch_coords[i].z) > 0) {
-            upsert_buf.push_back(std::move(batch_buffer[i]));
-            upsert_coord.push_back(batch_coords[i]);
+    for (size_t i = 0; i < local_buffer.size(); i++) {
+        if (local_erased.count(local_coords[i].z) > 0) {
+            upsert_buf.push_back(std::move(local_buffer[i]));
+            upsert_coord.push_back(local_coords[i]);
         } else {
-            insert_buf.push_back(std::move(batch_buffer[i]));
-            insert_coord.push_back(batch_coords[i]);
+            insert_buf.push_back(std::move(local_buffer[i]));
+            insert_coord.push_back(local_coords[i]);
         }
     }
-    batch_buffer.clear();
-    batch_coords.clear();
 
     if (!insert_buf.empty()) {
         flush_batch_with_retry(false, std::move(insert_buf), std::move(insert_coord));
@@ -574,6 +593,35 @@ void MongoWriter::flush_batch_with_retry(bool upsert_mode,
             }
 
             total_retries++;
+            int wait_ms = exponential_backoff_with_jitter(attempts);
+            std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
+        } catch (...) {
+            attempts++;
+            total_errors++;
+            if (!quiet) {
+                fprintf(stderr, "MongoDB flush_batch_%s failed with unknown exception (attempt %d/%d)\n",
+                        upsert_mode ? "upsert" : "insert", attempts, config.max_retries);
+            }
+            if (attempts >= config.max_retries) {
+                total_failed_batches++;
+                flush_failure_rounds++;
+                if (flush_failure_rounds >= 2) {
+                    total_retry_exhausted_batches++;
+                    total_discarded_tiles += batch_buf.size();
+                    if (upsert_mode) {
+                        total_upsert_discarded_tiles += batch_buf.size();
+                    } else {
+                        total_insert_discarded_tiles += batch_buf.size();
+                    }
+                    flush_failure_rounds = 0;
+                } else {
+                    for (size_t i = 0; i < batch_buf.size(); i++) {
+                        batch_buffer.push_back(std::move(batch_buf[i]));
+                        batch_coords.push_back(batch_coord[i]);
+                    }
+                }
+                return;
+            }
             int wait_ms = exponential_backoff_with_jitter(attempts);
             std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
         }

@@ -206,6 +206,8 @@ void write_metadata(const std::string &json_metadata);
 static MongoWriter* get_writer_instance(const mongo_config &cfg);
 static void destroy_writer_instance();
 static size_t get_global_total_discarded();
+static size_t get_global_insert_discarded_tiles();
+static size_t get_global_upsert_discarded_tiles();
 std::string safe_uri() const;  // mongo_config 方法
 bool should_use_upsert_for_zoom(int z) const;
 std::set<int> get_erased_zooms_snapshot() const;

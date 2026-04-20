@@ -5,6 +5,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <algorithm>
+#include <climits>
 #include <cstdint>
 #include <chrono>
 #include "geometry.hpp"
@@ -89,7 +90,8 @@ static std::string trim_copy(const std::string &s) {
 }
 
 static bool looks_like_pg_array_literal(const std::string &s) {
-    return s.size() >= 2 && s.front() == '{' && s.back() == '}' && s.find(':') == std::string::npos;
+    return s.size() >= 2 && s.front() == '{' && s.back() == '}' &&
+           s.find(':') == std::string::npos && s.find('"') == std::string::npos;
 }
 
 static std::string minify_json_like(const std::string &s) {
@@ -614,54 +616,62 @@ static ShardPlan prepare_shard_plan(PGconn *pgconn,
                     min_key = it->second.first;
                     max_key = it->second.second;
                     has_range = true;
-                } else {
-                    std::string range_query =
-                        "SELECT MIN(_k), MAX(_k) FROM ("
-                        "SELECT CAST(" + esc_key + " AS bigint) AS _k FROM (" + base_query + ") AS _range_base "
-                        "WHERE " + esc_key + " IS NOT NULL) AS _range_mm";
-                    PGresult *range_res = PQexec(pgconn, range_query.c_str());
-                    if (PQresultStatus(range_res) == PGRES_TUPLES_OK &&
-                        PQntuples(range_res) > 0 &&
-                        !PQgetisnull(range_res, 0, 0) &&
-                        !PQgetisnull(range_res, 0, 1)) {
-                        min_key = strtoll(PQgetvalue(range_res, 0, 0), NULL, 10);
-                        max_key = strtoll(PQgetvalue(range_res, 0, 1), NULL, 10);
-                        has_range = true;
-                        shard_range_cache[range_cache_key] = std::make_pair(min_key, max_key);
-                    } else if (shard_mode == "range") {
-                        const char *db_err = PQerrorMessage(pgconn);
-                        if (db_err != NULL && strstr(db_err, "invalid input syntax for type bigint") != NULL) {
-                            fprintf(stderr, "Thread %zu: range sharding key '%s' is non-numeric; use --postgis-shard-mode=key or auto\n",
-                                    thread_id, config.shard_key.c_str());
-                        } else {
-                            fprintf(stderr, "Thread %zu: range sharding metadata query failed for key '%s': %s\n",
-                                    thread_id, config.shard_key.c_str(), db_err ? db_err : "unknown error");
-                        }
-                    }
-                    PQclear(range_res);
                 }
+            }
+
+            if (!has_range) {
+                std::string range_query =
+                    "SELECT MIN(_k), MAX(_k) FROM ("
+                    "SELECT CAST(" + esc_key + " AS bigint) AS _k FROM (" + base_query + ") AS _range_base "
+                    "WHERE " + esc_key + " IS NOT NULL) AS _range_mm";
+                PGresult *range_res = PQexec(pgconn, range_query.c_str());
+                if (PQresultStatus(range_res) == PGRES_TUPLES_OK &&
+                    PQntuples(range_res) > 0 &&
+                    !PQgetisnull(range_res, 0, 0) &&
+                    !PQgetisnull(range_res, 0, 1)) {
+                    min_key = strtoll(PQgetvalue(range_res, 0, 0), NULL, 10);
+                    max_key = strtoll(PQgetvalue(range_res, 0, 1), NULL, 10);
+                    has_range = true;
+                    std::lock_guard<std::mutex> lock(shard_range_cache_mutex);
+                    shard_range_cache[range_cache_key] = std::make_pair(min_key, max_key);
+                } else if (shard_mode == "range") {
+                    const char *db_err = PQerrorMessage(pgconn);
+                    if (db_err != NULL && strstr(db_err, "invalid input syntax for type bigint") != NULL) {
+                        fprintf(stderr, "Thread %zu: range sharding key '%s' is non-numeric; use --postgis-shard-mode=key or auto\n",
+                                thread_id, config.shard_key.c_str());
+                    } else {
+                        fprintf(stderr, "Thread %zu: range sharding metadata query failed for key '%s': %s\n",
+                                thread_id, config.shard_key.c_str(), db_err ? db_err : "unknown error");
+                    }
+                }
+                PQclear(range_res);
             }
 
             if (has_range && max_key >= min_key) {
                     unsigned long long span = static_cast<unsigned long long>(max_key - min_key) + 1ULL;
                     unsigned long long chunk = (span + num_threads - 1) / num_threads;
-                    long long start = min_key + static_cast<long long>(chunk * thread_id);
-                    long long end = (thread_id + 1 >= num_threads) ? (max_key + 1) : (start + static_cast<long long>(chunk));
-                    if (start < end) {
-                        std::string range_cond = "(" + esc_key + " >= " + std::to_string(start) +
-                                                 " AND " + esc_key + " < " + std::to_string(end) + ")";
-                        std::string range_sharded_query = apply_shard_condition_to_query(base_query, range_cond);
-                        if (probe_query_ok(pgconn, range_sharded_query)) {
-                            plan.query = range_sharded_query;
-                            plan.applied = true;
-                            DEBUG_LOG("Thread %zu/%zu: using range sharding on key %s [%lld, %lld)", thread_id, num_threads, config.shard_key.c_str(), start, end);
-                        } else if (shard_mode == "range") {
-                            fprintf(stderr, "Thread %zu: range sharding probe failed for key '%s'\n", thread_id, config.shard_key.c_str());
-                        }
+                    if (thread_id > 0 && chunk > ULLONG_MAX / thread_id) {
+                         DEBUG_LOG("Thread %zu: range shard overflow detected, skipping", thread_id);
                     } else {
-                        plan.applied = true;
-                        plan.no_work = true;
-                        DEBUG_LOG("Thread %zu/%zu: no range-shard work for key %s", thread_id, num_threads, config.shard_key.c_str());
+                        unsigned long long offset = chunk * thread_id;
+                        long long start = min_key + static_cast<long long>(offset);
+                        long long end = (thread_id + 1 >= num_threads) ? (max_key + 1) : (min_key + static_cast<long long>(offset + chunk));
+                        if (start < end) {
+                            std::string range_cond = "(" + esc_key + " >= " + std::to_string(start) +
+                                                     " AND " + esc_key + " < " + std::to_string(end) + ")";
+                            std::string range_sharded_query = apply_shard_condition_to_query(base_query, range_cond);
+                            if (probe_query_ok(pgconn, range_sharded_query)) {
+                                plan.query = range_sharded_query;
+                                plan.applied = true;
+                                DEBUG_LOG("Thread %zu/%zu: using range sharding on key %s [%lld, %lld)", thread_id, num_threads, config.shard_key.c_str(), start, end);
+                            } else if (shard_mode == "range") {
+                                fprintf(stderr, "Thread %zu: range sharding probe failed for key '%s'\n", thread_id, config.shard_key.c_str());
+                            }
+                        } else {
+                            plan.applied = true;
+                            plan.no_work = true;
+                            DEBUG_LOG("Thread %zu/%zu: no range-shard work for key %s", thread_id, num_threads, config.shard_key.c_str());
+                        }
                     }
             }
 
@@ -744,6 +754,8 @@ bool PostGISReader::connect()
     if (PQstatus((PGconn *)conn) != CONNECTION_OK)
     {
         fprintf(stderr, "Error: Connection to PostGIS failed: %s\n", PQerrorMessage((PGconn *)conn));
+        PQfinish((PGconn *)conn);
+        conn = NULL;
         return false;
     }
 
@@ -819,7 +831,14 @@ int PostGISReader::get_cached_srid(const postgis_config &cfg, void *conn_ptr)
     PGresult *res = PQexec(pgconn, srid_query.c_str());
     if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0 && !PQgetisnull(res, 0, 0))
     {
-        resolved_srid = atoi(PQgetvalue(res, 0, 0));
+        const char *srid_str = PQgetvalue(res, 0, 0);
+        char *end_ptr = nullptr;
+        long srid_val = strtol(srid_str, &end_ptr, 10);
+        if (end_ptr != srid_str && *end_ptr == '\0' && srid_val >= 0 && srid_val <= INT_MAX) {
+            resolved_srid = static_cast<int>(srid_val);
+        } else {
+            fprintf(stderr, "Warning: Invalid SRID value '%s', defaulting to 0\n", srid_str);
+        }
     }
     PQclear(res);
 
@@ -1071,7 +1090,7 @@ void PostGISReader::process_feature(PGresult *res, int row, int nfields, int wkb
     size_t coord_memory = result.coordinates.capacity() * sizeof(draw);
     current_memory_usage.fetch_add(coord_memory);
 
-    if (result.geometry_type < 0 || result.geometry_type >= GEOM_TYPES)
+    if (result.geometry_type < 0 || result.geometry_type > GEOM_GEOMETRYCOLLECTION)
     {
         parse_errors_.fetch_add(1);
         ErrorLogger::instance().log_parse_error(row + 1, "UNSUPPORTED",
@@ -1083,7 +1102,11 @@ void PostGISReader::process_feature(PGresult *res, int row, int nfields, int wkb
     serial_feature sf;
     sf.layer = layer;
     sf.segment = thread_id % sst.size();
-    sf.t = mb_geometry[result.geometry_type];
+    int geom_idx = result.geometry_type;
+    if (geom_idx == GEOM_GEOMETRYCOLLECTION) {
+        geom_idx = GEOM_MULTIPOLYGON;
+    }
+    sf.t = mb_geometry[geom_idx];
     sf.geometry = result.coordinates;
     sf.has_id = false;
     sf.id = 0;

@@ -87,26 +87,38 @@ bool ParallelReader::read_parallel(std::vector<struct serialization_state>& sst,
 
     for (size_t i = 0; i < num_threads; i++) {
         threads.emplace_back([&, i]() {
-            PostGISReader t_reader(config);
-            if (!t_reader.connect()) {
-                fprintf(stderr, "Thread %zu failed to connect to PostGIS\n", i);
+            try {
+                PostGISReader t_reader(config);
+                if (!t_reader.connect()) {
+                    fprintf(stderr, "Thread %zu failed to connect to PostGIS\n", i);
+                    ErrorLogger::instance().log_error(ErrorSource::POSTGIS_READ, 0, 0, 0,
+                                                      "Thread " + std::to_string(i) + ": connection failed");
+                    thread_errors.fetch_add(1);
+                    t_reader.disconnect();
+                    return;
+                }
+
+                if (!t_reader.read_features(sst, layer, layername, i, num_threads)) {
+                    fprintf(stderr, "Thread %zu failed to read features\n", i);
+                    thread_errors.fetch_add(1);
+                    t_reader.disconnect();
+                    return;
+                }
+
+                total_features.fetch_add(t_reader.getTotalFeaturesProcessed());
+                total_parse_errors.fetch_add(t_reader.getParseErrors());
+                t_reader.disconnect();
+            } catch (const std::exception& e) {
+                fprintf(stderr, "Thread %zu exception: %s\n", i, e.what());
                 ErrorLogger::instance().log_error(ErrorSource::POSTGIS_READ, 0, 0, 0,
-                                                  "Thread " + std::to_string(i) + ": connection failed");
+                                                  std::string("Thread ") + std::to_string(i) + " exception: " + e.what());
                 thread_errors.fetch_add(1);
-                t_reader.disconnect();
-                return;
-            }
-
-            if (!t_reader.read_features(sst, layer, layername, i, num_threads)) {
-                fprintf(stderr, "Thread %zu failed to read features\n", i);
+            } catch (...) {
+                fprintf(stderr, "Thread %zu unknown exception\n", i);
+                ErrorLogger::instance().log_error(ErrorSource::POSTGIS_READ, 0, 0, 0,
+                                                  std::string("Thread ") + std::to_string(i) + " unknown exception");
                 thread_errors.fetch_add(1);
-                t_reader.disconnect();
-                return;
             }
-
-            total_features.fetch_add(t_reader.getTotalFeaturesProcessed());
-            total_parse_errors.fetch_add(t_reader.getParseErrors());
-            t_reader.disconnect();
         });
     }
 

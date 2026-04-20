@@ -6,13 +6,22 @@
 #include <chrono>
 #include <ctime>
 
-extern int quiet;
+static int error_logger_quiet = 0;
+
+void ErrorLogger::set_quiet(int q) {
+    error_logger_quiet = q;
+}
 
 static std::string current_timestamp() {
     auto now = std::chrono::system_clock::now();
     auto time_t_now = std::chrono::system_clock::to_time_t(now);
     char buf[64];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", std::localtime(&time_t_now));
+    struct tm tm_buf;
+    if (localtime_r(&time_t_now, &tm_buf) != nullptr) {
+        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm_buf);
+    } else {
+        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", std::gmtime(&time_t_now));
+    }
     return std::string(buf);
 }
 
@@ -49,13 +58,13 @@ bool ErrorLogger::initialize(const std::string& exec_path) {
                       "PRAGMA busy_timeout=5000;",
                       nullptr, nullptr, &err_msg);
     if (rc != SQLITE_OK) {
-        fprintf(stderr, "Warning: Failed to set SQLite pragmas: %s\n", err_msg);
-        sqlite3_free(err_msg);
+        fprintf(stderr, "Warning: Failed to set SQLite pragmas: %s\n", err_msg ? err_msg : "unknown");
+        if (err_msg) { sqlite3_free(err_msg); }
     }
 
     create_tables();
 
-    if (!quiet) {
+    if (!error_logger_quiet) {
         fprintf(stderr, "Error logger initialized: %s\n", db_path_.c_str());
     }
 
@@ -95,25 +104,60 @@ void ErrorLogger::create_tables() {
         ");";
 
     char* err_msg = nullptr;
-    sqlite3_exec(db, create_postgis_errors, nullptr, nullptr, &err_msg);
-    if (err_msg) { sqlite3_free(err_msg); }
+    int rc = sqlite3_exec(db, create_postgis_errors, nullptr, nullptr, &err_msg);
+    if (rc != SQLITE_OK && err_msg) {
+        fprintf(stderr, "Warning: Failed to create postgis_errors table: %s\n", err_msg);
+        sqlite3_free(err_msg);
+    }
 
-    sqlite3_exec(db, create_mongo_errors, nullptr, nullptr, &err_msg);
-    if (err_msg) { sqlite3_free(err_msg); }
+    err_msg = nullptr;
+    rc = sqlite3_exec(db, create_mongo_errors, nullptr, nullptr, &err_msg);
+    if (rc != SQLITE_OK && err_msg) {
+        fprintf(stderr, "Warning: Failed to create mongo_errors table: %s\n", err_msg);
+        sqlite3_free(err_msg);
+    }
 
-    sqlite3_exec(db, create_general_errors, nullptr, nullptr, &err_msg);
-    if (err_msg) { sqlite3_free(err_msg); }
+    err_msg = nullptr;
+    rc = sqlite3_exec(db, create_general_errors, nullptr, nullptr, &err_msg);
+    if (rc != SQLITE_OK && err_msg) {
+        fprintf(stderr, "Warning: Failed to create general_errors table: %s\n", err_msg);
+        sqlite3_free(err_msg);
+    }
 }
 
 void ErrorLogger::begin_transaction() {
     auto* db = reinterpret_cast<sqlite3*>(db_);
-    sqlite3_exec(db, "BEGIN TRANSACTION", nullptr, nullptr, nullptr);
+    char* err_msg = nullptr;
+    int rc = sqlite3_exec(db, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Warning: Failed to begin transaction: %s\n", err_msg ? err_msg : "unknown");
+        if (err_msg) sqlite3_free(err_msg);
+    }
 }
 
 void ErrorLogger::commit_transaction() {
     auto* db = reinterpret_cast<sqlite3*>(db_);
-    sqlite3_exec(db, "COMMIT TRANSACTION", nullptr, nullptr, nullptr);
+    char* err_msg = nullptr;
+    int rc = sqlite3_exec(db, "COMMIT TRANSACTION", nullptr, nullptr, &err_msg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Warning: Failed to commit transaction: %s\n", err_msg ? err_msg : "unknown");
+        if (err_msg) sqlite3_free(err_msg);
+    }
     uncommitted_ = 0;
+}
+
+static void bind_text_checked(sqlite3_stmt* stmt, int idx, const std::string& val) {
+    int rc = sqlite3_bind_text(stmt, idx, val.c_str(), -1, SQLITE_TRANSIENT);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Warning: sqlite3_bind_text failed for param %d: rc=%d\n", idx, rc);
+    }
+}
+
+static void bind_int_checked(sqlite3_stmt* stmt, int idx, int val) {
+    int rc = sqlite3_bind_int(stmt, idx, val);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Warning: sqlite3_bind_int failed for param %d: rc=%d\n", idx, rc);
+    }
 }
 
 void ErrorLogger::log_error(ErrorSource source, int z, int x, int y,
@@ -153,17 +197,17 @@ void ErrorLogger::log_error(ErrorSource source, int z, int x, int y,
     }
 
     std::string ts = current_timestamp();
-    sqlite3_bind_text(stmt, 1, ts.c_str(), -1, SQLITE_TRANSIENT);
+    bind_text_checked(stmt, 1, ts);
 
     if (source == ErrorSource::POSTGIS_READ || source == ErrorSource::POSTGIS_PARSE) {
-        sqlite3_bind_int(stmt, 2, z);
-        sqlite3_bind_text(stmt, 3, "", -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 4, message.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 5, detail.c_str(), -1, SQLITE_TRANSIENT);
+        bind_int_checked(stmt, 2, z);
+        bind_text_checked(stmt, 3, "");
+        bind_text_checked(stmt, 4, message);
+        bind_text_checked(stmt, 5, detail);
     } else if (source == ErrorSource::MONGO_WRITE || source == ErrorSource::MONGO_FLUSH || source == ErrorSource::MONGO_CONNECT) {
-        sqlite3_bind_int(stmt, 2, z);
-        sqlite3_bind_int(stmt, 3, x);
-        sqlite3_bind_int(stmt, 4, y);
+        bind_int_checked(stmt, 2, z);
+        bind_int_checked(stmt, 3, x);
+        bind_int_checked(stmt, 4, y);
         const char* op_name = "";
         switch (source) {
             case ErrorSource::MONGO_WRITE:   op_name = "write_tile"; break;
@@ -171,14 +215,17 @@ void ErrorLogger::log_error(ErrorSource source, int z, int x, int y,
             case ErrorSource::MONGO_CONNECT: op_name = "connect"; break;
             default: break;
         }
-        sqlite3_bind_text(stmt, 5, op_name, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 6, message.c_str(), -1, SQLITE_TRANSIENT);
+        bind_text_checked(stmt, 5, op_name);
+        bind_text_checked(stmt, 6, message);
     } else {
-        sqlite3_bind_text(stmt, 2, "general", -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 3, message.c_str(), -1, SQLITE_TRANSIENT);
+        bind_text_checked(stmt, 2, "general");
+        bind_text_checked(stmt, 3, message);
     }
 
-    sqlite3_step(stmt);
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "Warning: sqlite3_step failed: rc=%d\n", rc);
+    }
     sqlite3_finalize(stmt);
 
     uncommitted_++;
@@ -211,13 +258,16 @@ void ErrorLogger::log_parse_error(int row, const std::string& geometry_type,
     }
 
     std::string ts = current_timestamp();
-    sqlite3_bind_text(stmt, 1, ts.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 2, row);
-    sqlite3_bind_text(stmt, 3, geometry_type.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 4, message.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 5, wkb_hex_preview.c_str(), -1, SQLITE_TRANSIENT);
+    bind_text_checked(stmt, 1, ts);
+    bind_int_checked(stmt, 2, row);
+    bind_text_checked(stmt, 3, geometry_type);
+    bind_text_checked(stmt, 4, message);
+    bind_text_checked(stmt, 5, wkb_hex_preview);
 
-    sqlite3_step(stmt);
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "Warning: sqlite3_step failed in log_parse_error: rc=%d\n", rc);
+    }
     sqlite3_finalize(stmt);
 
     uncommitted_++;
@@ -250,14 +300,17 @@ void ErrorLogger::log_mongo_error(int z, int x, int y,
     }
 
     std::string ts = current_timestamp();
-    sqlite3_bind_text(stmt, 1, ts.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 2, z);
-    sqlite3_bind_int(stmt, 3, x);
-    sqlite3_bind_int(stmt, 4, y);
-    sqlite3_bind_text(stmt, 5, operation.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 6, message.c_str(), -1, SQLITE_TRANSIENT);
+    bind_text_checked(stmt, 1, ts);
+    bind_int_checked(stmt, 2, z);
+    bind_int_checked(stmt, 3, x);
+    bind_int_checked(stmt, 4, y);
+    bind_text_checked(stmt, 5, operation);
+    bind_text_checked(stmt, 6, message);
 
-    sqlite3_step(stmt);
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "Warning: sqlite3_step failed in log_mongo_error: rc=%d\n", rc);
+    }
     sqlite3_finalize(stmt);
 
     uncommitted_++;
@@ -312,7 +365,10 @@ void ErrorLogger::close() {
         if (uncommitted_ > 0) {
             commit_transaction();
         }
-        sqlite3_close(reinterpret_cast<sqlite3*>(db_));
+        int rc = sqlite3_close(reinterpret_cast<sqlite3*>(db_));
+        if (rc != SQLITE_OK) {
+            fprintf(stderr, "Warning: sqlite3_close failed: rc=%d\n", rc);
+        }
         db_ = nullptr;
     }
 }
