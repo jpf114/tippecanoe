@@ -1,0 +1,8 @@
+
+================================================================
+PART 1: California.geojsonl Single File Tests (3.6GB, 11,542,912 features)
+================================================================
+
+--- Test: ca_z5_default ---
+Command: ./tippecanoe -q -f -z5 -o tests/big_data/output/ca_z5_default.mbtiles tests/big_data/California.geojsonl
+Output: tests/big_data/output/ca_z5_default.mbtiles
