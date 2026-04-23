@@ -80,7 +80,12 @@ bool ParallelReader::read_parallel(std::vector<struct serialization_state>& sst,
         return true;
     }
 
-    fprintf(stderr, "Starting parallel read with %zu threads (hash-based ctid sharding)\n", num_threads);
+    std::string shard_mode = config.shard_mode.empty() ? "auto" : config.shard_mode;
+    fprintf(stderr, "Starting parallel read with %zu threads (shard mode: %s", num_threads, shard_mode.c_str());
+    if (!config.shard_key.empty()) {
+        fprintf(stderr, ", shard key: %s", config.shard_key.c_str());
+    }
+    fprintf(stderr, ")\n");
 
     std::vector<std::thread> threads;
     std::atomic<size_t> thread_errors{0};

@@ -1344,6 +1344,11 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
 
         if (!plan.applied) {
             fprintf(stderr, "Thread %zu: sharding not available in mode '%s', falling back to sequential read\n", thread_id, shard_mode.c_str());
+            if (shard_mode == "auto" || shard_mode.empty()) {
+                fprintf(stderr, "  Diagnostic: auto mode failed because ctid is not available in subquery results\n");
+                fprintf(stderr, "  Solution: Use --postgis-shard-key=<column> --postgis-shard-mode=key\n");
+                fprintf(stderr, "  Example: --postgis-shard-key=ogc_fid --postgis-shard-mode=key\n");
+            }
             base_query = build_select_query(config, srid, conn);
             if (thread_id != 0) {
                 log_progress(0, 0, "Non-primary thread exiting (no sharding support)");

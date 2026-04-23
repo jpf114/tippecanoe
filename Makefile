@@ -77,7 +77,7 @@ INCLUDES = $(VCPKG_INCLUDE) -I. -Iclipper2/include
 LIBS = $(VCPKG_LIB)
 
 COMMON_LIBS = -lm -lz -lsqlite3 -lpthread
-DB_EXTRA_LIBS = -lpq -lmongocxx -lbsoncxx -lssl -lcrypto
+DB_EXTRA_LIBS = -lpq -lpgcommon -lpgport $(VCPKG_INSTALLED)/lib/libmongocxx-static.a $(VCPKG_INSTALLED)/lib/libbsoncxx-static.a $(VCPKG_INSTALLED)/lib/libmongoc2.a $(VCPKG_INSTALLED)/lib/libbson2.a $(VCPKG_INSTALLED)/lib/libutf8proc.a -lssl -lcrypto -lresolv -lz
 
 tippecanoe: geojson.o jsonpull/jsonpull.o tile.o pool.o mbtiles.o geometry.o projection.o memfile.o mvt.o serial.o main.o platform.o text.o dirtiles.o pmtiles_file.o plugin.o read_json.o write_json.o geobuf.o flatgeobuf.o evaluator.o geocsv.o csv.o geojson-loop.o json_logger.o visvalingam.o compression.o clip.o sort.o attribute.o thread.o shared_borders.o clipper2/src/clipper.engine.o
 	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(COMMON_LIBS)
