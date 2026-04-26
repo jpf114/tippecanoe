@@ -5,40 +5,41 @@
 #include <cstdio>
 #include <algorithm>
 
+extern int quiet;
+
 namespace PostGIS {
 
 static std::string validation_error;
 
+static bool should_emit_parallel_read_logs(const postgis_config &cfg) {
+    return cfg.enable_progress_report && !quiet;
+}
+
 bool validate_config(const postgis_config& cfg) {
     validation_error.clear();
 
-    if (cfg.host.empty()) {
-        validation_error = "PostGIS host is required";
-        return false;
-    }
-
     if (cfg.dbname.empty()) {
-        validation_error = "PostGIS database name is required";
+        validation_error = "PostGIS database name is required (for example: --postgis gis or --postgis-host/--postgis-dbname)";
         return false;
     }
 
-    if (cfg.user.empty()) {
-        validation_error = "PostGIS user is required";
+    if (!cfg.has_input_source()) {
+        validation_error = "Either PostGIS table or SQL query is required (--postgis-table or --postgis-sql)";
         return false;
     }
 
-    if (cfg.password.empty()) {
-        validation_error = "PostGIS password is required (use --postgis-password if empty)";
+    if (cfg.requires_explicit_geometry_field()) {
+        validation_error = "PostGIS geometry field is required (use --postgis-geometry-field unless your custom SQL already handles it)";
         return false;
     }
 
-    if (cfg.table.empty() && cfg.sql.empty()) {
-        validation_error = "Either PostGIS table or SQL query is required";
+    if (cfg.requires_selected_columns_for_best_effort()) {
+        validation_error = "--postgis-columns-best-effort requires --postgis-columns";
         return false;
     }
 
-    if (cfg.geometry_field.empty() && cfg.sql.empty()) {
-        validation_error = "PostGIS geometry field is required (unless using custom SQL)";
+    if (cfg.requires_shard_key()) {
+        validation_error = "--postgis-shard-key is required when --postgis-shard-mode=" + cfg.effective_shard_mode();
         return false;
     }
 
@@ -80,12 +81,18 @@ bool ParallelReader::read_parallel(std::vector<struct serialization_state>& sst,
         return true;
     }
 
-    std::string shard_mode = config.shard_mode.empty() ? "auto" : config.shard_mode;
-    fprintf(stderr, "Starting parallel read with %zu threads (shard mode: %s", num_threads, shard_mode.c_str());
-    if (!config.shard_key.empty()) {
-        fprintf(stderr, ", shard key: %s", config.shard_key.c_str());
+    if (should_emit_parallel_read_logs(config)) {
+        fprintf(stderr, "Starting parallel read with %zu threads", num_threads);
+        if (config.should_report_shard_strategy()) {
+            std::string shard_mode = config.effective_shard_mode();
+            fprintf(stderr, " (shard mode: %s", shard_mode.c_str());
+            if (!config.shard_key.empty()) {
+                fprintf(stderr, ", shard key: %s", config.shard_key.c_str());
+            }
+            fprintf(stderr, ")");
+        }
+        fprintf(stderr, "\n");
     }
-    fprintf(stderr, ")\n");
 
     std::vector<std::thread> threads;
     std::atomic<size_t> thread_errors{0};
@@ -131,13 +138,15 @@ bool ParallelReader::read_parallel(std::vector<struct serialization_state>& sst,
         t.join();
     }
 
-    if (thread_errors.load() > 0) {
+    if (thread_errors.load() > 0 && !quiet) {
         fprintf(stderr, "Warning: %zu of %zu threads encountered errors during parallel read\n",
                 thread_errors.load(), num_threads);
     }
 
-    fprintf(stderr, "Parallel read complete: %zu features, %zu parse errors\n",
-            total_features.load(), total_parse_errors.load());
+    if (should_emit_parallel_read_logs(config)) {
+        fprintf(stderr, "Parallel read complete: %zu features, %zu parse errors\n",
+                total_features.load(), total_parse_errors.load());
+    }
 
     return thread_errors.load() == 0;
 }

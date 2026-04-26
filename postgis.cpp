@@ -14,6 +14,8 @@
 #include "wkb_parser.hpp"
 #include "error_logger.hpp"
 
+extern int quiet;
+
 std::unordered_map<std::string, int> PostGISReader::srid_cache_;
 std::mutex PostGISReader::srid_cache_mutex_;
 static std::unordered_map<std::string, std::pair<long long, long long>> shard_range_cache;
@@ -24,6 +26,10 @@ static std::unordered_map<std::string, std::vector<std::string>> table_columns_c
 static std::mutex table_columns_cache_mutex;
 static std::unordered_map<std::string, std::vector<std::string>> sql_columns_cache;
 static std::mutex sql_columns_cache_mutex;
+
+static bool should_emit_postgis_runtime_logs(const postgis_config &config) {
+    return config.enable_progress_report && !quiet;
+}
 
 void PostGISReader::reset_runtime_caches() {
     {
@@ -470,14 +476,14 @@ static bool validate_selected_columns(PGconn *pgconn, const postgis_config &cfg,
             return false;
         }
     }
-    if (cfg.table.empty() && cfg.sql.empty()) {
+    if (!cfg.has_input_source()) {
         std::lock_guard<std::mutex> lock(selected_columns_validation_cache_mutex);
         selected_columns_validation_cache[cache_key] = true;
         return true;
     }
 
     std::unordered_map<std::string, bool> existing;
-    if (!cfg.sql.empty()) {
+    if (cfg.has_sql_input()) {
         if (!fetch_sql_subquery_columns(pgconn, cfg, existing)) {
             fprintf(stderr, "Error: failed to inspect columns for --postgis-sql: %s\n", PQerrorMessage(pgconn));
             std::lock_guard<std::mutex> lock(selected_columns_validation_cache_mutex);
@@ -582,9 +588,9 @@ static ShardPlan prepare_shard_plan(PGconn *pgconn,
                                     size_t num_threads) {
     ShardPlan plan;
     plan.query = base_query;
-    std::string shard_mode = config.shard_mode.empty() ? "auto" : config.shard_mode;
+    std::string shard_mode = config.effective_shard_mode();
 
-    if (shard_mode == "none") {
+    if (config.is_none_shard_mode()) {
         if (thread_id == 0) {
             return plan;
         }
@@ -596,7 +602,7 @@ static ShardPlan prepare_shard_plan(PGconn *pgconn,
     if (!config.shard_key.empty()) {
         char *esc_shard_key = PQescapeIdentifier(pgconn, config.shard_key.c_str(), config.shard_key.size());
         if (esc_shard_key == NULL) {
-            if (shard_mode == "key" || shard_mode == "range") {
+            if (config.is_key_shard_mode() || config.is_range_shard_mode()) {
                 fprintf(stderr, "Thread %zu: failed to escape shard key '%s'\n", thread_id, config.shard_key.c_str());
                 plan.fatal = true;
             }
@@ -604,7 +610,7 @@ static ShardPlan prepare_shard_plan(PGconn *pgconn,
         }
         std::string esc_key = std::string(esc_shard_key);
 
-        if (shard_mode == "range" || shard_mode == "auto") {
+        if (config.can_attempt_range_sharding()) {
             std::string range_cache_key = config.host + "|" + config.port + "|" + config.dbname + "|" + config.shard_key + "|" + base_query;
             long long min_key = 0;
             long long max_key = -1;
@@ -634,7 +640,7 @@ static ShardPlan prepare_shard_plan(PGconn *pgconn,
                     has_range = true;
                     std::lock_guard<std::mutex> lock(shard_range_cache_mutex);
                     shard_range_cache[range_cache_key] = std::make_pair(min_key, max_key);
-                } else if (shard_mode == "range") {
+                } else if (config.is_range_shard_mode()) {
                     const char *db_err = PQerrorMessage(pgconn);
                     if (db_err != NULL && strstr(db_err, "invalid input syntax for type bigint") != NULL) {
                         fprintf(stderr, "Thread %zu: range sharding key '%s' is non-numeric; use --postgis-shard-mode=key or auto\n",
@@ -664,7 +670,7 @@ static ShardPlan prepare_shard_plan(PGconn *pgconn,
                                 plan.query = range_sharded_query;
                                 plan.applied = true;
                                 DEBUG_LOG("Thread %zu/%zu: using range sharding on key %s [%lld, %lld)", thread_id, num_threads, config.shard_key.c_str(), start, end);
-                            } else if (shard_mode == "range") {
+                            } else if (config.is_range_shard_mode()) {
                                 fprintf(stderr, "Thread %zu: range sharding probe failed for key '%s'\n", thread_id, config.shard_key.c_str());
                             }
                         } else {
@@ -675,7 +681,7 @@ static ShardPlan prepare_shard_plan(PGconn *pgconn,
                     }
             }
 
-            if (!plan.applied && shard_mode == "range") {
+            if (!plan.applied && config.is_range_shard_mode()) {
                 fprintf(stderr, "Thread %zu: configured range shard key '%s' is not usable; try shard-mode=key or auto\n", thread_id, config.shard_key.c_str());
                 PQfreemem(esc_shard_key);
                 plan.fatal = true;
@@ -683,7 +689,7 @@ static ShardPlan prepare_shard_plan(PGconn *pgconn,
             }
         }
 
-        if (!plan.no_work && !plan.applied && (shard_mode == "key" || shard_mode == "auto")) {
+        if (!plan.no_work && !plan.applied && config.can_attempt_key_sharding()) {
             std::string key_cond =
                 "(abs(hashtext(COALESCE(CAST(" + esc_key + " AS text), ''))) % " + std::to_string(num_threads) + ") = " + std::to_string(thread_id);
             std::string key_sharded_query = apply_shard_condition_to_query(base_query, key_cond);
@@ -691,7 +697,7 @@ static ShardPlan prepare_shard_plan(PGconn *pgconn,
                 plan.query = key_sharded_query;
                 plan.applied = true;
                 DEBUG_LOG("Thread %zu/%zu: using hash-based sharding on key %s", thread_id, num_threads, config.shard_key.c_str());
-            } else if (shard_mode == "key") {
+            } else if (config.is_key_shard_mode()) {
                 fprintf(stderr, "Thread %zu: configured shard key '%s' is not usable for key-hash sharding\n", thread_id, config.shard_key.c_str());
                 PQfreemem(esc_shard_key);
                 plan.fatal = true;
@@ -702,7 +708,7 @@ static ShardPlan prepare_shard_plan(PGconn *pgconn,
         PQfreemem(esc_shard_key);
     }
 
-    if (!plan.no_work && !plan.applied && shard_mode == "auto") {
+    if (!plan.no_work && !plan.applied && config.can_attempt_ctid_sharding()) {
         std::string ctid_cond = "(abs(hashtext(ctid::text)) % " + std::to_string(num_threads) + ") = " + std::to_string(thread_id);
         std::string ctid_sharded_query = apply_shard_condition_to_query(base_query, ctid_cond);
         if (probe_query_ok(pgconn, ctid_sharded_query)) {
@@ -717,14 +723,7 @@ static ShardPlan prepare_shard_plan(PGconn *pgconn,
 
 PostGISReader::PostGISReader(const postgis_config &cfg) : config(cfg), conn(NULL)
 {
-    if (config.batch_size < MIN_POSTGIS_BATCH_SIZE)
-    {
-        config.batch_size = MIN_POSTGIS_BATCH_SIZE;
-    }
-    else if (config.batch_size > MAX_POSTGIS_BATCH_SIZE)
-    {
-        config.batch_size = MAX_POSTGIS_BATCH_SIZE;
-    }
+    config.normalize();
 }
 
 PostGISReader::~PostGISReader()
@@ -794,7 +793,7 @@ int PostGISReader::get_cached_srid(const postgis_config &cfg, void *conn_ptr)
     std::string srid_query;
     int resolved_srid = 0;
 
-    if (!cfg.sql.empty())
+    if (cfg.has_sql_input())
     {
         std::string sql_geom_field = resolve_sql_geometry_field(pgconn, cfg);
         if (sql_geom_field.empty()) {
@@ -806,7 +805,7 @@ int PostGISReader::get_cached_srid(const postgis_config &cfg, void *conn_ptr)
         }
         srid_query = "SELECT ST_SRID(" + esc_geom + ") FROM (" + cfg.sql + ") AS _subq LIMIT 1";
     }
-    else if (!cfg.table.empty() && !cfg.geometry_field.empty())
+    else if (cfg.has_table_input() && !cfg.geometry_field.empty())
     {
         char *esc_geom = PQescapeIdentifier(pgconn, cfg.geometry_field.c_str(), cfg.geometry_field.size());
         char *esc_table = PQescapeIdentifier(pgconn, cfg.table.c_str(), cfg.table.size());
@@ -856,14 +855,14 @@ std::string PostGISReader::build_select_query(const postgis_config &cfg, int sri
     PGconn *pgconn = static_cast<PGconn *>(conn_ptr);
     std::vector<std::string> source_cols;
     std::unordered_map<std::string, bool> existing_cols;
-    if (!cfg.sql.empty()) {
+    if (cfg.has_sql_input()) {
         if (!fetch_sql_subquery_columns_ordered(pgconn, cfg, source_cols)) {
             return "";
         }
         for (const std::string &col : source_cols) {
             existing_cols[col] = true;
         }
-    } else if (!cfg.table.empty()) {
+    } else if (cfg.has_table_input()) {
         if (!fetch_table_columns(pgconn, cfg, cfg.table, source_cols)) {
             return "";
         }
@@ -880,7 +879,7 @@ std::string PostGISReader::build_select_query(const postgis_config &cfg, int sri
         projection = "*";
     }
 
-    if (!cfg.sql.empty())
+    if (cfg.has_sql_input())
     {
         std::string sql_geom_field = resolve_sql_geometry_field(pgconn, cfg);
         if (sql_geom_field.empty()) {
@@ -929,7 +928,7 @@ bool PostGISReader::check_memory_usage()
         return false;
     }
 
-    if (estimated > limit * 0.8)
+    if (estimated > limit * 0.8 && should_emit_postgis_runtime_logs(config))
     {
         fprintf(stderr, "WARNING: Memory usage at %.1f%% (%zu MB / %zu MB)\n",
                 (double)estimated / limit * 100.0,
@@ -942,7 +941,7 @@ bool PostGISReader::check_memory_usage()
 
 void PostGISReader::log_progress(size_t processed, size_t total, const char *stage)
 {
-    if (!config.enable_progress_report)
+    if (!should_emit_postgis_runtime_logs(config))
         return;
 
     if (total > 0)
@@ -1187,9 +1186,8 @@ void PostGISReader::process_feature(PGresult *res, int row, int nfields, int wkb
             return a.key < b.key;
         });
     } else {
-        std::sort(attrs.begin(), attrs.end(), [](const AttrKV &a, const AttrKV &b) {
-            return a.key < b.key;
-        });
+        // Preserve the SELECT/result-set field order so PostGIS input can match
+        // native tippecanoe output when users disable canonical attribute sorting.
     }
 
     std::vector<std::shared_ptr<std::string>> full_keys;
@@ -1259,7 +1257,9 @@ bool PostGISReader::execute_query_with_retry(const std::string &query)
         retries++;
         if (retries < config.max_retries)
         {
-            fprintf(stderr, "Retrying query (attempt %d/%d)...\n", retries + 1, config.max_retries);
+            if (should_emit_postgis_runtime_logs(config)) {
+                fprintf(stderr, "Retrying query (attempt %d/%d)...\n", retries + 1, config.max_retries);
+            }
             usleep(1000000);
         }
     }
@@ -1311,11 +1311,11 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
     }
 
     std::string base_query;
-    if (!config.sql.empty())
+    if (config.has_sql_input())
     {
         base_query = build_select_query(config, srid, conn);
     }
-    else if (!config.table.empty() && !config.geometry_field.empty())
+    else if (config.has_table_input() && !config.geometry_field.empty())
     {
         base_query = build_select_query(config, srid, conn);
     }
@@ -1331,7 +1331,7 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
 
     if (num_threads > 1)
     {
-        std::string shard_mode = config.shard_mode.empty() ? "auto" : config.shard_mode;
+        std::string shard_mode = config.effective_shard_mode();
         ShardPlan plan = prepare_shard_plan(pgconn, config, base_query, thread_id, num_threads);
         if (plan.fatal) {
             return false;
@@ -1343,11 +1343,13 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
         base_query = plan.query;
 
         if (!plan.applied) {
-            fprintf(stderr, "Thread %zu: sharding not available in mode '%s', falling back to sequential read\n", thread_id, shard_mode.c_str());
-            if (shard_mode == "auto" || shard_mode.empty()) {
-                fprintf(stderr, "  Diagnostic: auto mode failed because ctid is not available in subquery results\n");
-                fprintf(stderr, "  Solution: Use --postgis-shard-key=<column> --postgis-shard-mode=key\n");
-                fprintf(stderr, "  Example: --postgis-shard-key=ogc_fid --postgis-shard-mode=key\n");
+            if (thread_id == 0 && should_emit_postgis_runtime_logs(config)) {
+                fprintf(stderr, "Thread %zu: sharding not available in mode '%s', falling back to sequential read\n", thread_id, shard_mode.c_str());
+                if (shard_mode == "auto") {
+                    fprintf(stderr, "  Diagnostic: auto mode failed because ctid is not available in subquery results\n");
+                    fprintf(stderr, "  Solution: Use --postgis-shard-key=<column> --postgis-shard-mode=key\n");
+                    fprintf(stderr, "  Example: --postgis-shard-key=ogc_fid --postgis-shard-mode=key\n");
+                }
             }
             base_query = build_select_query(config, srid, conn);
             if (thread_id != 0) {
@@ -1395,7 +1397,9 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
     };
 
     auto run_standard_query_mode = [&]() -> bool {
-        fprintf(stderr, "Thread %zu: Using standard query mode\n", thread_id);
+        if (should_emit_postgis_runtime_logs(config)) {
+            fprintf(stderr, "Thread %zu: Using standard query mode\n", thread_id);
+        }
         PGresult *res = PQexec((PGconn *)conn, base_query.c_str());
         if (PQresultStatus(res) != PGRES_TUPLES_OK) {
             fprintf(stderr, "Thread %zu: Query failed: %s\n", thread_id, PQerrorMessage((PGconn *)conn));
@@ -1403,7 +1407,9 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
             return false;
         }
         int ntuples = PQntuples(res);
-        fprintf(stderr, "Thread %zu: Processing %d features\n", thread_id, ntuples);
+        if (should_emit_postgis_runtime_logs(config)) {
+            fprintf(stderr, "Thread %zu: Processing %d features\n", thread_id, ntuples);
+        }
         int wkb_field_index = find_wkb_field_index(res, "query");
         if (wkb_field_index == -1) {
             PQclear(res);
@@ -1421,8 +1427,10 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
 
     if (config.use_cursor && (total_count == 0 || total_count > config.batch_size))
     {
-        fprintf(stderr, "Thread %zu: Using cursor-based batch processing (batch size: %zu)\n",
-                thread_id, config.batch_size);
+        if (should_emit_postgis_runtime_logs(config)) {
+            fprintf(stderr, "Thread %zu: Using cursor-based batch processing (batch size: %zu)\n",
+                    thread_id, config.batch_size);
+        }
 
         std::string cursor_name = "pg_cursor_" + std::to_string(getpid()) + "_" + std::to_string(thread_id);
         std::string begin_query = "BEGIN ISOLATION LEVEL REPEATABLE READ";
@@ -1437,13 +1445,17 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
             }
             else
             {
-                fprintf(stderr, "Thread %zu: Failed to declare cursor, falling back to non-cursor mode\n", thread_id);
+                if (should_emit_postgis_runtime_logs(config)) {
+                    fprintf(stderr, "Thread %zu: Failed to declare cursor, falling back to non-cursor mode\n", thread_id);
+                }
                 execute_query("ROLLBACK");
             }
         }
         else
         {
-            fprintf(stderr, "Thread %zu: Failed to begin transaction, falling back to non-cursor mode\n", thread_id);
+            if (should_emit_postgis_runtime_logs(config)) {
+                fprintf(stderr, "Thread %zu: Failed to begin transaction, falling back to non-cursor mode\n", thread_id);
+            }
         }
 
         if (cursor_ok)
@@ -1507,9 +1519,11 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
     }
 
     log_progress(total_features_processed.load(), total_count, "Completed");
-    fprintf(stderr, "Thread %zu: Total features processed: %zu in %zu batches (parse errors: %zu)\n",
-            thread_id, total_features_processed.load(), total_batches_processed.load(), parse_errors_.load());
-    if (config.profile) {
+    if (should_emit_postgis_runtime_logs(config)) {
+        fprintf(stderr, "Thread %zu: Total features processed: %zu in %zu batches (parse errors: %zu)\n",
+                thread_id, total_features_processed.load(), total_batches_processed.load(), parse_errors_.load());
+    }
+    if (config.profile && !quiet) {
         long long t_total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                    std::chrono::steady_clock::now() - t_start)
                                    .count();

@@ -71,6 +71,7 @@
 #include "mongo_manager.hpp"
 #include "error_logger.hpp"
 #include "common_main.hpp"
+#include "db_options.hpp"
 
 static int low_detail = 12;
 static int full_detail = -1;
@@ -129,12 +130,102 @@ char **av;
 
 std::vector<clipbbox> clipbboxes;
 
+static void print_core_usage(const char *progname, struct option *long_options_orig) {
+	int width = 7 + strlen(progname);
+	fprintf(stderr, "Usage: %s [options]\n", progname);
+	fprintf(stderr, "  Core options\n        ");
+
+	for (size_t lo = 0; long_options_orig[lo].name != NULL; lo++) {
+		if (long_options_orig[lo].val == 0) {
+			continue;
+		}
+		if (!is_core_db_help_option(long_options_orig[lo].name)) {
+			continue;
+		}
+
+		if (width + strlen(long_options_orig[lo].name) + 9 >= 80) {
+			fprintf(stderr, "\n        ");
+			width = 8;
+		}
+
+		width += strlen(long_options_orig[lo].name) + 9;
+		if (strcmp(long_options_orig[lo].name, "output") == 0) {
+			fprintf(stderr, " --%s=output.mbtiles", long_options_orig[lo].name);
+			width += 9;
+		} else if (long_options_orig[lo].has_arg) {
+			fprintf(stderr, " [--%s=...]", long_options_orig[lo].name);
+		} else {
+			fprintf(stderr, " [--%s]", long_options_orig[lo].name);
+		}
+	}
+
+	fprintf(stderr, "\n");
+	fprintf(stderr, "\n");
+	fprintf(stderr, "  Core workflow\n");
+	fprintf(stderr, "    --postgis + (--postgis-table or --postgis-sql)\n");
+	fprintf(stderr, "    --postgis-geometry-field is only needed when the geometry column is not the default or cannot be inferred\n");
+	fprintf(stderr, "    --mongo for business output, -o for MBTiles verification output\n");
+	fprintf(stderr, "    -z / -Z to control zoom range\n");
+	fprintf(stderr, "    --postgis short form: dbname[:user[:password[:host[:port]]]]\n");
+	fprintf(stderr, "    --mongo short form: dbname:collection[:username[:password[:host[:port[:auth_source]]]]]\n");
+	fprintf(stderr, "\n");
+	fprintf(stderr, "  Note\n");
+	fprintf(stderr, "    Advanced and expert database tuning options remain supported for compatibility,\n");
+	fprintf(stderr, "    but are hidden from the main help output.\n");
+	fprintf(stderr, "    Use --help-advanced to inspect them.\n");
+}
+
+static void print_db_help_group(const char *title, struct option *long_options_orig, bool (*matcher)(const char *)) {
+	int width = 8;
+	fprintf(stderr, "  %s\n        ", title);
+
+	for (size_t lo = 0; long_options_orig[lo].name != NULL; lo++) {
+		if (long_options_orig[lo].val == 0) {
+			continue;
+		}
+		if (!matcher(long_options_orig[lo].name)) {
+			continue;
+		}
+
+		if (width + strlen(long_options_orig[lo].name) + 9 >= 80) {
+			fprintf(stderr, "\n        ");
+			width = 8;
+		}
+
+		width += strlen(long_options_orig[lo].name) + 9;
+		if (long_options_orig[lo].has_arg) {
+			fprintf(stderr, " [--%s=...]", long_options_orig[lo].name);
+		} else {
+			fprintf(stderr, " [--%s]", long_options_orig[lo].name);
+		}
+	}
+
+	fprintf(stderr, "\n");
+}
+
+static void print_advanced_usage(const char *progname, struct option *long_options_orig) {
+	print_core_usage(progname, long_options_orig);
+	fprintf(stderr, "\n");
+	print_db_help_group("Advanced database options", long_options_orig, is_advanced_db_help_option);
+	fprintf(stderr, "\n");
+	print_db_help_group("Expert database options", long_options_orig, is_expert_db_help_option);
+	fprintf(stderr, "\n");
+	fprintf(stderr, "  Guidance\n");
+	fprintf(stderr, "    Prefer the short forms of --postgis and --mongo first.\n");
+	fprintf(stderr, "    Only reach for expert options when you are tuning performance or troubleshooting.\n");
+	fprintf(stderr, "    Legacy PostGIS tuning flags for attribute ordering, exact counts, and profiling remain accepted,\n");
+	fprintf(stderr, "    but are now hidden from help because they are no longer part of the normal usage path.\n");
+	fprintf(stderr, "    MongoDB metadata and fail-on-discard are enabled by default; the legacy enable flags remain accepted for compatibility.\n");
+}
+
 static void validate_postgis_config() {
 	if (!use_postgis) {
-		fprintf(stderr, "Error: PostGIS configuration is required\n");
+		fprintf(stderr, "Error: PostGIS input is required. Use --postgis plus --postgis-table or --postgis-sql.\n");
 		exit(EXIT_ARGS);
 	}
 
+	postgis_cfg.normalize();
+	
 	if (!PostGIS::validate_config(postgis_cfg)) {
 		fprintf(stderr, "Error: %s\n", PostGIS::get_validation_error().c_str());
 		exit(EXIT_ARGS);
@@ -143,42 +234,30 @@ static void validate_postgis_config() {
 
 static void validate_mongo_config() {
 	if (!use_mongo) {
-		fprintf(stderr, "Error: MongoDB output is required. Use --mongo or --mongo-dbname etc.\n");
+		fprintf(stderr, "Error: MongoDB business output is required. Use --mongo in short form or explicit Mongo options.\n");
 		exit(EXIT_ARGS);
 	}
+
+	mongo_cfg.normalize();
 
 	auto mongo_validation_error = MongoDB::validate_config(mongo_cfg);
 	if (mongo_validation_error.has_value()) {
 		fprintf(stderr, "Error: %s\n", mongo_validation_error.value().c_str());
 		exit(EXIT_ARGS);
 	}
-
-	mongo_cfg.normalize();
-
-	if (!quiet) {
-		fprintf(stderr, "MongoDB output enabled: %s.%s (batch size: %zu, fail-on-discard: %s)\n",
-				mongo_cfg.dbname.c_str(), mongo_cfg.collection.c_str(), mongo_cfg.batch_size,
-				mongo_cfg.fail_on_discard ? "true" : "false");
-	}
 }
 
 static void validate_runtime_config() {
 	if (use_postgis) {
+		if (postgis_cfg.has_table_input() && postgis_cfg.has_sql_input() && !quiet) {
+			fprintf(stderr, "Warning: both --postgis-table and --postgis-sql were provided; --postgis-sql will take precedence.\n");
+		}
+
 		if (!postgis_cfg.selected_columns_csv.empty() && split_csv_list(postgis_cfg.selected_columns_csv).empty()) {
 			fprintf(stderr, "Error: --postgis-columns is empty after parsing\n");
 			exit(EXIT_ARGS);
 		}
-		if (postgis_cfg.selected_columns_best_effort && postgis_cfg.selected_columns_csv.empty()) {
-			fprintf(stderr, "Error: --postgis-columns-best-effort requires --postgis-columns\n");
-			exit(EXIT_ARGS);
-		}
-
-		if ((postgis_cfg.shard_mode == "key" || postgis_cfg.shard_mode == "range") && postgis_cfg.shard_key.empty()) {
-			fprintf(stderr, "Error: --postgis-shard-key is required when --postgis-shard-mode=%s\n", postgis_cfg.shard_mode.c_str());
-			exit(EXIT_ARGS);
-		}
-
-		if (!postgis_cfg.shard_key.empty() && postgis_cfg.shard_mode == "none" && !quiet) {
+		if (postgis_cfg.ignores_shard_key() && !quiet) {
 			fprintf(stderr, "Warning: --postgis-shard-key is ignored when --postgis-shard-mode=none\n");
 		}
 	}
@@ -188,8 +267,240 @@ static void validate_runtime_config() {
 	}
 }
 
+static void print_effective_db_runtime_summary() {
+	if (quiet) {
+		return;
+	}
+
+	if (use_postgis) {
+		std::string input_mode_storage = postgis_cfg.input_mode_label();
+		const char *input_mode = input_mode_storage.c_str();
+		std::string source_storage = postgis_cfg.has_sql_input() ? "custom-sql" : postgis_cfg.effective_layer_name();
+		const char *source = source_storage.c_str();
+		fprintf(stderr,
+		        "PostGIS input enabled: %s@%s:%s/%s (mode: %s, source: %s",
+		        postgis_cfg.user.empty() ? "<default-user>" : postgis_cfg.user.c_str(),
+		        postgis_cfg.host.c_str(),
+		        postgis_cfg.port.c_str(),
+		        postgis_cfg.dbname.c_str(),
+		        input_mode,
+		        source);
+		if (postgis_cfg.should_report_geometry_field()) {
+			fprintf(stderr, ", geometry: %s", postgis_cfg.geometry_field.c_str());
+		}
+		if (postgis_cfg.should_report_selected_columns()) {
+			fprintf(stderr, ", columns: %s", postgis_cfg.selected_columns_csv.c_str());
+		}
+		if (postgis_cfg.should_report_shard_strategy()) {
+			fprintf(stderr, ", shard: %s", postgis_cfg.effective_shard_mode().c_str());
+			if (!postgis_cfg.shard_key.empty()) {
+				fprintf(stderr, ", shard-key: %s", postgis_cfg.shard_key.c_str());
+			}
+		}
+		if (postgis_cfg.has_read_tuning_overrides()) {
+			fprintf(stderr, ", read:");
+			if (!postgis_cfg.uses_default_batch_size()) {
+				fprintf(stderr, " batch=%zu", postgis_cfg.batch_size);
+			}
+			if (!postgis_cfg.uses_cursor_by_default()) {
+				fprintf(stderr, " cursor=off");
+			}
+			if (!postgis_cfg.uses_default_memory_limit()) {
+				fprintf(stderr, " memory=%zuMB", postgis_cfg.max_memory_mb);
+			}
+			if (!postgis_cfg.uses_default_retry_policy()) {
+				fprintf(stderr, " retries=%d", postgis_cfg.max_retries);
+			}
+			if (!postgis_cfg.uses_default_progress_report()) {
+				fprintf(stderr, " progress=off");
+			}
+		}
+		if (postgis_cfg.has_attribute_strategy_overrides()) {
+			fprintf(stderr, ", attrs:");
+			if (postgis_cfg.selected_columns_best_effort) {
+				fprintf(stderr, " best-effort-columns");
+			}
+			if (!postgis_cfg.uses_default_attribute_order()) {
+				fprintf(stderr, " canonical-order");
+			}
+		}
+		if (postgis_cfg.has_debug_strategy_overrides()) {
+			fprintf(stderr, ", debug:");
+			if (!postgis_cfg.uses_default_exact_count_strategy()) {
+				fprintf(stderr, " exact-count");
+			}
+			if (!postgis_cfg.uses_default_profile_strategy()) {
+				fprintf(stderr, " profile");
+			}
+		}
+		fprintf(stderr, ")\n");
+	}
+
+	if (use_mongo) {
+		const char *batch_mode = mongo_cfg.batch_size_explicitly_set ? "manual" : "auto";
+		fprintf(stderr, "MongoDB output enabled: %s.%s (batch: %s, metadata: %s",
+		        mongo_cfg.dbname.c_str(),
+		        mongo_cfg.collection.c_str(),
+		        batch_mode,
+		        mongo_cfg.write_metadata ? "on" : "off");
+		if (!mongo_cfg.uses_default_indexes()) {
+			fprintf(stderr, ", indexes: off");
+		}
+		if (!mongo_cfg.uses_default_fail_policy()) {
+			fprintf(stderr, ", fail-on-discard: off");
+		}
+		if (!mongo_cfg.uses_default_pool_size()) {
+			fprintf(stderr, ", pool: %zu", mongo_cfg.connection_pool_size);
+		}
+		if (!mongo_cfg.uses_default_timeout()) {
+			fprintf(stderr, ", timeout: %dms", mongo_cfg.timeout_ms);
+		}
+		fprintf(stderr, ")\n");
+	}
+}
+
+static void print_effective_output_summary(const db_output_mode &output_mode, const char *out_mbtiles, const char *out_dir) {
+	if (quiet) {
+		return;
+	}
+
+	if (output_mode.business_output && output_mode.has_mbtiles_verification) {
+		fprintf(stderr, "Output mode: MongoDB business output + MBTiles verification output (%s)\n", out_mbtiles);
+		return;
+	}
+
+	if (output_mode.business_output && output_mode.has_directory_tiles) {
+		fprintf(stderr, "Output mode: MongoDB business output + directory tile output (%s)\n", out_dir);
+		return;
+	}
+
+	if (output_mode.is_business_only()) {
+		fprintf(stderr, "Output mode: MongoDB business output only\n");
+		return;
+	}
+
+	if (output_mode.has_mbtiles_verification) {
+		fprintf(stderr, "Output mode: MBTiles local verification output only (%s)\n", out_mbtiles);
+		return;
+	}
+
+	if (output_mode.has_directory_tiles) {
+		fprintf(stderr, "Output mode: directory tile output only (%s)\n", out_dir);
+	}
+}
+
+static bool handle_postgis_option(const char *opt, const char *opt_value, const char *progname) {
+	if (strcmp(opt, "postgis") == 0) {
+		use_postgis = true;
+		return postgis_cfg.parse_connection_string(opt_value);
+	} else if (strcmp(opt, "postgis-host") == 0) {
+		postgis_cfg.host = opt_value;
+	} else if (strcmp(opt, "postgis-port") == 0) {
+		postgis_cfg.port = opt_value;
+	} else if (strcmp(opt, "postgis-dbname") == 0) {
+		postgis_cfg.dbname = opt_value;
+	} else if (strcmp(opt, "postgis-user") == 0) {
+		postgis_cfg.user = opt_value;
+	} else if (strcmp(opt, "postgis-password") == 0) {
+		postgis_cfg.password = opt_value;
+	} else if (strcmp(opt, "postgis-table") == 0) {
+		postgis_cfg.table = opt_value;
+	} else if (strcmp(opt, "postgis-geometry-field") == 0) {
+		postgis_cfg.geometry_field = opt_value;
+	} else if (strcmp(opt, "postgis-sql") == 0) {
+		postgis_cfg.sql = opt_value;
+	} else if (strcmp(opt, "postgis-columns") == 0) {
+		postgis_cfg.selected_columns_csv = opt_value;
+	} else if (strcmp(opt, "postgis-columns-best-effort") == 0) {
+		postgis_cfg.selected_columns_best_effort = true;
+	} else if (strcmp(opt, "postgis-canonical-attr-order") == 0) {
+		postgis_cfg.canonical_attr_order = true;
+	} else if (strcmp(opt, "postgis-no-canonical-attr-order") == 0) {
+		postgis_cfg.canonical_attr_order = false;
+	} else if (strcmp(opt, "postgis-profile") == 0) {
+		postgis_cfg.profile = true;
+	} else if (strcmp(opt, "postgis-shard-key") == 0) {
+		postgis_cfg.shard_key = opt_value;
+	} else if (strcmp(opt, "postgis-shard-mode") == 0) {
+		postgis_cfg.shard_mode = opt_value;
+		if (!postgis_cfg.has_supported_shard_mode()) {
+			fprintf(stderr, "%s: --postgis-shard-mode must be one of auto|none|key|range (got %s)\n", progname, opt_value);
+			return false;
+		}
+	} else if (strcmp(opt, "postgis-progress-count") == 0) {
+		postgis_cfg.progress_with_exact_count = true;
+	} else {
+		return false;
+	}
+
+	use_postgis = true;
+	return true;
+}
+
+static bool handle_mongo_option(const char *opt, const char *opt_value) {
+	if (strcmp(opt, "mongo") == 0) {
+		use_mongo = true;
+		return mongo_cfg.parse_connection_string(opt_value);
+	} else if (strcmp(opt, "mongo-host") == 0) {
+		mongo_cfg.host = opt_value;
+	} else if (strcmp(opt, "mongo-port") == 0) {
+		mongo_cfg.port = atoi_require(opt_value, "MongoDB port");
+	} else if (strcmp(opt, "mongo-dbname") == 0) {
+		mongo_cfg.dbname = opt_value;
+	} else if (strcmp(opt, "mongo-collection") == 0) {
+		mongo_cfg.collection = opt_value;
+	} else if (strcmp(opt, "mongo-username") == 0) {
+		mongo_cfg.username = opt_value;
+	} else if (strcmp(opt, "mongo-password") == 0) {
+		mongo_cfg.password = opt_value;
+	} else if (strcmp(opt, "mongo-auth-source") == 0) {
+		mongo_cfg.auth_source = opt_value;
+	} else if (strcmp(opt, "mongo-batch-size") == 0) {
+		mongo_cfg.batch_size = atoi_require(opt_value, "MongoDB batch size");
+		mongo_cfg.batch_size_explicitly_set = true;
+	} else if (strcmp(opt, "mongo-pool-size") == 0) {
+		mongo_cfg.connection_pool_size = atoi_require(opt_value, "MongoDB connection pool size");
+	} else if (strcmp(opt, "mongo-timeout") == 0) {
+		mongo_cfg.timeout_ms = atoi_require(opt_value, "MongoDB timeout");
+	} else if (strcmp(opt, "mongo-no-indexes") == 0) {
+		mongo_cfg.create_indexes = false;
+	} else if (strcmp(opt, "mongo-drop-collection") == 0) {
+		mongo_cfg.drop_collection_before_write = true;
+	} else if (strcmp(opt, "mongo-metadata") == 0) {
+		mongo_cfg.write_metadata = true;
+		mongo_cfg.metadata_explicitly_set = true;
+	} else if (strcmp(opt, "mongo-no-metadata") == 0) {
+		mongo_cfg.write_metadata = false;
+		mongo_cfg.metadata_explicitly_set = true;
+	} else if (strcmp(opt, "mongo-fail-on-discard") == 0) {
+		mongo_cfg.fail_on_discard = true;
+	} else if (strcmp(opt, "mongo-no-fail-on-discard") == 0) {
+		mongo_cfg.fail_on_discard = false;
+	} else {
+		return false;
+	}
+
+	use_mongo = true;
+	return true;
+}
+
+static db_output_mode normalize_runtime_defaults(bool has_mbtiles_output, bool has_dir_output) {
+	db_output_mode output_mode = determine_db_output_mode(use_mongo, has_mbtiles_output, has_dir_output);
+	db_runtime_defaults defaults = normalize_db_runtime_defaults(use_mongo, has_mbtiles_output, has_dir_output, mongo_cfg);
+
+	if (defaults.note_missing_mbtiles_verification && !quiet) {
+		fprintf(stderr, "Note: MongoDB output is enabled without MBTiles verification output (-o).\n");
+	}
+
+	if (defaults.note_dual_output_mode && !quiet) {
+		fprintf(stderr, "Note: Writing MongoDB business output and MBTiles verification output together.\n");
+	}
+
+	return output_mode;
+}
+
 static void auto_adjust_mongo_batch_size(size_t total_features, int maxzoom) {
-	if (mongo_cfg.batch_size != DEFAULT_MONGO_BATCH_SIZE) {
+	if (mongo_cfg.batch_size_explicitly_set) {
 		return;
 	}
 
@@ -285,7 +596,9 @@ static void read_postgis_data(std::string &layername, const char *fname,
 	}
 	total_features = parallel_reader.get_total_features();
 
-	auto_adjust_mongo_batch_size(total_features.load(), maxzoom);
+	if (use_mongo) {
+		auto_adjust_mongo_batch_size(total_features.load(), maxzoom);
+	}
 
 	for (size_t i = 0; i < CPUS; i++) {
 		dist_sum += dist_sums[i];
@@ -436,9 +749,13 @@ std::pair<int, metadata> read_input(std::string &layername, const char *fname, i
 		exit(EXIT_CLOSE);
 	}
 
+	db_output_mode output_mode = determine_db_output_mode(use_mongo, outdb != NULL, outdir != NULL);
 	validate_postgis_config();
-	validate_mongo_config();
+	if (output_mode.requires_mongo_output()) {
+		validate_mongo_config();
+	}
 	validate_runtime_config();
+	print_effective_db_runtime_summary();
 
 	double dist_sum = 0;
 	size_t dist_count = 0;
@@ -1614,6 +1931,7 @@ int maindb(int argc, char **argv) {
 		{"mongo-no-indexes", no_argument, 0, '~'},
 		{"mongo-drop-collection", no_argument, 0, '~'},
 		{"mongo-metadata", no_argument, 0, '~'},
+		{"mongo-no-metadata", no_argument, 0, '~'},
 		{"mongo-fail-on-discard", no_argument, 0, '~'},
 		{"mongo-no-fail-on-discard", no_argument, 0, '~'},
 
@@ -1760,6 +2078,7 @@ int maindb(int argc, char **argv) {
 		{"no-polygon-splitting", no_argument, &prevent[P_POLYGON_SPLIT], 1},
 		{"prefer-radix-sort", no_argument, &additional[A_PREFER_RADIX_SORT], 1},
 		{"help", no_argument, 0, 'H'},
+		{"help-advanced", no_argument, 0, '~'},
 
 		{0, 0, 0, 0},
 	};
@@ -1814,7 +2133,10 @@ int maindb(int argc, char **argv) {
 
 		case '~': {
 			const char *opt = long_options[option_index].name;
-			if (strcmp(opt, "tile-stats-attributes-limit") == 0) {
+			if (strcmp(opt, "help-advanced") == 0) {
+				print_advanced_usage(argv[0], long_options_orig);
+				exit(EXIT_SUCCESS);
+			} else if (strcmp(opt, "tile-stats-attributes-limit") == 0) {
 				max_tilestats_attributes = atoi(optarg);
 			} else if (strcmp(opt, "tile-stats-sample-values-limit") == 0) {
 				max_tilestats_sample_values = atoi(optarg);
@@ -1890,118 +2212,14 @@ int maindb(int argc, char **argv) {
 				unidecode_data = read_unidecode(optarg);
 			} else if (strcmp(opt, "maximum-string-attribute-length") == 0) {
 				maximum_string_attribute_length = atoll_require(optarg, "Maximum string attribute length");
-			} else if (strcmp(opt, "postgis") == 0) {
-				use_postgis = true;
-				if (!postgis_cfg.parse_connection_string(optarg)) {
+			} else if (strncmp(opt, "postgis", strlen("postgis")) == 0) {
+				if (!handle_postgis_option(opt, optarg, argv[0])) {
 					exit(EXIT_ARGS);
 				}
-			} else if (strcmp(opt, "postgis-host") == 0) {
-				postgis_cfg.host = optarg;
-				use_postgis = true;
-			} else if (strcmp(opt, "postgis-port") == 0) {
-				postgis_cfg.port = optarg;
-				use_postgis = true;
-			} else if (strcmp(opt, "postgis-dbname") == 0) {
-				postgis_cfg.dbname = optarg;
-				use_postgis = true;
-			} else if (strcmp(opt, "postgis-user") == 0) {
-				postgis_cfg.user = optarg;
-				use_postgis = true;
-			} else if (strcmp(opt, "postgis-password") == 0) {
-				postgis_cfg.password = optarg;
-				use_postgis = true;
-			} else if (strcmp(opt, "postgis-table") == 0) {
-				postgis_cfg.table = optarg;
-				use_postgis = true;
-			} else if (strcmp(opt, "postgis-geometry-field") == 0) {
-				postgis_cfg.geometry_field = optarg;
-				use_postgis = true;
-			} else if (strcmp(opt, "postgis-sql") == 0) {
-				postgis_cfg.sql = optarg;
-				use_postgis = true;
-			} else if (strcmp(opt, "postgis-columns") == 0) {
-				postgis_cfg.selected_columns_csv = optarg;
-				use_postgis = true;
-			} else if (strcmp(opt, "postgis-columns-best-effort") == 0) {
-				postgis_cfg.selected_columns_best_effort = true;
-				use_postgis = true;
-			} else if (strcmp(opt, "postgis-canonical-attr-order") == 0) {
-				postgis_cfg.canonical_attr_order = true;
-				use_postgis = true;
-			} else if (strcmp(opt, "postgis-no-canonical-attr-order") == 0) {
-				postgis_cfg.canonical_attr_order = false;
-				use_postgis = true;
-			} else if (strcmp(opt, "postgis-profile") == 0) {
-				postgis_cfg.profile = true;
-				use_postgis = true;
-			} else if (strcmp(opt, "postgis-shard-key") == 0) {
-				postgis_cfg.shard_key = optarg;
-				use_postgis = true;
-			} else if (strcmp(opt, "postgis-shard-mode") == 0) {
-				postgis_cfg.shard_mode = optarg;
-				if (postgis_cfg.shard_mode != "auto" &&
-				    postgis_cfg.shard_mode != "none" &&
-				    postgis_cfg.shard_mode != "key" &&
-				    postgis_cfg.shard_mode != "range") {
-					fprintf(stderr, "%s: --postgis-shard-mode must be one of auto|none|key|range (got %s)\n", argv[0], optarg);
+			} else if (strncmp(opt, "mongo", strlen("mongo")) == 0) {
+				if (!handle_mongo_option(opt, optarg)) {
 					exit(EXIT_ARGS);
 				}
-				use_postgis = true;
-			} else if (strcmp(opt, "postgis-progress-count") == 0) {
-				postgis_cfg.progress_with_exact_count = true;
-				use_postgis = true;
-			} else if (strcmp(opt, "mongo") == 0) {
-				// 解析单行配置：host:port:dbname:user:password:auth_source:collection
-				if (!mongo_cfg.parse_connection_string(optarg)) {
-					// parse_connection_string 已经输出详细错误信息
-					exit(EXIT_ARGS);
-				}
-				use_mongo = true;
-			} else if (strcmp(opt, "mongo-host") == 0) {
-				mongo_cfg.host = optarg;
-				use_mongo = true;
-			} else if (strcmp(opt, "mongo-port") == 0) {
-				mongo_cfg.port = atoi_require(optarg, "MongoDB port");
-				use_mongo = true;
-			} else if (strcmp(opt, "mongo-dbname") == 0) {
-				mongo_cfg.dbname = optarg;
-				use_mongo = true;
-			} else if (strcmp(opt, "mongo-collection") == 0) {
-				mongo_cfg.collection = optarg;
-				use_mongo = true;
-			} else if (strcmp(opt, "mongo-username") == 0) {
-				mongo_cfg.username = optarg;
-				use_mongo = true;
-			} else if (strcmp(opt, "mongo-password") == 0) {
-				mongo_cfg.password = optarg;
-				use_mongo = true;
-			} else if (strcmp(opt, "mongo-auth-source") == 0) {
-				mongo_cfg.auth_source = optarg;
-				use_mongo = true;
-			} else if (strcmp(opt, "mongo-batch-size") == 0) {
-				mongo_cfg.batch_size = atoi_require(optarg, "MongoDB batch size");
-				use_mongo = true;
-			} else if (strcmp(opt, "mongo-pool-size") == 0) {
-				mongo_cfg.connection_pool_size = atoi_require(optarg, "MongoDB connection pool size");
-				use_mongo = true;
-			} else if (strcmp(opt, "mongo-timeout") == 0) {
-				mongo_cfg.timeout_ms = atoi_require(optarg, "MongoDB timeout");
-				use_mongo = true;
-			} else if (strcmp(opt, "mongo-no-indexes") == 0) {
-				mongo_cfg.create_indexes = false;
-				use_mongo = true;
-			} else if (strcmp(opt, "mongo-drop-collection") == 0) {
-				mongo_cfg.drop_collection_before_write = true;
-				use_mongo = true;
-			} else if (strcmp(opt, "mongo-metadata") == 0) {
-				mongo_cfg.write_metadata = true;
-				use_mongo = true;
-			} else if (strcmp(opt, "mongo-fail-on-discard") == 0) {
-				mongo_cfg.fail_on_discard = true;
-				use_mongo = true;
-			} else if (strcmp(opt, "mongo-no-fail-on-discard") == 0) {
-				mongo_cfg.fail_on_discard = false;
-				use_mongo = true;
 			} else {
 				fprintf(stderr, "%s: Unrecognized option --%s\n", argv[0], opt);
 				exit(EXIT_ARGS);
@@ -2294,33 +2512,7 @@ int maindb(int argc, char **argv) {
 			if (i != 'H' && i != '?') {
 				fprintf(stderr, "Unknown option -%c\n", i);
 			}
-			int width = 7 + strlen(argv[0]);
-			fprintf(stderr, "Usage: %s [options]", argv[0]);
-			for (size_t lo = 0; long_options_orig[lo].name != NULL && strlen(long_options_orig[lo].name) > 0; lo++) {
-				if (long_options_orig[lo].val == 0) {
-					fprintf(stderr, "\n  %s\n        ", long_options_orig[lo].name);
-					width = 8;
-					continue;
-				}
-				if (width + strlen(long_options_orig[lo].name) + 9 >= 80) {
-					fprintf(stderr, "\n        ");
-					width = 8;
-				}
-				width += strlen(long_options_orig[lo].name) + 9;
-				if (strcmp(long_options_orig[lo].name, "output") == 0) {
-					fprintf(stderr, " --%s=output.mbtiles", long_options_orig[lo].name);
-					width += 9;
-				} else if (long_options_orig[lo].has_arg) {
-					fprintf(stderr, " [--%s=...]", long_options_orig[lo].name);
-				} else {
-					fprintf(stderr, " [--%s]", long_options_orig[lo].name);
-				}
-			}
-			if (width + 16 >= 80) {
-				fprintf(stderr, "\n        ");
-				width = 8;
-			}
-			fprintf(stderr, "\n");
+			print_core_usage(argv[0], long_options_orig);
 			if (i == 'H') {
 				exit(EXIT_SUCCESS);
 			} else {
@@ -2432,6 +2624,8 @@ int maindb(int argc, char **argv) {
 		fprintf(stderr, "Forcing -g0 since -B or -r is not known\n");
 	}
 
+	db_output_mode output_mode = normalize_runtime_defaults(out_mbtiles != NULL, out_dir != NULL);
+
 	if (out_mbtiles == NULL && out_dir == NULL && !use_mongo) {
 		fprintf(stderr, "%s: must specify -o out.mbtiles or -e directory or use --mongo for MongoDB output\n", av[0]);
 		exit(EXIT_ARGS);
@@ -2486,11 +2680,12 @@ int maindb(int argc, char **argv) {
 	if (use_postgis) {
 		PostGISReader::reset_runtime_caches();
 	}
+	print_effective_output_summary(output_mode, out_mbtiles, out_dir);
 
 	DEBUG_LOG("Starting data ingestion pipeline (read_input)...");
 	// 2. 调用 read_input() 读取 PostGIS 数据并写入瓦片
 	// read_input 内部会调用 traverse_zooms 进行瓦片写入
-	std::string postgis_layer = postgis_cfg.table.empty() ? "postgis" : postgis_cfg.table;
+	std::string postgis_layer = postgis_cfg.effective_layer_name();
 	const char *read_input_name = out_mbtiles ? out_mbtiles : (out_dir ? out_dir : "mongo-output");
 	DEBUG_LOG("Layer configuration: %s", postgis_layer.c_str());
 	auto input_ret = read_input(postgis_layer, read_input_name,

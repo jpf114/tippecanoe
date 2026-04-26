@@ -697,66 +697,37 @@ all of them should have had together.
 
 ## PostGIS Support
 
-Tippecanoe includes support for reading directly from PostGIS databases, allowing you to generate vector tilesets from spatial data stored in PostgreSQL/PostGIS without first exporting to intermediate files like GeoJSON.
+This repository includes a customized `tippecanoe-db` workflow for reading directly from PostGIS and optionally writing MongoDB business output alongside MBTiles verification output.
 
-### Using PostGIS Input
-
-To use PostGIS as an input source, you need to provide database connection parameters and specify either a table name with geometry field or a custom SQL query.
-
-#### Basic Usage
+### tippecanoe-db Quick Start
 
 ```bash
-# Using table and geometry field
-tippecanoe -o output.mbtiles \
-  --postgis-host localhost \
-  --postgis-port 5432 \
-  --postgis-dbname gis \
-  --postgis-user postgres \
-  --postgis-password password \
+tippecanoe-db \
+  --postgis "gis:postgres:password:localhost:5432" \
   --postgis-table roads \
-  --postgis-geometry-field geom
-
-# Using custom SQL query
-tippecanoe -o output.mbtiles \
-  --postgis-host localhost \
-  --postgis-port 5432 \
-  --postgis-dbname gis \
-  --postgis-user postgres \
-  --postgis-password password \
-  --postgis-sql "SELECT id, name, ST_AsGeoJSON(geom) as geojson FROM roads WHERE type='highway'"
-
-# Using combined connection string
-tippecanoe -o output.mbtiles \
-  --postgis "localhost:5432:gis:postgres:password:roads:geom"
+  --postgis-geometry-field geom \
+  --mongo "tiles:roads:admin:password:localhost:27017:admin" \
+  -o roads.mbtiles \
+  -Z5 -z10
 ```
 
-#### PostGIS Options
+Notes:
 
-| Option | Description |
-|--------|-------------|
-| `--postgis` | Combined PostGIS connection string in format: host:port:dbname:user:password:table:geometry_column[:sql] |
-| `--postgis-host` | Database host |
-| `--postgis-port` | Database port (default: 5432) |
-| `--postgis-dbname` | Database name |
-| `--postgis-user` | Database user |
-| `--postgis-password` | Database password |
-| `--postgis-table` | Table name (used with geometry-field to auto-generate SQL) |
-| `--postgis-geometry-field` | Geometry field name |
-| `--postgis-sql` | Custom SQL query (overrides table and geometry-field) |
+- Recommended PostGIS short form: `dbname[:user[:password[:host[:port]]]]`
+- Recommended Mongo short form: `dbname:collection[:username[:password[:host[:port[:auth_source]]]]]`
+- `--mongo` is business output; `-o` is MBTiles verification output
+- The default PostGIS attribute strategy now preserves source field order so MBTiles verification output matches native `tippecanoe` more closely by default
 
-### tippecanoe-db
+### More Detail
 
-Tippecanoe also provides a specialized executable `tippecanoe-db` that is optimized for working with PostGIS data. This executable includes all the same functionality as the main `tippecanoe` command but with additional optimizations for database operations.
-
-#### Usage
+Use these commands to inspect the current CLI surface:
 
 ```bash
-tippecanoe-db [options] -o output.mbtiles
+tippecanoe-db --help
+tippecanoe-db --help-advanced
 ```
 
-The `tippecanoe-db` command supports the same PostGIS connection options as the main `tippecanoe` command, but is specifically designed to handle large datasets directly from the database.
-
-For more detailed information about PostGIS support and `tippecanoe-db`, see the [PostGIS documentation](postgis.md) and [tippecanoe-db documentation](tippecanoe-db.md).
+The maintained database workflow guide is [docs/user_guide.md](docs/user_guide.md). Historical design and test notes live under [docs](docs).
 
 Development
 -----------

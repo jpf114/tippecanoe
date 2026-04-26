@@ -9,6 +9,7 @@
 #include <mutex>
 #include <random>
 #include <set>
+#include <cctype>
 #include <bsoncxx/builder/stream/document.hpp>
 #include <bsoncxx/document/view.hpp>
 #include <mongocxx/client.hpp>
@@ -51,6 +52,8 @@ struct mongo_config {
     bool drop_collection_before_write;
 
     bool write_metadata;
+    bool metadata_explicitly_set;
+    bool batch_size_explicitly_set;
 
     bool enable_progress_report;
 
@@ -58,13 +61,13 @@ struct mongo_config {
     bool fail_on_discard;
 
     mongo_config()
-        : host(""),
-          port(0),
+        : host("localhost"),
+          port(27017),
           dbname(""),
           collection(""),
           username(""),
           password(""),
-          auth_source(""),
+          auth_source("admin"),
           batch_size(DEFAULT_MONGO_BATCH_SIZE),
           connection_pool_size(DEFAULT_MONGO_CONNECTION_POOL_SIZE),
           timeout_ms(MONGO_TIMEOUT_MS),
@@ -75,6 +78,8 @@ struct mongo_config {
           create_indexes(true),
           drop_collection_before_write(false),
           write_metadata(false),
+          metadata_explicitly_set(false),
+          batch_size_explicitly_set(false),
           enable_progress_report(true),
           fail_on_discard(true)
     {
@@ -86,39 +91,92 @@ struct mongo_config {
         } else if (batch_size > MAX_MONGO_BATCH_SIZE) {
             batch_size = MAX_MONGO_BATCH_SIZE;
         }
+
+        if (connection_pool_size < 1) {
+            connection_pool_size = 1;
+        } else if (connection_pool_size > MAX_MONGO_CONNECTION_POOL_SIZE) {
+            connection_pool_size = MAX_MONGO_CONNECTION_POOL_SIZE;
+        }
+
+        if (timeout_ms < 1) {
+            timeout_ms = MONGO_TIMEOUT_MS;
+        }
+
+        if (max_retries < 1) {
+            max_retries = 1;
+        }
     }
 
     bool parse_connection_string(const std::string &conn_str) {
         std::vector<std::string> parts = split_by_delimiter(conn_str, ':');
 
-        if (parts.size() != 7) {
-            fprintf(stderr, "Error: MongoDB connection string must have exactly 7 parts\n");
-            fprintf(stderr, "Format: host:port:dbname:user:password:auth_source:collection\n");
-            fprintf(stderr, "Example: localhost:27017:gis:user:pass:admin:china\n");
+        if (parts.size() < 2) {
+            fprintf(stderr, "Error: MongoDB connection string must have at least 2 parts\n");
+            fprintf(stderr, "Short format: dbname:collection[:username[:password[:host[:port[:auth_source]]]]]\n");
+            fprintf(stderr, "Legacy format: host:port:dbname:user:password:auth_source:collection\n");
             fprintf(stderr, "Got %zu parts: %s\n", parts.size(), conn_str.c_str());
             return false;
         }
 
-        host = parts[0];
-        if (!parts[1].empty()) {
-            try {
-                port = std::stoi(parts[1]);
-            } catch (...) {
-                fprintf(stderr, "Error: Invalid port number: %s\n", parts[1].c_str());
+        bool legacy_format = false;
+        if (parts.size() == 7 && !parts[1].empty()) {
+            legacy_format = true;
+            for (char c : parts[1]) {
+                if (!std::isdigit(static_cast<unsigned char>(c))) {
+                    legacy_format = false;
+                    break;
+                }
+            }
+        }
+
+        if (legacy_format) {
+            host = parts[0];
+            if (!parts[1].empty()) {
+                try {
+                    port = std::stoi(parts[1]);
+                } catch (...) {
+                    fprintf(stderr, "Error: Invalid port number: %s\n", parts[1].c_str());
+                    return false;
+                }
+            }
+            dbname = parts[2];
+            username = parts[3];
+            password = parts[4];
+            auth_source = parts[5];
+            collection = parts[6];
+        } else {
+            if (parts.size() > 7) {
+                fprintf(stderr, "Error: MongoDB short connection string supports at most 7 parts\n");
+                fprintf(stderr, "Short format: dbname:collection[:username[:password[:host[:port[:auth_source]]]]]\n");
+                fprintf(stderr, "Legacy format: host:port:dbname:user:password:auth_source:collection\n");
+                fprintf(stderr, "Got %zu parts: %s\n", parts.size(), conn_str.c_str());
                 return false;
             }
-        } else {
-            port = 27017;
-        }
-        dbname = parts[2];
-        username = parts[3];
-        password = parts[4];
-        auth_source = parts[5];
-        collection = parts[6];
 
-        if (dbname.empty() || username.empty() || auth_source.empty() || collection.empty()) {
+            dbname = parts[0];
+            collection = parts[1];
+            if (parts.size() >= 3) username = parts[2];
+            if (parts.size() >= 4) password = parts[3];
+            if (parts.size() >= 5 && !parts[4].empty()) host = parts[4];
+            if (parts.size() >= 6 && !parts[5].empty()) {
+                try {
+                    port = std::stoi(parts[5]);
+                } catch (...) {
+                    fprintf(stderr, "Error: Invalid port number: %s\n", parts[5].c_str());
+                    return false;
+                }
+            }
+            if (parts.size() >= 7 && !parts[6].empty()) auth_source = parts[6];
+        }
+
+        if (dbname.empty() || collection.empty()) {
             fprintf(stderr, "Error: MongoDB connection string has empty required fields\n");
-            fprintf(stderr, "Format: host:port:dbname:user:password:auth_source:collection\n");
+            fprintf(stderr, "Short format: dbname:collection[:username[:password[:host[:port[:auth_source]]]]]\n");
+            return false;
+        }
+
+        if (username.empty() != password.empty()) {
+            fprintf(stderr, "Error: MongoDB username and password must be provided together\n");
             return false;
         }
 
@@ -195,6 +253,22 @@ struct mongo_config {
 
         uri_str += host + ":" + std::to_string(port) + "/" + dbname;
         return uri_str;
+    }
+
+    bool uses_default_pool_size() const {
+        return connection_pool_size == DEFAULT_MONGO_CONNECTION_POOL_SIZE;
+    }
+
+    bool uses_default_timeout() const {
+        return timeout_ms == MONGO_TIMEOUT_MS;
+    }
+
+    bool uses_default_indexes() const {
+        return create_indexes;
+    }
+
+    bool uses_default_fail_policy() const {
+        return fail_on_discard;
     }
 };
 

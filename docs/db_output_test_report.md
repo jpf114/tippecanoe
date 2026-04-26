@@ -6,6 +6,9 @@
 > CPU: 16核 | 内存: 7.6GB  
 > PostGIS: 10.1.0.16:5433/geoc_data (SRID 900914 CGCS2000)  
 > MongoDB: localhost:27017/tippecanoe_test  
+>
+> 说明：这是阶段性测试报告，不是当前 CLI 默认值说明。
+> 当前以 `tippecanoe-db --help`、`tippecanoe-db --help-advanced` 和 [user_guide.md](/home/tdt-dell/code/GitHubCode/tippecanoe/docs/user_guide.md) 为准。
 
 ---
 

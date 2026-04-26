@@ -97,8 +97,8 @@ tile-join: tile-join.o platform.o projection.o mbtiles.o mvt.o memfile.o dirtile
 tippecanoe-json-tool: jsontool.o jsonpull/jsonpull.o csv.o text.o geojson-loop.o
 	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(COMMON_LIBS)
 
-unit: unit.o text.o sort.o mvt.o projection.o clip.o attribute.o jsonpull/jsonpull.o evaluator.o read_json.o postgis.o wkb_parser.o error_logger.o serial.o geometry.o clipper2/src/clipper.engine.o
-	$(CXX) $(PG) $(LIBS) $(PGIS_LIB) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(COMMON_LIBS) -lpq -lsqlite3
+unit: unit.o text.o sort.o mvt.o projection.o clip.o attribute.o jsonpull/jsonpull.o evaluator.o read_json.o postgis.o wkb_parser.o error_logger.o serial.o geometry.o visvalingam.o clipper2/src/clipper.engine.o
+	$(CXX) $(PG) $(LIBS) $(PGIS_LIB) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(COMMON_LIBS) -lpq -lpgcommon -lpgport -lssl -lcrypto -lresolv -lsqlite3
 
 tippecanoe-overzoom: overzoom.o mvt.o clip.o evaluator.o jsonpull/jsonpull.o text.o attribute.o read_json.o projection.o read_json.o clipper2/src/clipper.engine.o
 	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(COMMON_LIBS)
@@ -129,6 +129,10 @@ tile-db.o: tile-db.cpp
 # Special rule for maindb.o with MongoDB headers (includes mongo.hpp)
 maindb.o: maindb.cpp
 	$(CXX) -MMD $(PG) $(PGIS_INCLUDE) $(INCLUDES) $(MONGO_CXX_INCLUDE) $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
+
+# Special rule for unit.o with MongoDB headers (tests include mongo.hpp helpers)
+unit.o: unit.cpp
+	$(CXX) -MMD $(PG) $(INCLUDES) $(MONGO_CXX_INCLUDE) $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
 
 %.o: %.c
 	$(CC) -MMD $(PG) $(INCLUDES) $(FINAL_FLAGS) $(CFLAGS) -c -o $@ $<

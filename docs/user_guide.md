@@ -91,8 +91,10 @@ ls -la tippecanoe-db
 
 ```bash
 tippecanoe-db \
-  --postgis "localhost:5432:mydb:postgres:password:mytable:geom" \
-  --mongo "localhost:27017:tilerender:admin:password:admin:mytiles" \
+  --postgis "mydb:postgres:password:localhost:5432" \
+  --postgis-table mytable \
+  --postgis-geometry-field geom \
+  --mongo "tilerender:mytiles:admin:password:localhost:27017:admin" \
   -z10 -Z5
 ```
 
@@ -100,16 +102,18 @@ tippecanoe-db \
 - 分片模式：`--postgis-shard-mode=auto`
 - 列校验：严格模式（未开启 `--postgis-columns-best-effort`）
 - 进度统计：不执行精确 `COUNT(*)`（未开启 `--postgis-progress-count`）
-- 属性顺序：开启主线一致性顺序（等价于 `--postgis-canonical-attr-order`）
+- 属性顺序：默认保留源字段顺序；只有显式指定 `--postgis-canonical-attr-order` 时才做 canonical 重排
+- Mongo metadata：默认写入；如需关闭，显式指定 `--mongo-no-metadata`
 
 #### 完整参数示例
 
 ```bash
 tippecanoe-db \
-  --postgis "localhost:5432:mydb:postgres:password:mytable:geom" \
-  --mongo "localhost:27017:tilerender:admin:password:admin:mytiles" \
+  --postgis "mydb:postgres:password:localhost:5432" \
+  --postgis-table mytable \
+  --postgis-geometry-field geom \
+  --mongo "tilerender:mytiles:admin:password:localhost:27017:admin" \
   --mongo-drop-collection \
-  --mongo-metadata \
   --mongo-batch-size 500 \
   -o output.mbtiles \
   -z10 -Z5 \
@@ -133,10 +137,11 @@ tippecanoe-db \
 
 ```bash
 tippecanoe-db \
-  --postgis "pg-host:5432:prod_gis:reader:password:mytable:geom" \
-  --mongo "mongo-host:27017:tile_service:writer:password:admin:mytiles" \
+  --postgis "prod_gis:reader:password:pg-host:5432" \
+  --postgis-table mytable \
+  --postgis-geometry-field geom \
+  --mongo "tile_service:mytiles:writer:password:mongo-host:27017:admin" \
   --mongo-drop-collection \
-  --mongo-metadata \
   --mongo-batch-size 500 \
   --mongo-pool-size 20 \
   --mongo-fail-on-discard \
@@ -165,18 +170,18 @@ tippecanoe-db \
 **方式一：连接字符串（推荐）**
 
 ```bash
---postgis "host:port:dbname:user:password:table:geometry_field"
+--postgis "dbname[:user[:password[:host[:port]]]]"
 ```
 
 | 部分 | 说明 | 示例 |
 |------|------|------|
-| host | 数据库主机 | localhost |
-| port | 数据库端口 | 5432 |
 | dbname | 数据库名 | TippTest |
 | user | 用户名 | postgres |
 | password | 密码 | mypassword |
-| table | 表名 | china |
-| geometry_field | 几何列名 | geom |
+| host | 数据库主机 | localhost |
+| port | 数据库端口 | 5432 |
+
+> 兼容说明：当前实现仍兼容旧的 host-first 连接串，但推荐统一使用上面的 dbname-first 短格式，并把表名、几何列名通过 `--postgis-table`、`--postgis-geometry-field` 单独传入。
 
 **方式二：独立参数**
 
@@ -208,8 +213,8 @@ tippecanoe-db \
 |------|------|--------|------|
 | `--postgis-columns` | 否 | 空（不裁剪） | 指定属性列白名单（CSV，不含几何列）；示例：`id,name,level` |
 | `--postgis-columns-best-effort` | 否 | 否 | 与 `--postgis-columns` 配合：遇到非法或不存在列时跳过并告警；未开启时严格失败 |
-| `--postgis-canonical-attr-order` | 否 | 是 | 启用主线对齐属性顺序（用于稳定输出与一致性对比） |
-| `--postgis-no-canonical-attr-order` | 否 | 否 | 关闭主线对齐属性顺序，改为通用按键名排序 |
+| `--postgis-canonical-attr-order` | 否 | 否 | 显式启用 canonical 属性顺序；主要用于专家级对齐/排障 |
+| `--postgis-no-canonical-attr-order` | 否 | 是（默认） | 默认保留源字段顺序，便于 MBTiles 校验结果贴近原生 tippecanoe |
 | `--postgis-profile` | 否 | 否 | 输出 PostGIS 读取性能摘要（总耗时、COUNT 耗时、features、batches） |
 | `--postgis-shard-key` | 否 | 空 | 指定并行分片字段（推荐整数主键） |
 | `--postgis-shard-mode` | 否 | `auto` | 分片模式：`auto`（range→key-hash→ctid→单线程）、`range`、`key`、`none` |
@@ -219,25 +224,26 @@ tippecanoe-db \
 - `--postgis-shard-mode=range|key` 时，必须同时提供 `--postgis-shard-key`
 - `--postgis-shard-mode=none` 时会禁用分片（非主线程退出）
 - `range` 模式要求分片键可转为 `bigint`，否则建议改用 `key` 或 `auto`
-- 常规场景无需设置 `--postgis-canonical-attr-order`，默认已开启；仅在需要时可用 `--postgis-no-canonical-attr-order` 关闭
+- 常规场景无需设置属性顺序参数，默认已保留源字段顺序
+- 若需要强制 canonical 顺序，再显式指定 `--postgis-canonical-attr-order`
 
 #### 3.2.2 MongoDB 输出参数（当前定制版本要求）
 
 **方式一：连接字符串（推荐）**
 
 ```bash
---mongo "host:port:dbname:user:password:auth_source:collection"
+--mongo "dbname:collection[:username[:password[:host[:port[:auth_source]]]]]"
 ```
 
 | 部分 | 说明 | 示例 |
 |------|------|------|
-| host | MongoDB 主机 | localhost |
-| port | MongoDB 端口 | 27017 |
 | dbname | 数据库名 | test |
+| collection | 集合名 | china |
 | user | 用户名 | admin |
 | password | 密码 | admin |
+| host | MongoDB 主机 | localhost |
+| port | MongoDB 端口 | 27017 |
 | auth_source | 认证数据库 | admin |
-| collection | 集合名 | china |
 
 **方式二：独立参数**
 
@@ -260,7 +266,7 @@ tippecanoe-db \
 | `--mongo-timeout` | 否 | 30000(ms) | 连接/读写超时 |
 | `--mongo-drop-collection` | 否 | 否 | 写入前删除集合，使用 insert 模式（性能更高） |
 | `--mongo-no-indexes` | 否 | 否 | 不创建索引 |
-| `--mongo-metadata` | 否 | 否 | 写入元数据到 `{collection}_metadata` 集合 |
+| `--mongo-no-metadata` | 否 | 否 | 默认会写入 `{collection}_metadata`；指定该参数后关闭 |
 | `--mongo-fail-on-discard` | 否 | 是 | 有瓦片被丢弃时返回非 0 退出码 |
 | `--mongo-no-fail-on-discard` | 否 | 否 | best-effort 模式：有丢弃仅告警，不作为失败退出 |
 
@@ -277,7 +283,7 @@ tippecanoe-db \
 | `--extend-zooms-if-still-dropping` | 否 | 如仍需丢弃则扩展 zoom 级别 |
 | `-x` / `--exclude` | 无 | 排除指定属性字段 |
 | `-y` / `--include` | 无 | 仅包含指定属性字段 |
-| `-j` / `--layer` | 表名 | 图层名称 |
+| 图层名 | 表名或 SQL 来源 | 当前 `tippecanoe-db` 默认从输入源推导，未单独暴露 layer 参数 |
 
 ### 3.3 典型操作流程
 
@@ -285,17 +291,18 @@ tippecanoe-db \
 
 ```bash
 tippecanoe-db \
-  --postgis "localhost:5432:mydb:postgres:pass:china:geom" \
-  --mongo "localhost:27017:tilerender:admin:pass:admin:china" \
+  --postgis "mydb:postgres:pass:localhost:5432" \
+  --postgis-table china \
+  --postgis-geometry-field geom \
+  --mongo "tilerender:china:admin:pass:localhost:27017:admin" \
   --mongo-drop-collection \
-  --mongo-metadata \
   -o china.mbtiles \
   -z10 -Z5
 ```
 
 **说明：**
 - `--mongo-drop-collection`：首次导入时删除旧数据，使用 insert 模式（性能最优）
-- `--mongo-metadata`：写入元数据，方便读取端获取瓦片集信息
+- metadata 默认写入，无需额外打开；如需关闭才使用 `--mongo-no-metadata`
 - `-o china.mbtiles`：同时生成 MBTiles 文件，用于验证
 
 #### 场景二：增量更新（部分 zoom 级别）
@@ -321,16 +328,14 @@ tippecanoe-db \
   --postgis-user postgres \
   --postgis-password pass \
   --postgis-sql "SELECT geom, name, pop FROM cities WHERE pop > 500000" \
-  --mongo "localhost:27017:tilerender:admin:pass:admin:cities_large" \
+  --mongo "tilerender:cities_large:admin:pass:localhost:27017:admin" \
   --mongo-drop-collection \
-  --mongo-metadata \
-  -z8 -Z3 \
-  -j cities
+  -z8 -Z3
 ```
 
 **说明：**
 - 使用 `--postgis-sql` 指定自定义查询，仅筛选人口大于 50 万的城市
-- `-j cities` 指定图层名称
+- 当前 `tippecanoe-db` 不单独暴露 layer 参数，图层名默认从 SQL/输入源推导
 
 ---
 
@@ -342,10 +347,11 @@ tippecanoe-db \
 
 ```bash
 tippecanoe-db \
-  --postgis "pg-host:5432:gis_data:reader:pass:admin_regions:geometry" \
-  --mongo "mongo-host:27017:tile_service:writer:pass:admin:admin_regions" \
+  --postgis "gis_data:reader:pass:pg-host:5432" \
+  --postgis-table admin_regions \
+  --postgis-geometry-field geometry \
+  --mongo "tile_service:admin_regions:writer:pass:mongo-host:27017:admin" \
   --mongo-drop-collection \
-  --mongo-metadata \
   -z12 -Z3 \
   --drop-densest-as-needed
 ```
@@ -396,24 +402,30 @@ async function getMetadata() {
 ```bash
 # 图层1：道路
 tippecanoe-db \
-  --postgis "pg-host:5432:gis:reader:pass:roads:geom" \
-  --mongo "mongo-host:27017:tiles:writer:pass:admin:roads" \
-  --mongo-drop-collection --mongo-metadata \
-  -z14 -Z5 -j roads
+  --postgis "gis:reader:pass:pg-host:5432" \
+  --postgis-table roads \
+  --postgis-geometry-field geom \
+  --mongo "tiles:roads:writer:pass:mongo-host:27017:admin" \
+  --mongo-drop-collection \
+  -z14 -Z5
 
 # 图层2：建筑
 tippecanoe-db \
-  --postgis "pg-host:5432:gis:reader:pass:buildings:geom" \
-  --mongo "mongo-host:27017:tiles:writer:pass:admin:buildings" \
-  --mongo-drop-collection --mongo-metadata \
-  -z16 -Z10 -j buildings
+  --postgis "gis:reader:pass:pg-host:5432" \
+  --postgis-table buildings \
+  --postgis-geometry-field geom \
+  --mongo "tiles:buildings:writer:pass:mongo-host:27017:admin" \
+  --mongo-drop-collection \
+  -z16 -Z10
 
 # 图层3：水系
 tippecanoe-db \
-  --postgis "pg-host:5432:gis:reader:pass:waterways:geom" \
-  --mongo "mongo-host:27017:tiles:writer:pass:admin:waterways" \
-  --mongo-drop-collection --mongo-metadata \
-  -z12 -Z4 -j waterways
+  --postgis "gis:reader:pass:pg-host:5432" \
+  --postgis-table waterways \
+  --postgis-geometry-field geom \
+  --mongo "tiles:waterways:writer:pass:mongo-host:27017:admin" \
+  --mongo-drop-collection \
+  -z12 -Z4
 ```
 
 ### 4.3 数据更新场景
@@ -859,7 +871,7 @@ tippecanoe-db 运行异常
 
 | 参数 | 短选项 | 必选 | 默认值 | 约束/说明 |
 |------|--------|------|--------|-----------|
-| `--postgis` | — | 条件必选 | — | 推荐。连接串：`host:port:dbname:user:password:table:geometry_field` |
+| `--postgis` | — | 条件必选 | — | 推荐。连接串：`dbname[:user[:password[:host[:port]]]]` |
 | `--postgis-host` | — | 条件必选 | localhost | 分字段模式下必填之一 |
 | `--postgis-port` | — | 条件必选 | 5432 | 分字段模式下必填之一 |
 | `--postgis-dbname` | — | 条件必选 | — | 分字段模式下必填之一 |
@@ -870,8 +882,8 @@ tippecanoe-db 运行异常
 | `--postgis-sql` | — | 条件必选 | — | 与 `--postgis-table` 路径二选一 |
 | `--postgis-columns` | — | 否 | 空 | 属性列白名单（CSV） |
 | `--postgis-columns-best-effort` | — | 否 | 否 | 仅与 `--postgis-columns` 一起使用 |
-| `--postgis-canonical-attr-order` | — | 否 | 是 | 主线一致性模式，稳定属性顺序 |
-| `--postgis-no-canonical-attr-order` | — | 否 | 否 | 关闭一致性顺序，使用通用排序 |
+| `--postgis-canonical-attr-order` | — | 否 | 否 | 显式启用 canonical 属性顺序 |
+| `--postgis-no-canonical-attr-order` | — | 否 | 是 | 默认保留源字段顺序 |
 | `--postgis-profile` | — | 否 | 否 | 输出 PostGIS 读取性能摘要 |
 | `--postgis-shard-key` | — | 否 | 空 | `range/key` 模式下必填 |
 | `--postgis-shard-mode` | — | 否 | `auto` | `auto/range/key/none` |
@@ -881,7 +893,7 @@ tippecanoe-db 运行异常
 
 | 参数 | 短选项 | 必选 | 默认值 | 约束/说明 |
 |------|--------|------|--------|-----------|
-| `--mongo` | — | 条件必选 | — | 推荐。连接串：`host:port:dbname:user:password:auth_source:collection` |
+| `--mongo` | — | 条件必选 | — | 推荐。连接串：`dbname:collection[:username[:password[:host[:port[:auth_source]]]]]` |
 | `--mongo-host` | — | 条件必选 | — | 分字段模式下必填之一 |
 | `--mongo-port` | — | 条件必选 | 27017 | 分字段模式下必填之一 |
 | `--mongo-dbname` | — | 条件必选 | — | 分字段模式下必填之一 |
@@ -894,7 +906,7 @@ tippecanoe-db 运行异常
 | `--mongo-timeout` | — | 否 | 30000 | 毫秒 |
 | `--mongo-drop-collection` | — | 否 | 否 | 首次全量导入常用 |
 | `--mongo-no-indexes` | — | 否 | 否 | 关闭自动建索引 |
-| `--mongo-metadata` | — | 否 | 否 | 写入 metadata 集合 |
+| `--mongo-no-metadata` | — | 否 | 否 | 默认 metadata 开启；指定后关闭 |
 | `--mongo-fail-on-discard` | — | 否 | 是 | 丢弃瓦片时非零退出 |
 | `--mongo-no-fail-on-discard` | — | 否 | 否 | best-effort 模式 |
 

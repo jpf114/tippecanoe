@@ -914,6 +914,71 @@ struct write_tile_args {
 	std::set<zxy> skip_children_out;     // what will be skipped in the next zoom
 };
 
+static void write_tile_outputs(int z, unsigned tx, unsigned ty, sqlite3 *outdb, const char *outdir, const std::string &compressed) {
+	// MongoDB uses thread-local writer instances, so the business output path does not need db_lock.
+	if (use_mongo) {
+		try {
+			MongoWriter *writer = MongoWriter::get_writer_instance(mongo_cfg);
+			if (writer != NULL) {
+				writer->write_tile(z, tx, ty, compressed.data(), compressed.size());
+			} else {
+				fprintf(stderr, "Error: Failed to get MongoDB writer instance for tile %d/%u/%u\n", z, tx, ty);
+				ErrorLogger::instance().log_mongo_error(z, tx, ty, "get_writer_instance", "Failed to get MongoDB writer instance");
+			}
+		} catch (const std::exception &e) {
+			fprintf(stderr, "Error: MongoDB write failed for tile %d/%u/%u: %s\n", z, tx, ty, e.what());
+			ErrorLogger::instance().log_mongo_error(z, tx, ty, "write_tile", e.what());
+		} catch (...) {
+			fprintf(stderr, "Error: MongoDB write failed with unknown error for tile %d/%u/%u\n", z, tx, ty);
+			ErrorLogger::instance().log_mongo_error(z, tx, ty, "write_tile", "Unknown MongoDB write error");
+		}
+	}
+
+	if (outdb != NULL || outdir != NULL) {
+		if (pthread_mutex_lock(&db_lock) != 0) {
+			perror("pthread_mutex_lock");
+			exit(EXIT_PTHREAD);
+		}
+
+		if (outdb != NULL) {
+			mbtiles_write_tile(outdb, z, tx, ty, compressed.data(), compressed.size());
+		} else if (outdir != NULL) {
+			dir_write_tile(outdir, z, tx, ty, compressed);
+		}
+
+		if (pthread_mutex_unlock(&db_lock) != 0) {
+			perror("pthread_mutex_unlock");
+			exit(EXIT_PTHREAD);
+		}
+	}
+}
+
+static void erase_zoom_outputs(int z, sqlite3 *outdb, const char *outdir) {
+	if (outdb != NULL) {
+		mbtiles_erase_zoom(outdb, z);
+	} else if (outdir != NULL) {
+		dir_erase_zoom(outdir, z);
+	}
+
+	if (use_mongo) {
+		try {
+			MongoWriter *writer = MongoWriter::get_writer_instance(mongo_cfg);
+			if (writer != NULL) {
+				writer->erase_zoom(z);
+			} else {
+				fprintf(stderr, "Error: Failed to get MongoDB writer instance for zoom erase %d\n", z);
+				ErrorLogger::instance().log_mongo_error(z, 0, 0, "get_writer_instance", "Failed to get MongoDB writer instance for erase_zoom");
+			}
+		} catch (const std::exception &e) {
+			fprintf(stderr, "Error: MongoDB erase zoom failed for z=%d: %s\n", z, e.what());
+			ErrorLogger::instance().log_mongo_error(z, 0, 0, "erase_zoom", e.what());
+		} catch (...) {
+			fprintf(stderr, "Error: MongoDB erase zoom failed with unknown error for z=%d\n", z);
+			ErrorLogger::instance().log_mongo_error(z, 0, 0, "erase_zoom", "Unknown MongoDB erase zoom error");
+		}
+	}
+}
+
 // Clips a feature's geometry to the tile bounds at the specified zoom level
 // with the specified buffer. Returns true if the feature was entirely clipped away
 // by bounding box alone; otherwise returns false.
@@ -2869,52 +2934,7 @@ long long write_tile(decompressor *geoms, std::atomic<long long> *geompos_in, ch
 					exit(EXIT_IMPOSSIBLE);
 				}
 
-				// Write to MongoDB (outside db_lock)
-				// MongoDB uses thread-local storage (TLS) instances â each thread
-				// has its own connection and batch buffer, so no external lock is needed.
-				// Moving this outside db_lock allows true concurrent writes to MongoDB
-				// across all worker threads.
-				if (use_mongo) {
-					try {
-						MongoWriter* writer = MongoWriter::get_writer_instance(mongo_cfg);
-						if (writer) {
-							writer->write_tile(z, tx, ty, compressed.data(), compressed.size());
-						} else {
-							fprintf(stderr, "Error: Failed to get MongoDB writer instance for tile %d/%u/%u\n",
-							        z, tx, ty);
-							ErrorLogger::instance().log_mongo_error(z, tx, ty,
-								"get_writer_instance", "Failed to get MongoDB writer instance");
-						}
-					} catch (const std::exception &e) {
-						fprintf(stderr, "Error: MongoDB write failed for tile %d/%u/%u: %s\n",
-						        z, tx, ty, e.what());
-						ErrorLogger::instance().log_mongo_error(z, tx, ty, "write_tile", e.what());
-					} catch (...) {
-						fprintf(stderr, "Error: MongoDB write failed with unknown error for tile %d/%u/%u\n",
-						        z, tx, ty);
-						ErrorLogger::instance().log_mongo_error(z, tx, ty,
-							"write_tile", "Unknown MongoDB write error");
-					}
-				}
-
-				// Write to file (optional) â requires db_lock for SQLite/dir thread safety
-				if (outdb != NULL || outdir != NULL) {
-					if (pthread_mutex_lock(&db_lock) != 0) {
-						perror("pthread_mutex_lock");
-						exit(EXIT_PTHREAD);
-					}
-
-					if (outdb != NULL) {
-						mbtiles_write_tile(outdb, z, tx, ty, compressed.data(), compressed.size());
-					} else if (outdir != NULL) {
-						dir_write_tile(outdir, z, tx, ty, compressed);
-					}
-
-					if (pthread_mutex_unlock(&db_lock) != 0) {
-						perror("pthread_mutex_unlock");
-						exit(EXIT_PTHREAD);
-					}
-				}
+				write_tile_outputs(z, tx, ty, outdb, outdir, compressed);
 
 				if (trying_to_stop_early && line_detail == first_detail) {
 					// We succeeded in stopping early.
@@ -3375,18 +3395,7 @@ int traverse_zooms(int *geomfd, off_t *geom_size, char *global_stringpool, std::
 			strategies[z] = s;
 
 			if (again) {
-				if (outdb != NULL) {
-					mbtiles_erase_zoom(outdb, z);
-				} else if (outdir != NULL) {
-					dir_erase_zoom(outdir, z);
-				}
-				// MongoDB 也需要删除已生成的 zoom 级别
-				if (use_mongo) {
-					MongoWriter* writer = MongoWriter::get_writer_instance(mongo_cfg);
-					if (writer) {
-						writer->erase_zoom(z);
-					}
-				}
+				erase_zoom_outputs(z, outdb, outdir);
 			} else {
 				break;
 			}

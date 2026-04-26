@@ -3,6 +3,8 @@
 > 版本：2.0  
 > 最后更新：2026-04-13  
 > 适用范围：tippecanoe-db 定制化切片工具
+>
+> 说明：本文偏向架构设计快照；若与当前 CLI 行为、默认值或输出语义冲突，以 `tippecanoe-db --help`、`tippecanoe-db --help-advanced` 和 [user_guide.md](/home/tdt-dell/code/GitHubCode/tippecanoe/docs/user_guide.md) 为准。
 
 ---
 

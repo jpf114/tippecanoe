@@ -3,6 +3,8 @@
 > 版本：2.0  
 > 最后更新：2026-04-13  
 > 适用范围：PostGIS 输入 + MongoDB 输出定制化版本
+>
+> 说明：本文偏向重构过程记录；若与当前参数默认值或帮助信息冲突，以 `tippecanoe-db --help`、`tippecanoe-db --help-advanced` 和 [user_guide.md](/home/tdt-dell/code/GitHubCode/tippecanoe/docs/user_guide.md) 为准。
 
 ---
 
