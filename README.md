@@ -715,6 +715,7 @@ Notes:
 
 - Recommended PostGIS short form: `dbname[:user[:password[:host[:port]]]]`
 - Recommended Mongo short form: `dbname:collection[:username[:password[:host[:port[:auth_source]]]]]`
+- The legacy host-first connection format is still accepted for compatibility, but new examples use the short form above.
 - `--mongo` is business output; `-o` is MBTiles verification output
 - The default PostGIS attribute strategy now preserves source field order so MBTiles verification output matches native `tippecanoe` more closely by default
 
@@ -784,8 +785,10 @@ Example (PostGIS input + MongoDB output):
 ```sh
 LD_LIBRARY_PATH="$HOME/vcpkg/installed/x64-linux-dynamic/lib:$HOME/vcpkg/installed/x64-linux-dynamic/debug/lib:${LD_LIBRARY_PATH}" \
 ./tippecanoe-db \
-  --postgis "localhost:5432:TippTest:postgres:pg:china:geom" \
-  --mongo "localhost:27017:test:admin:admin:admin:china" \
+  --postgis "TippTest:postgres:pg:localhost:5432" \
+  --postgis-table china \
+  --postgis-geometry-field geom \
+  --mongo "test:china:admin:admin:localhost:27017:admin" \
   -o china.mbtiles \
   -z12 -Z5
 ```

@@ -154,8 +154,10 @@ tippecanoe-db \
 
 ```bash
 tippecanoe-db \
-  --postgis "localhost:5432:TippTest:postgres:pg:china:geom" \
-  --mongo "localhost:27017:test1:admin:admin:admin:consistency_exact" \
+  --postgis "TippTest:postgres:pg:localhost:5432" \
+  --postgis-table china \
+  --postgis-geometry-field geom \
+  --mongo "test1:consistency_exact:admin:admin:localhost:27017:admin" \
   --postgis-shard-mode none \
   --postgis-canonical-attr-order \
   --mongo-no-fail-on-discard \
@@ -309,8 +311,10 @@ tippecanoe-db \
 
 ```bash
 tippecanoe-db \
-  --postgis "localhost:5432:mydb:postgres:pass:china:geom" \
-  --mongo "localhost:27017:tilerender:admin:pass:admin:china" \
+  --postgis "mydb:postgres:pass:localhost:5432" \
+  --postgis-table china \
+  --postgis-geometry-field geom \
+  --mongo "tilerender:china:admin:pass:localhost:27017:admin" \
   -z10 -Z10
 ```
 
@@ -711,8 +715,10 @@ A: 位于 tippecanoe-db 可执行文件的同目录下。如果通过绝对路�
 # 1) 生成 db 版本
 ./tippecanoe-db -zg --postgis-shard-mode none \
   -o build/consistency_db_exact.mbtiles \
-  --postgis "localhost:5432:TippTest:postgres:pg:china:geom" \
-  --mongo "localhost:27017:test1:admin:admin:admin:consistency_exact" \
+  --postgis "TippTest:postgres:pg:localhost:5432" \
+  --postgis-table china \
+  --postgis-geometry-field geom \
+  --mongo "test1:consistency_exact:admin:admin:localhost:27017:admin" \
   --mongo-no-fail-on-discard
 
 # 2) 导出同源 NDJSON（供主线 tippecanoe 对比）

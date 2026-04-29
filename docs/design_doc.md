@@ -592,9 +592,9 @@ MongoDB flush 失败 ───┤
 tippecanoe-db [OPTIONS]
 
 PostGIS 输入参数:
-  --postgis=host:port:dbname:user:password:table:geometry_field
-      连接字符串格式，7 部分以冒号分隔
-      示例: localhost:5432:mydb:postgres:pass:china:geom
+  --postgis=dbname[:user[:password[:host[:port]]]]
+      推荐短连接字符串格式，表名和几何列通过独立参数传入
+      示例: mydb:postgres:pass:localhost:5432
 
   --postgis-host=HOST       数据库主机 (默认: localhost)
   --postgis-port=PORT       数据库端口 (默认: 5432)
@@ -614,9 +614,9 @@ PostGIS 输入参数:
   --postgis-progress-count  开启精确进度（执行 COUNT(*)，默认关闭）
 
 MongoDB 输出参数:
-  --mongo=host:port:dbname:user:password:auth_source:collection
-      连接字符串格式，7 部分以冒号分隔
-      示例: localhost:27017:test:admin:pass:admin:china
+  --mongo=dbname:collection[:username[:password[:host[:port[:auth_source]]]]]
+      推荐短连接字符串格式
+      示例: test:china:admin:pass:localhost:27017:admin
 
   --mongo-host=HOST         MongoDB 主机
   --mongo-port=PORT         MongoDB 端口
