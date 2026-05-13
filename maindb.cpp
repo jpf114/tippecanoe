@@ -166,8 +166,8 @@ static void print_core_usage(const char *progname, struct option *long_options_o
 	fprintf(stderr, "    --postgis-geometry-field is only needed when the geometry column is not the default or cannot be inferred\n");
 	fprintf(stderr, "    --mongo for business output, -o for MBTiles verification output\n");
 	fprintf(stderr, "    -z / -Z to control zoom range\n");
-	fprintf(stderr, "    --postgis short form: dbname[:user[:password[:host[:port]]]]\n");
-	fprintf(stderr, "    --mongo short form: dbname:collection[:username[:password[:host[:port[:auth_source]]]]]\n");
+	fprintf(stderr, "    --postgis URI form: postgresql://[user[:password]@]host[:port]/dbname\n");
+	fprintf(stderr, "    --mongo URI form: mongodb://[user:password@]host[:port]/dbname?collection=name[&authSource=src]\n");
 	fprintf(stderr, "\n");
 	fprintf(stderr, "  Note\n");
 	fprintf(stderr, "    Advanced and expert database tuning options remain supported for compatibility,\n");

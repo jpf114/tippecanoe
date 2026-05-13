@@ -229,52 +229,109 @@ struct postgis_config
         }
     }
 
-    bool parse_connection_string(const std::string &conn_str) {
-        std::vector<std::string> parts = split_by_delimiter(conn_str, ':');
+    static std::string url_decode(const std::string &s) {
+        std::string out;
+        out.reserve(s.size());
+        for (size_t i = 0; i < s.size(); i++) {
+            if (s[i] == '%' && i + 2 < s.size() &&
+                std::isxdigit(static_cast<unsigned char>(s[i + 1])) &&
+                std::isxdigit(static_cast<unsigned char>(s[i + 2]))) {
+                char hex[3] = {s[i + 1], s[i + 2], '\0'};
+                out += static_cast<char>(strtol(hex, nullptr, 16));
+                i += 2;
+            } else if (s[i] == '+') {
+                out += ' ';
+            } else {
+                out += s[i];
+            }
+        }
+        return out;
+    }
 
-        if (parts.empty() || parts[0].empty()) {
+    bool parse_connection_string(const std::string &conn_str) {
+        if (conn_str.empty()) {
             fprintf(stderr, "Error: PostGIS connection string is empty\n");
             return false;
         }
 
-        bool legacy_format = false;
-        if (parts.size() >= 3 && !parts[1].empty()) {
-            legacy_format = true;
-            for (char c : parts[1]) {
-                if (!std::isdigit(static_cast<unsigned char>(c))) {
-                    legacy_format = false;
-                    break;
-                }
-            }
-        }
+        std::string str = conn_str;
 
-        if (legacy_format) {
-            host = parts[0];
-            port = parts[1];
-            dbname = parts[2];
-            if (parts.size() >= 4) user = parts[3];
-            if (parts.size() >= 5) password = parts[4];
-            if (parts.size() >= 6) table = parts[5];
-            if (parts.size() >= 7) geometry_field = parts[6];
-            if (parts.size() >= 8) sql = parts[7];
-        } else {
-            if (parts.size() > 5) {
-                fprintf(stderr, "Error: PostGIS short connection string supports at most 5 parts\n");
-                fprintf(stderr, "Short format: dbname[:user[:password[:host[:port]]]]\n");
-                fprintf(stderr, "Legacy format: host:port:dbname[:user[:password[:table[:geometry_field[:sql]]]]]\n");
-                fprintf(stderr, "Got %zu parts: %s\n", parts.size(), conn_str.c_str());
+        std::string scheme;
+        auto scheme_end = str.find("://");
+        if (scheme_end != std::string::npos) {
+            scheme = str.substr(0, scheme_end);
+            for (auto &c : scheme) c = std::tolower(static_cast<unsigned char>(c));
+            if (scheme != "postgresql" && scheme != "postgres") {
+                fprintf(stderr, "Error: PostGIS connection string must start with postgresql:// or postgres://\n");
+                fprintf(stderr, "Format: postgresql://[user[:password]@]host[:port]/dbname\n");
                 return false;
             }
-
-            dbname = parts[0];
-            if (parts.size() >= 2) user = parts[1];
-            if (parts.size() >= 3) password = parts[2];
-            if (parts.size() >= 4 && !parts[3].empty()) host = parts[3];
-            if (parts.size() >= 5 && !parts[4].empty()) port = parts[4];
+            str = str.substr(scheme_end + 3);
+        } else {
+            fprintf(stderr, "Error: PostGIS connection string must start with postgresql://\n");
+            fprintf(stderr, "Format: postgresql://[user[:password]@]host[:port]/dbname\n");
+            return false;
         }
 
+        std::string userinfo;
+        auto at_pos = str.rfind('@');
+        if (at_pos != std::string::npos) {
+            userinfo = str.substr(0, at_pos);
+            str = str.substr(at_pos + 1);
+        }
+
+        if (!userinfo.empty()) {
+            auto colon_pos = userinfo.find(':');
+            if (colon_pos != std::string::npos) {
+                user = url_decode(userinfo.substr(0, colon_pos));
+                password = url_decode(userinfo.substr(colon_pos + 1));
+            } else {
+                user = url_decode(userinfo);
+            }
+        }
+
+        std::string hostport;
+        std::string path;
+        auto slash_pos = str.find('/');
+        if (slash_pos != std::string::npos) {
+            hostport = str.substr(0, slash_pos);
+            path = str.substr(slash_pos + 1);
+        } else {
+            hostport = str;
+        }
+
+        if (hostport.empty()) {
+            fprintf(stderr, "Error: PostGIS connection string missing host\n");
+            fprintf(stderr, "Format: postgresql://[user[:password]@]host[:port]/dbname\n");
+            return false;
+        }
+
+        auto bracket_close = hostport.find(']');
+        if (bracket_close != std::string::npos) {
+            host = hostport.substr(1, bracket_close - 1);
+            if (bracket_close + 1 < hostport.size() && hostport[bracket_close + 1] == ':') {
+                port = hostport.substr(bracket_close + 2);
+            }
+        } else {
+            auto last_colon = hostport.rfind(':');
+            if (last_colon != std::string::npos) {
+                host = hostport.substr(0, last_colon);
+                port = hostport.substr(last_colon + 1);
+            } else {
+                host = hostport;
+            }
+        }
+
+        auto query_pos = path.find('?');
+        if (query_pos != std::string::npos) {
+            path = path.substr(0, query_pos);
+        }
+
+        dbname = url_decode(path);
+
         if (dbname.empty()) {
-            fprintf(stderr, "Error: PostGIS connection string has empty dbname\n");
+            fprintf(stderr, "Error: PostGIS connection string missing database name\n");
+            fprintf(stderr, "Format: postgresql://[user[:password]@]host[:port]/dbname\n");
             return false;
         }
 

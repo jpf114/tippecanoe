@@ -15,11 +15,11 @@ std::optional<std::string> validate_config(const mongo_config& cfg) {
     }
 
     if (cfg.dbname.empty()) {
-        return "MongoDB database name is required (for example: --mongo tiles:collection or --mongo-dbname tiles)";
+        return "MongoDB database name is required (for example: --mongo mongodb://localhost/tiles?collection=mycol or --mongo-dbname tiles)";
     }
 
     if (cfg.collection.empty()) {
-        return "MongoDB collection is required (for example: --mongo tiles:collection or --mongo-collection collection)";
+        return "MongoDB collection is required (for example: --mongo mongodb://localhost/tiles?collection=mycol or --mongo-collection collection)";
     }
 
     if (cfg.username.empty() != cfg.password.empty()) {

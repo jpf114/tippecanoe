@@ -19,7 +19,7 @@ bool validate_config(const postgis_config& cfg) {
     validation_error.clear();
 
     if (cfg.dbname.empty()) {
-        validation_error = "PostGIS database name is required (for example: --postgis gis or --postgis-host/--postgis-dbname)";
+        validation_error = "PostGIS database name is required (for example: --postgis postgresql://localhost/mydb or --postgis-host/--postgis-dbname)";
         return false;
     }
 

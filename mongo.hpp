@@ -107,71 +107,142 @@ struct mongo_config {
         }
     }
 
-    bool parse_connection_string(const std::string &conn_str) {
-        std::vector<std::string> parts = split_by_delimiter(conn_str, ':');
+    static std::string url_decode(const std::string &s) {
+        std::string out;
+        out.reserve(s.size());
+        for (size_t i = 0; i < s.size(); i++) {
+            if (s[i] == '%' && i + 2 < s.size() &&
+                std::isxdigit(static_cast<unsigned char>(s[i + 1])) &&
+                std::isxdigit(static_cast<unsigned char>(s[i + 2]))) {
+                char hex[3] = {s[i + 1], s[i + 2], '\0'};
+                out += static_cast<char>(strtol(hex, nullptr, 16));
+                i += 2;
+            } else if (s[i] == '+') {
+                out += ' ';
+            } else {
+                out += s[i];
+            }
+        }
+        return out;
+    }
 
-        if (parts.size() < 2) {
-            fprintf(stderr, "Error: MongoDB connection string must have at least 2 parts\n");
-            fprintf(stderr, "Short format: dbname:collection[:username[:password[:host[:port[:auth_source]]]]]\n");
-            fprintf(stderr, "Legacy format: host:port:dbname:user:password:auth_source:collection\n");
-            fprintf(stderr, "Got %zu parts: %s\n", parts.size(), conn_str.c_str());
+    bool parse_connection_string(const std::string &conn_str) {
+        if (conn_str.empty()) {
+            fprintf(stderr, "Error: MongoDB connection string is empty\n");
             return false;
         }
 
-        bool legacy_format = false;
-        if (parts.size() == 7 && !parts[1].empty()) {
-            legacy_format = true;
-            for (char c : parts[1]) {
-                if (!std::isdigit(static_cast<unsigned char>(c))) {
-                    legacy_format = false;
-                    break;
-                }
-            }
-        }
+        std::string str = conn_str;
 
-        if (legacy_format) {
-            host = parts[0];
-            if (!parts[1].empty()) {
-                try {
-                    port = std::stoi(parts[1]);
-                } catch (...) {
-                    fprintf(stderr, "Error: Invalid port number: %s\n", parts[1].c_str());
-                    return false;
-                }
-            }
-            dbname = parts[2];
-            username = parts[3];
-            password = parts[4];
-            auth_source = parts[5];
-            collection = parts[6];
-        } else {
-            if (parts.size() > 7) {
-                fprintf(stderr, "Error: MongoDB short connection string supports at most 7 parts\n");
-                fprintf(stderr, "Short format: dbname:collection[:username[:password[:host[:port[:auth_source]]]]]\n");
-                fprintf(stderr, "Legacy format: host:port:dbname:user:password:auth_source:collection\n");
-                fprintf(stderr, "Got %zu parts: %s\n", parts.size(), conn_str.c_str());
+        std::string scheme;
+        auto scheme_end = str.find("://");
+        if (scheme_end != std::string::npos) {
+            scheme = str.substr(0, scheme_end);
+            for (auto &c : scheme) c = std::tolower(static_cast<unsigned char>(c));
+            if (scheme != "mongodb" && scheme != "mongodb+srv") {
+                fprintf(stderr, "Error: MongoDB connection string must start with mongodb:// or mongodb+srv://\n");
+                fprintf(stderr, "Format: mongodb://[user:password@]host[:port]/dbname?collection=name[&authSource=src]\n");
                 return false;
             }
+            str = str.substr(scheme_end + 3);
+        } else {
+            fprintf(stderr, "Error: MongoDB connection string must start with mongodb://\n");
+            fprintf(stderr, "Format: mongodb://[user:password@]host[:port]/dbname?collection=name[&authSource=src]\n");
+            return false;
+        }
 
-            dbname = parts[0];
-            collection = parts[1];
-            if (parts.size() >= 3) username = parts[2];
-            if (parts.size() >= 4) password = parts[3];
-            if (parts.size() >= 5 && !parts[4].empty()) host = parts[4];
-            if (parts.size() >= 6 && !parts[5].empty()) {
+        std::string userinfo;
+        auto at_pos = str.rfind('@');
+        if (at_pos != std::string::npos) {
+            userinfo = str.substr(0, at_pos);
+            str = str.substr(at_pos + 1);
+        }
+
+        if (!userinfo.empty()) {
+            auto colon_pos = userinfo.find(':');
+            if (colon_pos != std::string::npos) {
+                username = url_decode(userinfo.substr(0, colon_pos));
+                password = url_decode(userinfo.substr(colon_pos + 1));
+            } else {
+                username = url_decode(userinfo);
+            }
+        }
+
+        std::string hostport;
+        std::string path_and_query;
+        auto slash_pos = str.find('/');
+        if (slash_pos != std::string::npos) {
+            hostport = str.substr(0, slash_pos);
+            path_and_query = str.substr(slash_pos + 1);
+        } else {
+            hostport = str;
+        }
+
+        if (hostport.empty()) {
+            fprintf(stderr, "Error: MongoDB connection string missing host\n");
+            fprintf(stderr, "Format: mongodb://[user:password@]host[:port]/dbname?collection=name[&authSource=src]\n");
+            return false;
+        }
+
+        auto bracket_close = hostport.find(']');
+        if (bracket_close != std::string::npos) {
+            host = hostport.substr(1, bracket_close - 1);
+            if (bracket_close + 1 < hostport.size() && hostport[bracket_close + 1] == ':') {
                 try {
-                    port = std::stoi(parts[5]);
+                    port = std::stoi(hostport.substr(bracket_close + 2));
                 } catch (...) {
-                    fprintf(stderr, "Error: Invalid port number: %s\n", parts[5].c_str());
+                    fprintf(stderr, "Error: Invalid port number in MongoDB URI\n");
                     return false;
                 }
             }
-            if (parts.size() >= 7 && !parts[6].empty()) auth_source = parts[6];
+        } else {
+            auto last_colon = hostport.rfind(':');
+            if (last_colon != std::string::npos) {
+                host = hostport.substr(0, last_colon);
+                try {
+                    port = std::stoi(hostport.substr(last_colon + 1));
+                } catch (...) {
+                    fprintf(stderr, "Error: Invalid port number: %s\n", hostport.substr(last_colon + 1).c_str());
+                    return false;
+                }
+            } else {
+                host = hostport;
+            }
         }
 
-        if (dbname.empty() || collection.empty()) {
-            fprintf(stderr, "Error: MongoDB connection string has empty required fields\n");
-            fprintf(stderr, "Short format: dbname:collection[:username[:password[:host[:port[:auth_source]]]]]\n");
+        std::string query;
+        auto query_pos = path_and_query.find('?');
+        if (query_pos != std::string::npos) {
+            dbname = url_decode(path_and_query.substr(0, query_pos));
+            query = path_and_query.substr(query_pos + 1);
+        } else {
+            dbname = url_decode(path_and_query);
+        }
+
+        if (!query.empty()) {
+            std::vector<std::string> params = split_by_delimiter(query, '&');
+            for (const auto &param : params) {
+                auto eq_pos = param.find('=');
+                if (eq_pos == std::string::npos) continue;
+                std::string key = param.substr(0, eq_pos);
+                std::string val = url_decode(param.substr(eq_pos + 1));
+                if (key == "collection") {
+                    collection = val;
+                } else if (key == "authSource") {
+                    auth_source = val;
+                }
+            }
+        }
+
+        if (dbname.empty()) {
+            fprintf(stderr, "Error: MongoDB connection string missing database name\n");
+            fprintf(stderr, "Format: mongodb://[user:password@]host[:port]/dbname?collection=name[&authSource=src]\n");
+            return false;
+        }
+
+        if (collection.empty()) {
+            fprintf(stderr, "Error: MongoDB connection string missing collection (use ?collection=name)\n");
+            fprintf(stderr, "Format: mongodb://[user:password@]host[:port]/dbname?collection=name[&authSource=src]\n");
             return false;
         }
 
