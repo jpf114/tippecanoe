@@ -9,8 +9,8 @@ def default(obj):
     raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
 
 # 文件路径
-input_geojson = "California.geojson"
-output_geojsonl = "California.geojsonl"
+input_geojson = "NewYork.geojson"
+output_geojsonl = "NewYork.geojsonl"
 
 print("开始转换 GeoJSON -> GeoJSONSeq（已支持 Decimal）...")
 
