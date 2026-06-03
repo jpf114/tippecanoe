@@ -31,6 +31,7 @@
 #include <string>
 #include <set>
 #include <map>
+#include <memory>
 #include <cmath>
 
 #if defined(__APPLE__) || defined(__FreeBSD__)
@@ -67,6 +68,7 @@
 #include "attribute.hpp"
 #include "thread.hpp"
 #include "platform.hpp"
+#include "checkpoint.hpp"
 
 static int low_detail = 12;
 static int full_detail = -1;
@@ -1215,8 +1217,65 @@ double round_droprate(double r) {
 	return std::round(r * 100000.0) / 100000.0;
 }
 
-std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzoom, int basezoom, double basezoom_marker_width, sqlite3 *outdb, const char *outdir, std::set<std::string> *exclude, std::set<std::string> *include, int exclude_all, json_object *filter, double droprate, int buffer, const char *tmpdir, double gamma, int read_parallel, int forcetable, const char *attribution, bool uses_gamma, long long *file_bbox, long long *file_bbox1, long long *file_bbox2, const char *prefilter, const char *postfilter, const char *description, bool guess_maxzoom, bool guess_cluster_maxzoom, std::unordered_map<std::string, int> const *attribute_types, const char *pgm, std::unordered_map<std::string, attribute_op> const *attribute_accum, std::map<std::string, std::string> const &attribute_descriptions, std::string const &commandline, int minimum_maxzoom) {
+std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, int maxzoom, int minzoom, int basezoom, double basezoom_marker_width, sqlite3 *outdb, const char *outdir, std::set<std::string> *exclude, std::set<std::string> *include, int exclude_all, json_object *filter, double droprate, int buffer, const char *tmpdir, double gamma, int read_parallel, int forcetable, const char *attribution, bool uses_gamma, long long *file_bbox, long long *file_bbox1, long long *file_bbox2, const char *prefilter, const char *postfilter, const char *description, bool guess_maxzoom, bool guess_cluster_maxzoom, std::unordered_map<std::string, int> const *attribute_types, const char *pgm, std::unordered_map<std::string, attribute_op> const *attribute_accum, std::map<std::string, std::string> const &attribute_descriptions, std::string const &commandline, int minimum_maxzoom, checkpoint::Session *checkpoint_session) {
 	int ret = EXIT_SUCCESS;
+
+	if (checkpoint_session != nullptr && checkpoint_session->can_resume_tiling()) {
+		checkpoint::TilingRestore restored;
+		checkpoint_session->restore_tiling(restored);
+
+		maxzoom = restored.maxzoom;
+		minzoom = restored.minzoom;
+		basezoom = restored.basezoom;
+
+		if (restored.pool_off.size() < CPUS) {
+			restored.pool_off.resize(CPUS, 0);
+		}
+		if (restored.initial_x.size() < CPUS) {
+			restored.initial_x.resize(CPUS, 0);
+		}
+		if (restored.initial_y.size() < CPUS) {
+			restored.initial_y.resize(CPUS, 0);
+		}
+
+		std::atomic<unsigned> midx(restored.midx.load());
+		std::atomic<unsigned> midy(restored.midy.load());
+		std::vector<strategy> strategies = std::move(restored.strategies);
+		std::vector<std::map<std::string, layermap_entry>> layermaps = std::move(restored.layermaps);
+
+		int written = traverse_zooms(restored.geomfd.data(), restored.geom_size.data(), restored.stringpool, &midx, &midy, maxzoom, minzoom, outdb, outdir, buffer, fname, tmpdir, gamma, full_detail, low_detail, min_detail, restored.pool_off.data(), restored.initial_x.data(), restored.initial_y.data(), simplification, maxzoom_simplification, layermaps, prefilter, postfilter, attribute_accum, filter, strategies, restored.iz, restored.shared_nodes_map, restored.nodepos, restored.shared_nodes_bloom, basezoom, droprate, unidecode_data, &drop_by_attribute_as_needed_attribute, drop_by_attribute_descending, &restored.skip_children, checkpoint_session);
+
+		if (maxzoom != written) {
+			if (written > minzoom) {
+				fprintf(stderr, "\n\n\n*** NOTE TILES ONLY COMPLETE THROUGH ZOOM %d ***\n", written);
+				maxzoom = written;
+				ret = EXIT_INCOMPLETE;
+			} else {
+				fprintf(stderr, "%s: No zoom levels were successfully written\n", *av);
+				exit(EXIT_NODATA);
+			}
+		}
+
+		double minlat = 0, minlon = 0, maxlat = 0, maxlon = 0, midlat = 0, midlon = 0;
+		tile2lonlat(midx, midy, maxzoom, &minlon, &maxlat);
+		tile2lonlat(midx + 1, midy + 1, maxzoom, &maxlon, &minlat);
+		midlat = (maxlat + minlat) / 2;
+		midlon = (maxlon + minlon) / 2;
+
+		std::map<std::string, layermap_entry> merged_lm = merge_layermaps(layermaps);
+		for (auto ai = merged_lm.begin(); ai != merged_lm.end(); ++ai) {
+			ai->second.minzoom = minzoom;
+			ai->second.maxzoom = maxzoom;
+		}
+
+		metadata m = make_metadata(fname, minzoom, maxzoom, minlat, minlon, maxlat, maxlon, minlat, minlon, maxlat, maxlon, midlat, midlon, attribution, merged_lm, true, description, !prevent[P_TILE_STATS], attribute_descriptions, "tippecanoe", commandline, strategies, basezoom, droprate, retain_points_multiplier);
+		if (outdb != NULL) {
+			mbtiles_write_metadata(outdb, m, forcetable);
+		} else {
+			dir_write_metadata(outdir, m);
+		}
+		return std::make_pair(ret, m);
+	}
 
 	std::vector<struct reader> readers;
 	readers.resize(CPUS);
@@ -2756,7 +2815,12 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 	std::atomic<unsigned> midx(0);
 	std::atomic<unsigned> midy(0);
 	std::vector<strategy> strategies;
-	int written = traverse_zooms(fd, size, stringpool, &midx, &midy, maxzoom, minzoom, outdb, outdir, buffer, fname, tmpdir, gamma, full_detail, low_detail, min_detail, pool_off, initial_x, initial_y, simplification, maxzoom_simplification, layermaps, prefilter, postfilter, attribute_accum, filter, strategies, iz, shared_nodes_map, nodepos, shared_nodes_bloom, basezoom, droprate, unidecode_data, &drop_by_attribute_as_needed_attribute, drop_by_attribute_descending);
+
+	if (checkpoint_session != nullptr) {
+		checkpoint_session->snapshot_tiling_entry(poolfd, (size_t) poolpos, pool_off, initial_x, initial_y, fd[0], size[0], shared_nodes_map, nodepos, shared_nodes_bloom, layermaps, (int) iz, minzoom, maxzoom, basezoom);
+	}
+
+	int written = traverse_zooms(fd, size, stringpool, &midx, &midy, maxzoom, minzoom, outdb, outdir, buffer, fname, tmpdir, gamma, full_detail, low_detail, min_detail, pool_off, initial_x, initial_y, simplification, maxzoom_simplification, layermaps, prefilter, postfilter, attribute_accum, filter, strategies, iz, shared_nodes_map, nodepos, shared_nodes_bloom, basezoom, droprate, unidecode_data, &drop_by_attribute_as_needed_attribute, drop_by_attribute_descending, nullptr, checkpoint_session);
 
 	if (maxzoom != written) {
 		if (written > minzoom) {
@@ -2993,6 +3057,9 @@ int main(int argc, char **argv) {
 	double gamma = 0;
 	int buffer = 5;
 	const char *tmpdir = "/tmp";
+	const char *checkpoint_dir = NULL;
+	const char *resume_dir = NULL;
+	int checkpoint_force = 0;
 	const char *attribution = NULL;
 	std::vector<source> sources;
 	const char *prefilter = NULL;
@@ -3023,6 +3090,11 @@ int main(int argc, char **argv) {
 		{"output-to-directory", required_argument, 0, 'e'},
 		{"force", no_argument, 0, 'f'},
 		{"allow-existing", no_argument, 0, 'F'},
+
+		{"Checkpoint / resume", 0, 0, 0},
+		{"checkpoint-dir", required_argument, 0, '~'},
+		{"resume", required_argument, 0, '~'},
+		{"checkpoint-force", no_argument, 0, '~'},
 
 		{"Tileset description and attribution", 0, 0, 0},
 		{"name", required_argument, 0, 'n'},
@@ -3327,6 +3399,12 @@ int main(int argc, char **argv) {
 				unidecode_data = read_unidecode(optarg);
 			} else if (strcmp(opt, "maximum-string-attribute-length") == 0) {
 				maximum_string_attribute_length = atoll_require(optarg, "Maximum string attribute length");
+			} else if (strcmp(opt, "checkpoint-dir") == 0) {
+				checkpoint_dir = optarg;
+			} else if (strcmp(opt, "resume") == 0) {
+				resume_dir = optarg;
+			} else if (strcmp(opt, "checkpoint-force") == 0) {
+				checkpoint_force = 1;
 			} else {
 				fprintf(stderr, "%s: Unrecognized option --%s\n", argv[0], opt);
 				exit(EXIT_ARGS);
@@ -3824,6 +3902,16 @@ int main(int argc, char **argv) {
 		exit(EXIT_ARGS);
 	}
 
+	if (checkpoint_dir != NULL && resume_dir != NULL) {
+		fprintf(stderr, "%s: --checkpoint-dir and --resume cannot be used together\n", argv[0]);
+		exit(EXIT_ARGS);
+	}
+
+	if (resume_dir != NULL && !forcetable) {
+		fprintf(stderr, "%s: --resume requires -F / --allow-existing to keep tiles already written to the output\n", argv[0]);
+		exit(EXIT_ARGS);
+	}
+
 	int ret = EXIT_SUCCESS;
 
 	for (i = optind; i < argc; i++) {
@@ -3851,11 +3939,46 @@ int main(int argc, char **argv) {
 	long long file_bbox1[4] = {0xFFFFFFFF, 0xFFFFFFFF, 0, 0};	      // standard -180 to 180 world plane
 	long long file_bbox2[4] = {0x1FFFFFFFF, 0xFFFFFFFF, 0x100000000, 0};  // 0 to 360 world plane
 
+	checkpoint::FingerprintParams fingerprint;
+	fingerprint.command_line = checkpoint::normalize_command_line_for_fingerprint(commandline);
+	fingerprint.temp_files = TEMP_FILES;
+	fingerprint.cpus = CPUS;
+	memcpy(fingerprint.prevent, prevent, sizeof(prevent));
+	memcpy(fingerprint.additional, additional, sizeof(additional));
+	std::vector<std::string> input_paths;
+	for (size_t a = 0; a < sources.size(); a++) {
+		if (!sources[a].file.empty()) {
+			input_paths.push_back(sources[a].file);
+		}
+	}
+	fingerprint.inputs = checkpoint::stat_input_paths(input_paths);
+	if (out_mbtiles != NULL) {
+		fingerprint.output_mode = pmtiles_has_suffix(out_mbtiles) ? "pmtiles" : "mbtiles";
+		fingerprint.output_path = checkpoint::absolute_path_or_die(out_mbtiles);
+	} else {
+		fingerprint.output_mode = "directory";
+		fingerprint.output_path = checkpoint::absolute_path_or_die(out_dir);
+	}
+
+	std::unique_ptr<checkpoint::Session> checkpoint_session;
+	if (resume_dir != NULL) {
+		checkpoint_session = checkpoint::Session::open_resume(resume_dir, fingerprint, forcetable);
+	} else if (checkpoint_dir != NULL) {
+		checkpoint_session = checkpoint::Session::open_new(checkpoint_dir, checkpoint_force != 0, fingerprint);
+	}
+
 	auto input_ret = read_input(sources, name ? name : out_mbtiles ? out_mbtiles
 								       : out_dir,
-				    maxzoom, minzoom, basezoom, basezoom_marker_width, outdb, out_dir, &exclude, &include, exclude_all, filter, droprate, buffer, tmpdir, gamma, read_parallel, forcetable, attribution, gamma != 0, file_bbox, file_bbox1, file_bbox2, prefilter, postfilter, description, guess_maxzoom, guess_cluster_maxzoom, &attribute_types, argv[0], &attribute_accum, attribute_descriptions, commandline, minimum_maxzoom);
+				    maxzoom, minzoom, basezoom, basezoom_marker_width, outdb, out_dir, &exclude, &include, exclude_all, filter, droprate, buffer, tmpdir, gamma, read_parallel, forcetable, attribution, gamma != 0, file_bbox, file_bbox1, file_bbox2, prefilter, postfilter, description, guess_maxzoom, guess_cluster_maxzoom, &attribute_types, argv[0], &attribute_accum, attribute_descriptions, commandline, minimum_maxzoom, checkpoint_session.get());
 
 	ret = std::get<0>(input_ret);
+
+	if (checkpoint_session != nullptr) {
+		if (ret == EXIT_SUCCESS) {
+			checkpoint_session->finalize_success();
+		}
+		checkpoint_session.reset();
+	}
 
 	if (outdb != NULL) {
 		mbtiles_close(outdb, argv[0]);

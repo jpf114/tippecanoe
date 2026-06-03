@@ -34,6 +34,7 @@
 #include "dirtiles.hpp"
 #include "geometry.hpp"
 #include "tile.hpp"
+#include "checkpoint.hpp"
 #include "pool.hpp"
 #include "projection.hpp"
 #include "serial.hpp"
@@ -3213,7 +3214,7 @@ exit(EXIT_IMPOSSIBLE);
 	return err_or_null;
 }
 
-int traverse_zooms(int *geomfd, off_t *geom_size, char *global_stringpool, std::atomic<unsigned> *midx, std::atomic<unsigned> *midy, int &maxzoom, int minzoom, sqlite3 *outdb, const char *outdir, int buffer, const char *fname, const char *tmpdir, double gamma, int full_detail, int low_detail, int min_detail, long long *pool_off, unsigned *initial_x, unsigned *initial_y, double simplification, double maxzoom_simplification, std::vector<std::map<std::string, layermap_entry>> &layermaps, const char *prefilter, const char *postfilter, std::unordered_map<std::string, attribute_op> const *attribute_accum, json_object *filter, std::vector<strategy> &strategies, int iz, node *shared_nodes_map, size_t nodepos, std::string const &shared_nodes_bloom, int basezoom, double droprate, std::vector<std::string> const &unidecode_data, std::string const *drop_by_attribute_as_needed_attribute, bool drop_by_attribute_descending) {
+int traverse_zooms(int *geomfd, off_t *geom_size, char *global_stringpool, std::atomic<unsigned> *midx, std::atomic<unsigned> *midy, int &maxzoom, int minzoom, sqlite3 *outdb, const char *outdir, int buffer, const char *fname, const char *tmpdir, double gamma, int full_detail, int low_detail, int min_detail, long long *pool_off, unsigned *initial_x, unsigned *initial_y, double simplification, double maxzoom_simplification, std::vector<std::map<std::string, layermap_entry>> &layermaps, const char *prefilter, const char *postfilter, std::unordered_map<std::string, attribute_op> const *attribute_accum, json_object *filter, std::vector<strategy> &strategies, int iz, node *shared_nodes_map, size_t nodepos, std::string const &shared_nodes_bloom, int basezoom, double droprate, std::vector<std::string> const &unidecode_data, std::string const *drop_by_attribute_as_needed_attribute, bool drop_by_attribute_descending, std::set<zxy> const *initial_skip_children, checkpoint::Session *session) {
 	last_progress = 0;
 
 	// The existing layermaps are one table per input thread.
@@ -3238,6 +3239,9 @@ int traverse_zooms(int *geomfd, off_t *geom_size, char *global_stringpool, std::
 	}
 
 	std::set<zxy> skip_children;
+	if (initial_skip_children != nullptr) {
+		skip_children = *initial_skip_children;
+	}
 
 	int z;
 	int largest_written = -1;
@@ -3531,6 +3535,19 @@ int traverse_zooms(int *geomfd, off_t *geom_size, char *global_stringpool, std::
 
 			geomfd[j] = subfd[j];
 			geom_size[j] = geomst.st_size;
+		}
+
+		if (session != nullptr && err == INT_MAX) {
+			checkpoint::ZoomCompleteContext ctx;
+			ctx.zoom = z;
+			ctx.geomfd = geomfd;
+			ctx.geom_size = geom_size;
+			ctx.skip_children = &skip_children;
+			ctx.strategies = &strategies;
+			ctx.maxzoom = maxzoom;
+			ctx.midx = midx->load();
+			ctx.midy = midy->load();
+			session->on_zoom_complete(ctx);
 		}
 
 		if (err != INT_MAX) {

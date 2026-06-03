@@ -59,7 +59,7 @@ C = $(wildcard *.c) $(wildcard *.cpp)
 INCLUDES = -I/usr/local/include -I. -Iclipper2/include
 LIBS = -L/usr/local/lib
 
-tippecanoe: geojson.o jsonpull/jsonpull.o tile.o pool.o mbtiles.o geometry.o projection.o memfile.o mvt.o serial.o main.o platform.o text.o dirtiles.o pmtiles_file.o plugin.o read_json.o write_json.o geobuf.o flatgeobuf.o evaluator.o geocsv.o csv.o geojson-loop.o json_logger.o visvalingam.o compression.o clip.o sort.o attribute.o thread.o shared_borders.o clipper2/src/clipper.engine.o
+tippecanoe: geojson.o jsonpull/jsonpull.o tile.o pool.o mbtiles.o geometry.o projection.o memfile.o mvt.o serial.o main.o platform.o text.o dirtiles.o pmtiles_file.o plugin.o read_json.o write_json.o geobuf.o flatgeobuf.o evaluator.o geocsv.o csv.o geojson-loop.o json_logger.o visvalingam.o compression.o clip.o sort.o attribute.o thread.o shared_borders.o checkpoint.o clipper2/src/clipper.engine.o
 	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lm -lz -lsqlite3 -lpthread
 
 tippecanoe-enumerate: enumerate.o
@@ -97,7 +97,7 @@ indent:
 TESTS = $(wildcard tests/*/out/*.json)
 SPACE = $(NULL) $(NULL)
 
-test: tippecanoe tippecanoe-decode $(addsuffix .check,$(TESTS)) raw-tiles-test parallel-test pbf-test join-test enumerate-test decode-test join-filter-test unit json-tool-test allow-existing-test csv-test layer-json-test pmtiles-test decode-pmtiles-test overzoom-test
+test: tippecanoe tippecanoe-decode $(addsuffix .check,$(TESTS)) raw-tiles-test parallel-test pbf-test join-test enumerate-test decode-test join-filter-test unit json-tool-test allow-existing-test csv-test layer-json-test pmtiles-test decode-pmtiles-test overzoom-test checkpoint-test
 	./unit
 
 suffixes = json json.gz
@@ -571,6 +571,28 @@ csv-test: tippecanoe tippecanoe-decode
 	./tippecanoe-decode -x generator -x generator_options tests/csv/out.mbtiles > tests/csv/out.mbtiles.json.check
 	cmp tests/csv/out.mbtiles.json.check tests/csv/out.mbtiles.json
 	rm -f tests/csv/out.mbtiles.json.check tests/csv/out.mbtiles
+
+checkpoint-test: tippecanoe
+	rm -rf /tmp/tippecanoe-checkpoint-test /tmp/tippecanoe-checkpoint-kill /tmp/tippecanoe-checkpoint-dir
+	mkdir -p /tmp/tippecanoe-checkpoint-test
+	./tippecanoe -q -z3 -o /tmp/tippecanoe-checkpoint-test/out.mbtiles --checkpoint-dir=/tmp/tippecanoe-checkpoint-test/cp tests/onefeature/in.json
+	test -f /tmp/tippecanoe-checkpoint-test/cp/state.sqlite
+	sqlite3 /tmp/tippecanoe-checkpoint-test/cp/state.sqlite 'SELECT COUNT(*) FROM zoom_commit;' | grep -qv '^0$$'
+	./tippecanoe -q -z3 --resume=/tmp/tippecanoe-checkpoint-test/cp -o /tmp/tippecanoe-checkpoint-test/out.mbtiles -F tests/onefeature/in.json
+	! ./tippecanoe -q -z9 --resume=/tmp/tippecanoe-checkpoint-test/cp -o /tmp/tippecanoe-checkpoint-test/out.mbtiles -F tests/onefeature/in.json
+	mkdir -p /tmp/tippecanoe-checkpoint-dir
+	./tippecanoe -q -z2 -e /tmp/tippecanoe-checkpoint-dir/tiles --checkpoint-dir=/tmp/tippecanoe-checkpoint-dir/cp tests/onefeature/in.json
+	test -f /tmp/tippecanoe-checkpoint-dir/cp/blobs/geom.0
+	test -f /tmp/tippecanoe-checkpoint-dir/tiles/metadata.json
+	rm -rf /tmp/tippecanoe-checkpoint-kill
+	mkdir -p /tmp/tippecanoe-checkpoint-kill
+	( ./tippecanoe -q -z12 -o /tmp/tippecanoe-checkpoint-kill/out.mbtiles --checkpoint-dir=/tmp/tippecanoe-checkpoint-kill/cp tests/ne_110m_populated_places/in.json & echo $$! > /tmp/tippecanoe-checkpoint-kill/pid )
+	sleep 2
+	kill -9 `cat /tmp/tippecanoe-checkpoint-kill/pid` 2>/dev/null || true
+	wait `cat /tmp/tippecanoe-checkpoint-kill/pid` 2>/dev/null || true
+	test -f /tmp/tippecanoe-checkpoint-kill/cp/state.sqlite
+	sqlite3 /tmp/tippecanoe-checkpoint-kill/cp/state.sqlite 'SELECT COUNT(*) FROM zoom_commit;' | grep -qv '^0$$'
+	./tippecanoe -q -z12 --resume=/tmp/tippecanoe-checkpoint-kill/cp -o /tmp/tippecanoe-checkpoint-kill/out.mbtiles -F tests/ne_110m_populated_places/in.json
 
 layer-json-test: tippecanoe tippecanoe-decode
 	# GeoJSON with description and named layer
