@@ -468,7 +468,7 @@ std::string stringify_strategies(std::vector<strategy> const &strategies) {
 void mbtiles_write_metadata(sqlite3 *db, const metadata &m, bool forcetable) {
 	char *sql, *err;
 
-	sql = sqlite3_mprintf("INSERT INTO metadata (name, value) VALUES ('name', %Q);", m.name.c_str());
+	sql = sqlite3_mprintf("INSERT OR REPLACE INTO metadata (name, value) VALUES ('name', %Q);", m.name.c_str());
 	if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
 		fprintf(stderr, "set name in metadata: %s\n", err);
 		if (!forcetable) {
@@ -477,7 +477,7 @@ void mbtiles_write_metadata(sqlite3 *db, const metadata &m, bool forcetable) {
 	}
 	sqlite3_free(sql);
 
-	sql = sqlite3_mprintf("INSERT INTO metadata (name, value) VALUES ('description', %Q);", m.description.c_str());
+	sql = sqlite3_mprintf("INSERT OR REPLACE INTO metadata (name, value) VALUES ('description', %Q);", m.description.c_str());
 	if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
 		fprintf(stderr, "set description in metadata: %s\n", err);
 		if (!forcetable) {
@@ -486,7 +486,7 @@ void mbtiles_write_metadata(sqlite3 *db, const metadata &m, bool forcetable) {
 	}
 	sqlite3_free(sql);
 
-	sql = sqlite3_mprintf("INSERT INTO metadata (name, value) VALUES ('version', %d);", m.version);
+	sql = sqlite3_mprintf("INSERT OR REPLACE INTO metadata (name, value) VALUES ('version', %d);", m.version);
 	if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
 		fprintf(stderr, "set version : %s\n", err);
 		if (!forcetable) {
@@ -495,7 +495,7 @@ void mbtiles_write_metadata(sqlite3 *db, const metadata &m, bool forcetable) {
 	}
 	sqlite3_free(sql);
 
-	sql = sqlite3_mprintf("INSERT INTO metadata (name, value) VALUES ('minzoom', %d);", m.minzoom);
+	sql = sqlite3_mprintf("INSERT OR REPLACE INTO metadata (name, value) VALUES ('minzoom', %d);", m.minzoom);
 	if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
 		fprintf(stderr, "set minzoom: %s\n", err);
 		if (!forcetable) {
@@ -504,7 +504,7 @@ void mbtiles_write_metadata(sqlite3 *db, const metadata &m, bool forcetable) {
 	}
 	sqlite3_free(sql);
 
-	sql = sqlite3_mprintf("INSERT INTO metadata (name, value) VALUES ('maxzoom', %d);", m.maxzoom);
+	sql = sqlite3_mprintf("INSERT OR REPLACE INTO metadata (name, value) VALUES ('maxzoom', %d);", m.maxzoom);
 	if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
 		fprintf(stderr, "set maxzoom: %s\n", err);
 		if (!forcetable) {
@@ -513,7 +513,7 @@ void mbtiles_write_metadata(sqlite3 *db, const metadata &m, bool forcetable) {
 	}
 	sqlite3_free(sql);
 
-	sql = sqlite3_mprintf("INSERT INTO metadata (name, value) VALUES ('center', '%f,%f,%d');", m.center_lon, m.center_lat, m.center_z);
+	sql = sqlite3_mprintf("INSERT OR REPLACE INTO metadata (name, value) VALUES ('center', '%f,%f,%d');", m.center_lon, m.center_lat, m.center_z);
 	if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
 		fprintf(stderr, "set center: %s\n", err);
 		if (!forcetable) {
@@ -522,7 +522,7 @@ void mbtiles_write_metadata(sqlite3 *db, const metadata &m, bool forcetable) {
 	}
 	sqlite3_free(sql);
 
-	sql = sqlite3_mprintf("INSERT INTO metadata (name, value) VALUES ('bounds', '%f,%f,%f,%f');", m.minlon, m.minlat, m.maxlon, m.maxlat);
+	sql = sqlite3_mprintf("INSERT OR REPLACE INTO metadata (name, value) VALUES ('bounds', '%f,%f,%f,%f');", m.minlon, m.minlat, m.maxlon, m.maxlat);
 	if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
 		fprintf(stderr, "set bounds: %s\n", err);
 		if (!forcetable) {
@@ -531,7 +531,7 @@ void mbtiles_write_metadata(sqlite3 *db, const metadata &m, bool forcetable) {
 	}
 	sqlite3_free(sql);
 
-	sql = sqlite3_mprintf("INSERT INTO metadata (name, value) VALUES ('antimeridian_adjusted_bounds', '%f,%f,%f,%f');", m.minlon2, m.minlat2, m.maxlon2, m.maxlat2);
+	sql = sqlite3_mprintf("INSERT OR REPLACE INTO metadata (name, value) VALUES ('antimeridian_adjusted_bounds', '%f,%f,%f,%f');", m.minlon2, m.minlat2, m.maxlon2, m.maxlat2);
 	if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
 		fprintf(stderr, "set bounds: %s\n", err);
 		if (!forcetable) {
@@ -540,7 +540,7 @@ void mbtiles_write_metadata(sqlite3 *db, const metadata &m, bool forcetable) {
 	}
 	sqlite3_free(sql);
 
-	sql = sqlite3_mprintf("INSERT INTO metadata (name, value) VALUES ('type', %Q);", m.type.c_str());
+	sql = sqlite3_mprintf("INSERT OR REPLACE INTO metadata (name, value) VALUES ('type', %Q);", m.type.c_str());
 	if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
 		fprintf(stderr, "set type: %s\n", err);
 		if (!forcetable) {
@@ -550,7 +550,7 @@ void mbtiles_write_metadata(sqlite3 *db, const metadata &m, bool forcetable) {
 	sqlite3_free(sql);
 
 	if (m.attribution.size() > 0) {
-		sql = sqlite3_mprintf("INSERT INTO metadata (name, value) VALUES ('attribution', %Q);", m.attribution.c_str());
+		sql = sqlite3_mprintf("INSERT OR REPLACE INTO metadata (name, value) VALUES ('attribution', %Q);", m.attribution.c_str());
 		if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
 			fprintf(stderr, "set attribution: %s\n", err);
 			if (!forcetable) {
@@ -560,7 +560,7 @@ void mbtiles_write_metadata(sqlite3 *db, const metadata &m, bool forcetable) {
 		sqlite3_free(sql);
 	}
 
-	sql = sqlite3_mprintf("INSERT INTO metadata (name, value) VALUES ('format', %Q);", m.format.c_str());
+	sql = sqlite3_mprintf("INSERT OR REPLACE INTO metadata (name, value) VALUES ('format', %Q);", m.format.c_str());
 	if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
 		fprintf(stderr, "set format: %s\n", err);
 		if (!forcetable) {
@@ -569,7 +569,7 @@ void mbtiles_write_metadata(sqlite3 *db, const metadata &m, bool forcetable) {
 	}
 	sqlite3_free(sql);
 
-	sql = sqlite3_mprintf("INSERT INTO metadata (name, value) VALUES ('generator', %Q);", m.generator.c_str());
+	sql = sqlite3_mprintf("INSERT OR REPLACE INTO metadata (name, value) VALUES ('generator', %Q);", m.generator.c_str());
 	if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
 		fprintf(stderr, "set generator: %s\n", err);
 		if (!forcetable) {
@@ -578,7 +578,7 @@ void mbtiles_write_metadata(sqlite3 *db, const metadata &m, bool forcetable) {
 	}
 	sqlite3_free(sql);
 
-	sql = sqlite3_mprintf("INSERT INTO metadata (name, value) VALUES ('generator_options', %Q);", m.generator_options.c_str());
+	sql = sqlite3_mprintf("INSERT OR REPLACE INTO metadata (name, value) VALUES ('generator_options', %Q);", m.generator_options.c_str());
 	if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
 		fprintf(stderr, "set commandline: %s\n", err);
 		if (!forcetable) {
@@ -588,7 +588,7 @@ void mbtiles_write_metadata(sqlite3 *db, const metadata &m, bool forcetable) {
 	sqlite3_free(sql);
 
 	if (m.strategies_json.size() > 0) {
-		sql = sqlite3_mprintf("INSERT INTO metadata (name, value) VALUES ('strategies', %Q);", m.strategies_json.c_str());
+		sql = sqlite3_mprintf("INSERT OR REPLACE INTO metadata (name, value) VALUES ('strategies', %Q);", m.strategies_json.c_str());
 		if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
 			fprintf(stderr, "set strategies: %s\n", err);
 			if (!forcetable) {
@@ -599,7 +599,7 @@ void mbtiles_write_metadata(sqlite3 *db, const metadata &m, bool forcetable) {
 	}
 
 	if (m.decisions_json.size() > 0) {
-		sql = sqlite3_mprintf("INSERT INTO metadata (name, value) VALUES ('tippecanoe_decisions', %Q);", m.decisions_json.c_str());
+		sql = sqlite3_mprintf("INSERT OR REPLACE INTO metadata (name, value) VALUES ('tippecanoe_decisions', %Q);", m.decisions_json.c_str());
 		if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
 			fprintf(stderr, "set decisions: %s\n", err);
 			if (!forcetable) {
@@ -639,7 +639,7 @@ void mbtiles_write_metadata(sqlite3 *db, const metadata &m, bool forcetable) {
 		state.nospace = true;
 		state.json_end_hash();
 
-		sql = sqlite3_mprintf("INSERT INTO metadata (name, value) VALUES ('json', %Q);", json.c_str());
+		sql = sqlite3_mprintf("INSERT OR REPLACE INTO metadata (name, value) VALUES ('json', %Q);", json.c_str());
 		if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
 			fprintf(stderr, "set json: %s\n", err);
 			if (!forcetable) {

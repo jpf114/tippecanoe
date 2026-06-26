@@ -74,15 +74,44 @@ struct ZoomCompleteContext {
 	unsigned midy = 0;
 };
 
+// Lightweight snapshot of all parameters needed to resume — read from state.sqlite
+// without opening a full Session.
+struct ResumeInfo {
+	std::string output_mode;       // "mbtiles" or "directory"
+	std::string output_path;       // absolute output path
+	std::vector<std::string> input_files;  // input file paths (from input_file table)
+	int maxzoom = 0;
+	int minzoom = 0;
+	int basezoom = 0;
+	int last_completed_zoom = -1;  // -1 if no zoom committed yet
+	bool entry_snapshot_done = false;  // true if initial snapshot was saved
+	std::string original_cmd;      // original command line (for display)
+	std::string normalized_cmd;    // normalized command line (for fingerprint)
+};
+
 std::string normalize_command_line_for_fingerprint(std::string const &command_line);
 std::string compute_fingerprint(FingerprintParams const &params);
 std::vector<InputFileStat> stat_input_paths(std::vector<std::string> const &paths);
 std::string absolute_path_or_die(const char *path);
 
+// Read resume metadata from state.sqlite.  Does NOT open a Session.
+// Exits with error if the directory or state.sqlite is missing/corrupt.
+ResumeInfo read_resume_info(const char *dir);
+
+// Output cleanup helpers for resuming after kill -9.
+// WAL / SHM / JOURNAL cleanup (mbtiles only, safe to call before opening the DB).
+void cleanup_resume_wal(const char *output_path);
+// Remove uncommitted-zoom directories (directory output mode).
+void cleanup_resume_dirs(const char *output_path, int last_completed_zoom, int maxzoom);
+// Remove uncommitted-zoom tiles from an already-open mbtiles database.
+void cleanup_resume_tiles(sqlite3 *outdb, int last_completed_zoom);
+
 class Session {
       public:
 	static std::unique_ptr<Session> open_new(const char *dir, bool force, FingerprintParams const &params);
-	static std::unique_ptr<Session> open_resume(const char *dir, FingerprintParams const &params, bool allow_existing_output);
+	// Self-contained resume: reads all params from state.sqlite, verifies fingerprint
+	// internally.  Does NOT need the caller to pass FingerprintParams.
+	static std::unique_ptr<Session> open_resume(const char *dir);
 
 	~Session();
 
@@ -110,8 +139,10 @@ class Session {
 	void open_db(bool create);
 	void init_schema();
 	void clear_workspace();
-	void write_job_row(FingerprintParams const &params, std::string const &fingerprint);
-	void verify_fingerprint_or_exit(FingerprintParams const &params);
+	void write_job_row(FingerprintParams const &params, std::string const &fingerprint, std::string const &normalized_cmd);
+	// Self-contained verification: reads stored fingerprint & params from DB,
+	// recomputes fingerprint, and exits on mismatch.
+	void verify_fingerprint_internal();
 	std::string path_blob(const char *name) const;
 	std::string path_staging(const char *name) const;
 	void fsync_path(std::string const &path);

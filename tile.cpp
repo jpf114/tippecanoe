@@ -3112,6 +3112,9 @@ void *run_thread(void *vargs) {
 		std::atomic<long long> geompos(0);
 		long long prevgeom = 0;
 
+		int features_in_slot = 0;
+		int tiles_written_from_slot = 0;
+
 		while (1) {
 			int z;
 			unsigned x, y;
@@ -3128,13 +3131,12 @@ void *run_thread(void *vargs) {
 			}
 			dc.deserialize_uint(&x, &geompos);
 			dc.deserialize_uint(&y, &geompos);
-#if 0
-// currently broken because also requires tracking nextzoom when skipping zooms
-if (z != arg->zoom) {
-fprintf(stderr, "Expected zoom %d, found zoom %d\n", arg->zoom, z);
-exit(EXIT_IMPOSSIBLE);
-}
-#endif
+
+			features_in_slot++;
+			if (features_in_slot == 1) {
+				fprintf(stderr, "  [tile first z=%d x=%u y=%u thread=%zu zoom=%d slot=%d compressed=%d]\n",
+					z, x, y, arg->threadno, arg->zoom, j, arg->compressed);
+			}
 
 			if (arg->compressed) {
 				dc.begin();
@@ -3149,6 +3151,10 @@ exit(EXIT_IMPOSSIBLE);
 			} else {
 				arg->wrote_zoom = z;
 				len = write_tile(&dc, &geompos, arg->global_stringpool, z, x, y, z == arg->maxzoom ? arg->full_detail : arg->low_detail, arg->min_detail, arg->outdb, arg->outdir, arg->buffer, arg->fname, arg->geomfile, arg->geompos, arg->minzoom, arg->maxzoom, arg->todo, arg->along, geompos, arg->gamma, arg->child_shards, arg->pool_off, arg->initial_x, arg->initial_y, arg->running, arg->simplification, arg->layermaps, arg->layer_unmaps, arg->tiling_seg, arg->pass, arg->mingap, arg->minextent, arg->mindrop_sequence, arg->minattribute, arg->prefilter, arg->postfilter, arg->filter, arg, arg->strategy, arg->compressed, arg->shared_nodes_map, arg->nodepos, *(arg->shared_nodes_bloom), (*arg->unidecode_data), estimated_complexity, arg->skip_children_out);
+				tiles_written_from_slot++;
+				if (features_in_slot <= 3) {
+					fprintf(stderr, "  [tile result z=%d x=%u y=%u len=%lld compressed=%d]\n", z, x, y, (long long)len, arg->compressed);
+				}
 			}
 
 			if (pthread_mutex_lock(&var_lock) != 0) {
@@ -3203,6 +3209,8 @@ exit(EXIT_IMPOSSIBLE);
 			}
 			arg->geomfd[j] = newfd;
 		}
+
+		fprintf(stderr, "  [tile thread=%zu zoom=%d slot=%d] features=%d tiles=%d\n", arg->threadno, arg->zoom, j, features_in_slot, tiles_written_from_slot);
 
 		if (fclose(geom) != 0) {
 			perror("close geom");
@@ -3413,7 +3421,7 @@ int traverse_zooms(int *geomfd, off_t *geom_size, char *global_stringpool, std::
 				args[thread].still_dropping = false;
 				args[thread].strategy = &strategy;
 				args[thread].zoom = z;
-				args[thread].compressed = (z != iz);
+				args[thread].compressed = (z != minzoom);
 				args[thread].shared_nodes_map = shared_nodes_map;
 				args[thread].nodepos = nodepos;
 				args[thread].shared_nodes_bloom = &shared_nodes_bloom;

@@ -43,8 +43,10 @@ void dir_write_tile(const char *outdir, int z, int tx, int ty, std::string const
 
 	struct stat st;
 	if (stat(newdir.c_str(), &st) == 0) {
-		fprintf(stderr, "Can't write tile to already existing %s\n", newdir.c_str());
-		exit(EXIT_EXISTS);
+		// File already exists — during resume with --force/-F, overwrite it.
+		// In normal operation, check_dir() already prevents writing to an
+		// existing tileset, so this path is only reached during resume.
+		unlink(newdir.c_str());
 	}
 
 	FILE *fp = fopen(newdir.c_str(), "wb");

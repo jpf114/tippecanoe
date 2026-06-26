@@ -3872,6 +3872,85 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "Forcing -g0 since -B or -r is not known\n");
 	}
 
+	// Track resume state for auto-cleanup (used after output is opened)
+	int resume_last_completed_zoom = -1;
+	bool resume_is_directory = false;
+
+	if (resume_dir != NULL) {
+		// Read all parameters from checkpoint — no need to pass them on command line
+		auto info = checkpoint::read_resume_info(resume_dir);
+
+		// Check if the checkpoint has a valid tiling snapshot
+		if (!info.entry_snapshot_done) {
+			fprintf(stderr, "%s: checkpoint %s is incomplete (initial snapshot not saved).\n"
+					"%s: The process was probably interrupted before the tiling phase began.\n"
+					"%s: Please re-run from scratch without --resume.\n",
+					argv[0], resume_dir, argv[0], argv[0]);
+			exit(EXIT_ARGS);
+		}
+
+		resume_last_completed_zoom = info.last_completed_zoom;
+		resume_is_directory = (info.output_mode == "directory");
+
+		// Print resume summary
+		fprintf(stderr, "\n=== Resuming from checkpoint: %s ===\n", resume_dir);
+		fprintf(stderr, "  Original command: %s\n", info.original_cmd.c_str());
+		fprintf(stderr, "  Output: %s (%s)\n", info.output_path.c_str(), info.output_mode.c_str());
+		for (auto const &f : info.input_files) {
+			fprintf(stderr, "  Input: %s\n", f.c_str());
+		}
+		fprintf(stderr, "  Zoom range: %d-%d\n", info.minzoom, info.maxzoom);
+		if (info.last_completed_zoom >= 0) {
+			fprintf(stderr, "  Resuming from zoom %d (last completed: %d)\n",
+				info.last_completed_zoom + 1, info.last_completed_zoom);
+		} else {
+			fprintf(stderr, "  No zooms completed yet — will start from zoom %d\n", info.basezoom);
+		}
+		fprintf(stderr, "========================================\n\n");
+
+		// Auto-populate output
+		if (out_mbtiles != NULL || out_dir != NULL) {
+			fprintf(stderr, "%s: note: ignoring -o/-e with --resume (using stored output path)\n", argv[0]);
+			// out_mbtiles/out_dir point to argv, not malloc'd — just null them
+			out_mbtiles = NULL;
+			out_dir = NULL;
+		}
+		if (info.output_mode == "mbtiles") {
+			out_mbtiles = strdup(info.output_path.c_str());
+		} else {
+			out_dir = strdup(info.output_path.c_str());
+		}
+
+		// Auto-populate zoom range
+		maxzoom = info.maxzoom;
+		minzoom = info.minzoom;
+
+		// Recalculate geometry_scale since maxzoom/minzoom changed from defaults
+		if (extra_detail >= 0 || prevent[P_SIMPLIFY_SHARED_NODES] || additional[A_EXTEND_ZOOMS] || extend_zooms_max > 0) {
+			geometry_scale = 0;
+		} else {
+			geometry_scale = 32 - (full_detail + maxzoom);
+			if (geometry_scale < 0) {
+				geometry_scale = 0;
+			}
+		}
+
+		// --resume automatically implies -F (preserve already-written tiles)
+		forcetable = 1;
+
+		// -f / --force would delete existing tiles — warn and ignore during resume
+		if (force) {
+			fprintf(stderr, "%s: warning: ignoring -f with --resume (tiles must be preserved)\n", argv[0]);
+			force = 0;
+		}
+
+		// Cleanup WAL/SHM/JOURNAL files before opening output
+		checkpoint::cleanup_resume_wal(info.output_path.c_str());
+		if (resume_is_directory) {
+			checkpoint::cleanup_resume_dirs(info.output_path.c_str(), resume_last_completed_zoom, info.maxzoom);
+		}
+	}
+
 	if (out_mbtiles == NULL && out_dir == NULL) {
 		fprintf(stderr, "%s: must specify -o out.mbtiles or -e directory\n", argv[0]);
 		exit(EXIT_ARGS);
@@ -3907,9 +3986,9 @@ int main(int argc, char **argv) {
 		exit(EXIT_ARGS);
 	}
 
-	if (resume_dir != NULL && !forcetable) {
-		fprintf(stderr, "%s: --resume requires -F / --allow-existing to keep tiles already written to the output\n", argv[0]);
-		exit(EXIT_ARGS);
+	// Auto-cleanup mbtiles: remove uncommitted tiles from killed session
+	if (resume_dir != NULL && outdb != NULL) {
+		checkpoint::cleanup_resume_tiles(outdb, resume_last_completed_zoom);
 	}
 
 	int ret = EXIT_SUCCESS;
@@ -3922,10 +4001,23 @@ int main(int argc, char **argv) {
 	}
 
 	if (sources.size() == 0) {
-		struct source src;
-		src.layer = "";
-		src.file = "";	// standard input
-		sources.push_back(src);
+		// If resuming, read input file list from checkpoint (no args needed on command line)
+		if (resume_dir != NULL) {
+			auto info = checkpoint::read_resume_info(resume_dir);
+			for (auto const &f : info.input_files) {
+				struct source src;
+				src.layer = "";
+				src.file = f;
+				sources.push_back(src);
+			}
+		}
+		// Fall back to stdin if no files specified and not resuming
+		if (sources.size() == 0) {
+			struct source src;
+			src.layer = "";
+			src.file = "";	// standard input
+			sources.push_back(src);
+		}
 	}
 
 	if (layername != NULL) {
@@ -3962,7 +4054,7 @@ int main(int argc, char **argv) {
 
 	std::unique_ptr<checkpoint::Session> checkpoint_session;
 	if (resume_dir != NULL) {
-		checkpoint_session = checkpoint::Session::open_resume(resume_dir, fingerprint, forcetable);
+		checkpoint_session = checkpoint::Session::open_resume(resume_dir);
 	} else if (checkpoint_dir != NULL) {
 		checkpoint_session = checkpoint::Session::open_new(checkpoint_dir, checkpoint_force != 0, fingerprint);
 	}
