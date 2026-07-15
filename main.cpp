@@ -1256,11 +1256,45 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 			}
 		}
 
+		// Restore file_bbox so metadata.bounds / antimeridian_adjusted_bounds
+		// match the normal (non-resume) path.
+		memcpy(file_bbox, restored.file_bbox, sizeof(long long) * 4);
+		memcpy(file_bbox1, restored.file_bbox1, sizeof(long long) * 4);
+		memcpy(file_bbox2, restored.file_bbox2, sizeof(long long) * 4);
+
 		double minlat = 0, minlon = 0, maxlat = 0, maxlon = 0, midlat = 0, midlon = 0;
+		// center from the resume mid-tile (matches normal-path center convention)
 		tile2lonlat(midx, midy, maxzoom, &minlon, &maxlat);
 		tile2lonlat(midx + 1, midy + 1, maxzoom, &maxlon, &minlat);
 		midlat = (maxlat + minlat) / 2;
 		midlon = (maxlon + minlon) / 2;
+
+		// data bounds from the persisted z=32 pixel bbox
+		tile2lonlat(file_bbox[0], file_bbox[1], 32, &minlon, &maxlat);
+		tile2lonlat(file_bbox[2], file_bbox[3], 32, &maxlon, &minlat);
+
+		if (midlat < minlat) {
+			midlat = minlat;
+		}
+		if (midlat > maxlat) {
+			midlat = maxlat;
+		}
+		if (midlon < minlon) {
+			midlon = minlon;
+		}
+		if (midlon > maxlon) {
+			midlon = maxlon;
+		}
+
+		// antimeridian-aware bounding box
+		double minlat2 = 0, minlon2 = 0, maxlat2 = 0, maxlon2 = 0;
+		if (file_bbox2[2] - file_bbox2[0] < file_bbox1[2] - file_bbox1[0]) {
+			tile2lonlat(file_bbox2[0], file_bbox2[1], 32, &minlon2, &maxlat2);
+			tile2lonlat(file_bbox2[2], file_bbox2[3], 32, &maxlon2, &minlat2);
+		} else {
+			tile2lonlat(file_bbox1[0], file_bbox1[1], 32, &minlon2, &maxlat2);
+			tile2lonlat(file_bbox1[2], file_bbox1[3], 32, &maxlon2, &minlat2);
+		}
 
 		std::map<std::string, layermap_entry> merged_lm = merge_layermaps(layermaps);
 		for (auto ai = merged_lm.begin(); ai != merged_lm.end(); ++ai) {
@@ -1268,7 +1302,7 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 			ai->second.maxzoom = maxzoom;
 		}
 
-		metadata m = make_metadata(fname, minzoom, maxzoom, minlat, minlon, maxlat, maxlon, minlat, minlon, maxlat, maxlon, midlat, midlon, attribution, merged_lm, true, description, !prevent[P_TILE_STATS], attribute_descriptions, "tippecanoe", commandline, strategies, basezoom, droprate, retain_points_multiplier);
+		metadata m = make_metadata(fname, minzoom, maxzoom, minlat, minlon, maxlat, maxlon, minlat2, minlon2, maxlat2, maxlon2, midlat, midlon, attribution, merged_lm, true, description, !prevent[P_TILE_STATS], attribute_descriptions, "tippecanoe", commandline, strategies, basezoom, droprate, retain_points_multiplier);
 		if (outdb != NULL) {
 			mbtiles_write_metadata(outdb, m, forcetable);
 		} else {
@@ -2817,7 +2851,7 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 	std::vector<strategy> strategies;
 
 	if (checkpoint_session != nullptr) {
-		checkpoint_session->snapshot_tiling_entry(poolfd, (size_t) poolpos, pool_off, initial_x, initial_y, fd[0], size[0], shared_nodes_map, nodepos, shared_nodes_bloom, layermaps, (int) iz, minzoom, maxzoom, basezoom);
+		checkpoint_session->snapshot_tiling_entry(poolfd, (size_t) poolpos, pool_off, initial_x, initial_y, fd[0], size[0], shared_nodes_map, nodepos, shared_nodes_bloom, layermaps, (int) iz, minzoom, maxzoom, basezoom, file_bbox, file_bbox1, file_bbox2);
 	}
 
 	int written = traverse_zooms(fd, size, stringpool, &midx, &midy, maxzoom, minzoom, outdb, outdir, buffer, fname, tmpdir, gamma, full_detail, low_detail, min_detail, pool_off, initial_x, initial_y, simplification, maxzoom_simplification, layermaps, prefilter, postfilter, attribute_accum, filter, strategies, iz, shared_nodes_map, nodepos, shared_nodes_bloom, basezoom, droprate, unidecode_data, &drop_by_attribute_as_needed_attribute, drop_by_attribute_descending, nullptr, checkpoint_session);

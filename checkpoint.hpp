@@ -1,7 +1,9 @@
 #ifndef CHECKPOINT_HPP
 #define CHECKPOINT_HPP
 
+#include <climits>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <set>
 #include <string>
@@ -58,6 +60,11 @@ struct TilingRestore {
 	int minzoom = 0;
 	int maxzoom = 0;
 	int basezoom = 0;
+	// Data global bbox in z=32 pixel coordinates, used to reconstruct
+	// metadata.bounds / antimeridian_adjusted_bounds on resume.
+	long long file_bbox[4] = {UINT_MAX, UINT_MAX, 0, 0};
+	long long file_bbox1[4] = {0xFFFFFFFF, 0xFFFFFFFF, 0, 0};
+	long long file_bbox2[4] = {0x1FFFFFFFF, 0xFFFFFFFF, 0x100000000, 0};
 
 	TilingRestore();
 	~TilingRestore();
@@ -125,7 +132,8 @@ class Session {
 
 	void snapshot_tiling_entry(int poolfd, size_t pool_size, long long const *pool_off, unsigned const *initial_x, unsigned const *initial_y,
 				   int geomfd, off_t geom_size, node *shared_nodes_map, size_t nodepos, std::string const &shared_nodes_bloom,
-				   std::vector<std::map<std::string, layermap_entry>> const &layermaps, int iz, int minzoom, int maxzoom, int basezoom);
+				   std::vector<std::map<std::string, layermap_entry>> const &layermaps, int iz, int minzoom, int maxzoom, int basezoom,
+				   long long const *file_bbox, long long const *file_bbox1, long long const *file_bbox2);
 
 	bool restore_tiling(TilingRestore &out);
 

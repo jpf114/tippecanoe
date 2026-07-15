@@ -171,27 +171,106 @@ void write_blob_file(std::string const &path, void const *data, size_t len) {
 	}
 }
 
+// Layermaps blob format version.
+//
+// v1: segs, [layers, [(nlen, name, id, minz, maxz)]]
+// v2: version, segs, [layers, [(nlen, name, id, minz, maxz, points, lines, polygons, retain)]]
+// v3: v2 + description + full tilestats (so metadata.vector_layers.fields and
+//     metadata.tilestats can be reconstructed on resume).
+constexpr uint32_t LAYERMAPS_FORMAT_VERSION = 3;
+
+static void write_str_field(FILE *fp, std::string const &s) {
+	uint32_t nlen = (uint32_t) s.size();
+	fwrite(&nlen, sizeof(nlen), 1, fp);
+	if (nlen > 0) {
+		fwrite(s.data(), 1, nlen, fp);
+	}
+}
+
+static bool read_str_field(FILE *fp, std::string &out) {
+	uint32_t nlen = 0;
+	if (fread(&nlen, sizeof(nlen), 1, fp) != 1) {
+		return false;
+	}
+	out.assign(nlen, '\0');
+	if (nlen > 0 && fread(&out[0], 1, nlen, fp) != nlen) {
+		return false;
+	}
+	return true;
+}
+
+static void write_tilestat_entry(FILE *fp, std::string const &attr_name, tilestat const &ts) {
+	write_str_field(fp, attr_name);
+	fwrite(&ts.min, sizeof(double), 1, fp);
+	fwrite(&ts.max, sizeof(double), 1, fp);
+	int32_t type = ts.type;
+	fwrite(&type, sizeof(type), 1, fp);
+	uint32_t scount = (uint32_t) ts.sample_values.size();
+	fwrite(&scount, sizeof(scount), 1, fp);
+	for (auto const &sv : ts.sample_values) {
+		int32_t sv_type = sv.type;
+		fwrite(&sv_type, sizeof(sv_type), 1, fp);
+		write_str_field(fp, sv.s);
+	}
+}
+
+static bool read_tilestat_entry(FILE *fp, std::string &attr_name, tilestat &ts) {
+	if (!read_str_field(fp, attr_name)) {
+		return false;
+	}
+	if (fread(&ts.min, sizeof(double), 1, fp) != 1) return false;
+	if (fread(&ts.max, sizeof(double), 1, fp) != 1) return false;
+	int32_t type = 0;
+	if (fread(&type, sizeof(type), 1, fp) != 1) return false;
+	ts.type = type;
+	uint32_t scount = 0;
+	if (fread(&scount, sizeof(scount), 1, fp) != 1) return false;
+	ts.sample_values.clear();
+	for (uint32_t i = 0; i < scount; i++) {
+		int32_t sv_type = 0;
+		if (fread(&sv_type, sizeof(sv_type), 1, fp) != 1) return false;
+		std::string s;
+		if (!read_str_field(fp, s)) return false;
+		ts.sample_values.push_back(serial_val(sv_type, s));
+	}
+	return true;
+}
+
 void write_layermaps_blob(std::string const &path, std::vector<std::map<std::string, layermap_entry>> const &layermaps) {
 	FILE *fp = fopen(path.c_str(), "wb");
 	if (fp == NULL) {
 		perror(path.c_str());
 		exit(EXIT_WRITE);
 	}
+	uint32_t version = LAYERMAPS_FORMAT_VERSION;
+	fwrite(&version, sizeof(version), 1, fp);
 	uint32_t segs = (uint32_t) layermaps.size();
 	fwrite(&segs, sizeof(segs), 1, fp);
 	for (auto const &seg : layermaps) {
 		uint32_t layers = (uint32_t) seg.size();
 		fwrite(&layers, sizeof(layers), 1, fp);
 		for (auto const &kv : seg) {
-			uint32_t nlen = (uint32_t) kv.first.size();
-			fwrite(&nlen, sizeof(nlen), 1, fp);
-			fwrite(kv.first.c_str(), 1, nlen, fp);
+			write_str_field(fp, kv.first);
 			uint32_t id = (uint32_t) kv.second.id;
 			int32_t minz = kv.second.minzoom;
 			int32_t maxz = kv.second.maxzoom;
+			size_t points = kv.second.points;
+			size_t lines = kv.second.lines;
+			size_t polygons = kv.second.polygons;
+			size_t retain = kv.second.retain;
 			fwrite(&id, sizeof(id), 1, fp);
 			fwrite(&minz, sizeof(minz), 1, fp);
 			fwrite(&maxz, sizeof(maxz), 1, fp);
+			fwrite(&points, sizeof(points), 1, fp);
+			fwrite(&lines, sizeof(lines), 1, fp);
+			fwrite(&polygons, sizeof(polygons), 1, fp);
+			fwrite(&retain, sizeof(retain), 1, fp);
+			write_str_field(fp, kv.second.description);
+			uint32_t tcount = (uint32_t) kv.second.tilestats.size();
+			fwrite(&tcount, sizeof(tcount), 1, fp);
+			for (auto const &ts : kv.second.tilestats) {
+				write_tilestat_entry(fp, ts.first, ts.second);
+			}
 		}
 	}
 	fclose(fp);
@@ -200,8 +279,22 @@ void write_layermaps_blob(std::string const &path, std::vector<std::map<std::str
 void read_layermaps_blob(std::string const &path, std::vector<std::map<std::string, layermap_entry>> &layermaps) {
 	FILE *fp = fopen(path.c_str(), "rb");
 	if (fp == NULL) {
-		perror(path.c_str());
-		exit(EXIT_OPEN);
+		// File may not exist if the initial snapshot was never written.
+		return;
+	}
+	uint32_t version = 0;
+	if (fread(&version, sizeof(version), 1, fp) != 1) {
+		fclose(fp);
+		return;
+	}
+	if (version != LAYERMAPS_FORMAT_VERSION) {
+		// Older format — field layout is incompatible. Return empty layermaps;
+		// metadata.vector_layers will be empty but tile content is unaffected.
+		// User should re-run from scratch with a v3-capable binary for full metadata.
+		fprintf(stderr, "%s: warning: layermaps.bin format version %u does not match expected %u; vector_layers metadata will be empty\n",
+			*av, version, LAYERMAPS_FORMAT_VERSION);
+		fclose(fp);
+		return;
 	}
 	uint32_t segs = 0;
 	if (fread(&segs, sizeof(segs), 1, fp) != 1) {
@@ -211,21 +304,45 @@ void read_layermaps_blob(std::string const &path, std::vector<std::map<std::stri
 	layermaps.resize(segs);
 	for (uint32_t s = 0; s < segs; s++) {
 		uint32_t layers = 0;
-		fread(&layers, sizeof(layers), 1, fp);
+		if (fread(&layers, sizeof(layers), 1, fp) != 1) {
+			break;
+		}
 		for (uint32_t l = 0; l < layers; l++) {
-			uint32_t nlen = 0;
-			fread(&nlen, sizeof(nlen), 1, fp);
-			std::string name(nlen, '\0');
-			fread(&name[0], 1, nlen, fp);
+			std::string name;
+			if (!read_str_field(fp, name)) {
+				break;
+			}
 			uint32_t id = 0;
 			int32_t minz = 0, maxz = 0;
-			fread(&id, sizeof(id), 1, fp);
-			fread(&minz, sizeof(minz), 1, fp);
-			fread(&maxz, sizeof(maxz), 1, fp);
+			size_t points = 0, lines = 0, polygons = 0, retain = 0;
+			if (fread(&id, sizeof(id), 1, fp) != 1) break;
+			if (fread(&minz, sizeof(minz), 1, fp) != 1) break;
+			if (fread(&maxz, sizeof(maxz), 1, fp) != 1) break;
+			if (fread(&points, sizeof(points), 1, fp) != 1) break;
+			if (fread(&lines, sizeof(lines), 1, fp) != 1) break;
+			if (fread(&polygons, sizeof(polygons), 1, fp) != 1) break;
+			if (fread(&retain, sizeof(retain), 1, fp) != 1) break;
+			std::string description;
+			if (!read_str_field(fp, description)) break;
+			uint32_t tcount = 0;
+			if (fread(&tcount, sizeof(tcount), 1, fp) != 1) break;
 			layermap_entry e(id);
 			e.minzoom = minz;
 			e.maxzoom = maxz;
-			layermaps[s].emplace(name, e);
+			e.points = points;
+			e.lines = lines;
+			e.polygons = polygons;
+			e.retain = retain;
+			e.description = description;
+			for (uint32_t t = 0; t < tcount; t++) {
+				std::string attr_name;
+				tilestat ts;
+				if (!read_tilestat_entry(fp, attr_name, ts)) {
+					break;
+				}
+				e.tilestats.emplace(attr_name, std::move(ts));
+			}
+			layermaps[s].emplace(name, std::move(e));
 		}
 	}
 	fclose(fp);
@@ -814,14 +931,18 @@ ResumeInfo read_resume_info(const char *dir) {
 // --- output cleanup helpers ---
 
 void cleanup_resume_wal(const char *output_path) {
-	// Remove WAL, SHM, and JOURNAL files left by a killed process
+	// Remove WAL and SHM files left by a killed process.
+	// NOTE: we deliberately do NOT delete the -journal file here: if a hot
+	// journal exists, SQLite must replay it on open to roll back the
+	// incomplete transaction. Deleting it first would leave the database
+	// in an inconsistent state and subsequent PRAGMA executions would fail
+	// with "database is locked".
 	std::string wal = std::string(output_path) + "-wal";
 	std::string shm = std::string(output_path) + "-shm";
 	std::string journal = std::string(output_path) + "-journal";
 
 	unlink(wal.c_str());
 	unlink(shm.c_str());
-	unlink(journal.c_str());
 
 	// If the database file header still indicates WAL mode (bytes 18-19 = 0x02 0x00),
 	// SQLite will refuse to open it without the WAL files (database is locked).
@@ -838,18 +959,27 @@ void cleanup_resume_wal(const char *output_path) {
 		close(fd);
 	}
 
-	// Open the database to perform journal recovery (rollback any incomplete
-	// transaction from the killed process) and switch to DELETE journal mode.
+	// Open the database to perform journal recovery (replay any hot journal
+	// from the killed process) and switch to DELETE journal mode.
 	// This must be done before tippecanoe opens the database, because
-	// tippecanoe's mbtiles_open will set WAL mode and its async workers
+	// tippecanoe's mbtiles_open uses EXCLUSIVE locking and its async workers
 	// will conflict with a database that still has an unrecovered journal.
 	sqlite3 *db = NULL;
 	if (sqlite3_open(output_path, &db) == SQLITE_OK) {
+		// Set a busy timeout so journal replay can complete if there is
+		// any transient lock contention.
+		sqlite3_busy_timeout(db, 30000);
 		char *err = NULL;
-		sqlite3_exec(db, "PRAGMA journal_mode=DELETE;", NULL, NULL, &err);
+		int rc = sqlite3_exec(db, "PRAGMA journal_mode=DELETE;", NULL, NULL, &err);
+		if (rc != SQLITE_OK) {
+			fprintf(stderr, "checkpoint: warning: journal recovery for %s failed: %s\n", output_path, err ? err : "(unknown)");
+		}
 		sqlite3_free(err);
 		sqlite3_close(db);
 	}
+
+	// After recovery the hot journal should be gone; remove any stragglers.
+	unlink(journal.c_str());
 }
 
 void cleanup_resume_dirs(const char *output_path, int last_completed_zoom, int maxzoom) {
@@ -987,7 +1117,8 @@ void Session::commit_generation() {
 
 void Session::snapshot_tiling_entry(int poolfd, size_t pool_size, long long const *pool_off, unsigned const *initial_x, unsigned const *initial_y,
 				   int geomfd, off_t geom_size, node *shared_nodes_map, size_t nodepos, std::string const &shared_nodes_bloom,
-				   std::vector<std::map<std::string, layermap_entry>> const &layermaps, int iz, int minzoom, int maxzoom, int basezoom) {
+				   std::vector<std::map<std::string, layermap_entry>> const &layermaps, int iz, int minzoom, int maxzoom, int basezoom,
+				   long long const *file_bbox, long long const *file_bbox1, long long const *file_bbox2) {
 	if (!active_) {
 		return;
 	}
@@ -1012,6 +1143,15 @@ void Session::snapshot_tiling_entry(int poolfd, size_t pool_size, long long cons
 	write_blob_file(path_staging("initial_x.bin"), initial_x, sizeof(unsigned) * CPUS);
 	write_blob_file(path_staging("initial_y.bin"), initial_y, sizeof(unsigned) * CPUS);
 	write_layermaps_blob(path_staging("layermaps.bin"), layermaps);
+	if (file_bbox != nullptr) {
+		write_blob_file(path_staging("file_bbox.bin"), file_bbox, sizeof(long long) * 4);
+	}
+	if (file_bbox1 != nullptr) {
+		write_blob_file(path_staging("file_bbox1.bin"), file_bbox1, sizeof(long long) * 4);
+	}
+	if (file_bbox2 != nullptr) {
+		write_blob_file(path_staging("file_bbox2.bin"), file_bbox2, sizeof(long long) * 4);
+	}
 
 	// Promote staging -> blobs
 	rename(path_staging("stringpool").c_str(), path_blob("stringpool").c_str());
@@ -1028,6 +1168,15 @@ void Session::snapshot_tiling_entry(int poolfd, size_t pool_size, long long cons
 	rename(path_staging("initial_x.bin").c_str(), path_blob("initial_x.bin").c_str());
 	rename(path_staging("initial_y.bin").c_str(), path_blob("initial_y.bin").c_str());
 	rename(path_staging("layermaps.bin").c_str(), path_blob("layermaps.bin").c_str());
+	if (file_bbox != nullptr) {
+		rename(path_staging("file_bbox.bin").c_str(), path_blob("file_bbox.bin").c_str());
+	}
+	if (file_bbox1 != nullptr) {
+		rename(path_staging("file_bbox1.bin").c_str(), path_blob("file_bbox1.bin").c_str());
+	}
+	if (file_bbox2 != nullptr) {
+		rename(path_staging("file_bbox2.bin").c_str(), path_blob("file_bbox2.bin").c_str());
+	}
 
 	commit_generation();
 
@@ -1190,6 +1339,21 @@ bool Session::restore_tiling(TilingRestore &out) {
 
 	read_skip_children_blob(path_blob("skip_children.bin"), out.skip_children);
 	read_strategies_blob(path_blob("strategies.bin"), out.strategies);
+
+	// Restore file_bbox / file_bbox1 / file_bbox2 (used by metadata.bounds).
+	// Missing files leave the TilingRestore defaults in place.
+	for (int which = 0; which < 3; which++) {
+		const char *name = which == 0 ? "file_bbox.bin" : which == 1 ? "file_bbox1.bin" : "file_bbox2.bin";
+		long long *dst = which == 0 ? out.file_bbox : which == 1 ? out.file_bbox1 : out.file_bbox2;
+		std::string p = path_blob(name);
+		FILE *bfp = fopen(p.c_str(), "rb");
+		if (bfp != NULL) {
+			if (fread(dst, sizeof(long long), 4, bfp) != 4) {
+				// short read — leave defaults
+			}
+			fclose(bfp);
+		}
+	}
 
 	out.iz = resume_iz_;
 	out.minzoom = tiling_minzoom_;
