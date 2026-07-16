@@ -3093,6 +3093,8 @@ int main(int argc, char **argv) {
 	const char *tmpdir = "/tmp";
 	const char *checkpoint_dir = NULL;
 	const char *resume_dir = NULL;
+	const char *checkpoint_status_dir = NULL;
+	const char *checkpoint_prune_dir = NULL;
 	int checkpoint_force = 0;
 	const char *attribution = NULL;
 	std::vector<source> sources;
@@ -3129,6 +3131,8 @@ int main(int argc, char **argv) {
 		{"checkpoint-dir", required_argument, 0, '~'},
 		{"resume", required_argument, 0, '~'},
 		{"checkpoint-force", no_argument, 0, '~'},
+		{"checkpoint-status", required_argument, 0, '~'},
+		{"checkpoint-prune", required_argument, 0, '~'},
 
 		{"Tileset description and attribution", 0, 0, 0},
 		{"name", required_argument, 0, 'n'},
@@ -3437,6 +3441,10 @@ int main(int argc, char **argv) {
 				checkpoint_dir = optarg;
 			} else if (strcmp(opt, "resume") == 0) {
 				resume_dir = optarg;
+			} else if (strcmp(opt, "checkpoint-status") == 0) {
+				checkpoint_status_dir = optarg;
+			} else if (strcmp(opt, "checkpoint-prune") == 0) {
+				checkpoint_prune_dir = optarg;
 			} else if (strcmp(opt, "checkpoint-force") == 0) {
 				checkpoint_force = 1;
 			} else {
@@ -3825,6 +3833,7 @@ int main(int argc, char **argv) {
 	}
 
 	signal(SIGPIPE, SIG_IGN);
+	checkpoint::install_signal_handlers();
 
 	files_open_at_start = open(get_null_device(), O_RDONLY | O_CLOEXEC);
 	if (files_open_at_start < 0) {
@@ -3904,6 +3913,16 @@ int main(int argc, char **argv) {
 		// if rate and base aren't known during feature reading.
 		gamma = 0;
 		fprintf(stderr, "Forcing -g0 since -B or -r is not known\n");
+	}
+
+	// --- Management commands: --checkpoint-status / --checkpoint-prune ---
+	// These are standalone utilities that read/manipulate a checkpoint directory
+	// and exit immediately, without starting any tiling work.
+	if (checkpoint_status_dir != NULL) {
+		return checkpoint::checkpoint_status(checkpoint_status_dir);
+	}
+	if (checkpoint_prune_dir != NULL) {
+		return checkpoint::checkpoint_prune(checkpoint_prune_dir);
 	}
 
 	// Track resume state for auto-cleanup (used after output is opened)

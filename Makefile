@@ -573,15 +573,19 @@ csv-test: tippecanoe tippecanoe-decode
 	rm -f tests/csv/out.mbtiles.json.check tests/csv/out.mbtiles
 
 checkpoint-test: tippecanoe
-	rm -rf /tmp/tippecanoe-checkpoint-test /tmp/tippecanoe-checkpoint-kill /tmp/tippecanoe-checkpoint-dir
+	rm -rf /tmp/tippecanoe-checkpoint-test /tmp/tippecanoe-checkpoint-kill /tmp/tippecanoe-checkpoint-dir /tmp/tippecanoe-checkpoint-sigterm
 	# 1) Basic first run with --checkpoint-dir, then self-contained --resume
 	mkdir -p /tmp/tippecanoe-checkpoint-test
 	./tippecanoe -q -z3 -f -o /tmp/tippecanoe-checkpoint-test/baseline.mbtiles tests/onefeature/in.json
 	./tippecanoe -q -z3 -o /tmp/tippecanoe-checkpoint-test/out.mbtiles --checkpoint-dir=/tmp/tippecanoe-checkpoint-test/cp tests/onefeature/in.json
-	test -f /tmp/tippecanoe-checkpoint-test/cp/state.sqlite
+	# Verify checkpoint state files (JSON state, not SQLite)
+	test -f /tmp/tippecanoe-checkpoint-test/cp/state.json
 	test -f /tmp/tippecanoe-checkpoint-test/cp/blobs/layermaps.bin
 	test -f /tmp/tippecanoe-checkpoint-test/cp/blobs/file_bbox.bin
-	sqlite3 /tmp/tippecanoe-checkpoint-test/cp/state.sqlite 'SELECT COUNT(*) FROM zoom_commit;' | grep -qv '^0$$'
+	# Verify at least one zoom commit exists in state.json
+	grep -q '"zoom_commits":{"[0-9]' /tmp/tippecanoe-checkpoint-test/cp/state.json
+	# Verify --checkpoint-status works on a completed checkpoint
+	./tippecanoe --checkpoint-status=/tmp/tippecanoe-checkpoint-test/cp 2>/dev/null
 	# Resume must work with --resume alone (no -o, no -F, no input file, no -z)
 	./tippecanoe -q --resume=/tmp/tippecanoe-checkpoint-test/cp
 	# Resumed output must match the baseline tile content and key metadata
@@ -591,7 +595,7 @@ checkpoint-test: tippecanoe
 	# 2) Directory output + checkpoint
 	mkdir -p /tmp/tippecanoe-checkpoint-dir
 	./tippecanoe -q -z2 -e /tmp/tippecanoe-checkpoint-dir/tiles --checkpoint-dir=/tmp/tippecanoe-checkpoint-dir/cp tests/onefeature/in.json
-	test -f /tmp/tippecanoe-checkpoint-dir/cp/state.sqlite
+	test -f /tmp/tippecanoe-checkpoint-dir/cp/state.json
 	test -f /tmp/tippecanoe-checkpoint-dir/tiles/metadata.json
 	./tippecanoe -q --resume=/tmp/tippecanoe-checkpoint-dir/cp
 	test -f /tmp/tippecanoe-checkpoint-dir/tiles/metadata.json
@@ -603,13 +607,30 @@ checkpoint-test: tippecanoe
 	sleep 1
 	kill -9 `cat /tmp/tippecanoe-checkpoint-kill/pid` 2>/dev/null || true
 	wait `cat /tmp/tippecanoe-checkpoint-kill/pid` 2>/dev/null || true
-	test -f /tmp/tippecanoe-checkpoint-kill/cp/state.sqlite
-	sqlite3 /tmp/tippecanoe-checkpoint-kill/cp/state.sqlite 'SELECT COUNT(*) FROM zoom_commit;' | grep -qv '^0$$'
+	test -f /tmp/tippecanoe-checkpoint-kill/cp/state.json
+	# Verify state.json has at least one zoom commit (proves partial progress was saved)
+	grep -q '"zoom_commits":{"[0-9]' /tmp/tippecanoe-checkpoint-kill/cp/state.json
 	# Resume should auto-clean any journal/WAL left by kill -9
 	./tippecanoe -q --resume=/tmp/tippecanoe-checkpoint-kill/cp
 	! test -f /tmp/tippecanoe-checkpoint-kill/out.mbtiles-journal
 	! test -f /tmp/tippecanoe-checkpoint-kill/out.mbtiles-wal
 	! test -f /tmp/tippecanoe-checkpoint-kill/out.mbtiles-shm
+	# 4) SIGTERM graceful shutdown, then resume must complete
+	rm -rf /tmp/tippecanoe-checkpoint-sigterm
+	mkdir -p /tmp/tippecanoe-checkpoint-sigterm
+	( ./tippecanoe -q -z12 -o /tmp/tippecanoe-checkpoint-sigterm/out.mbtiles --checkpoint-dir=/tmp/tippecanoe-checkpoint-sigterm/cp tests/ne_110m_populated_places/in.json & echo $$! > /tmp/tippecanoe-checkpoint-sigterm/pid )
+	sleep 2
+	kill -TERM `cat /tmp/tippecanoe-checkpoint-sigterm/pid` 2>/dev/null || true
+	wait `cat /tmp/tippecanoe-checkpoint-sigterm/pid` 2>/dev/null || true
+	test -f /tmp/tippecanoe-checkpoint-sigterm/cp/state.json
+	# Resume from SIGTERM checkpoint must complete successfully
+	./tippecanoe -q --resume=/tmp/tippecanoe-checkpoint-sigterm/cp
+	# Verify final output has tiles
+	sqlite3 /tmp/tippecanoe-checkpoint-sigterm/out.mbtiles 'SELECT COUNT(*) FROM map;' | grep -qv '^0$$'
+	# 5) --checkpoint-prune cleans up blobs/ but preserves state.json
+	./tippecanoe --checkpoint-prune=/tmp/tippecanoe-checkpoint-sigterm/cp 2>/dev/null
+	test -f /tmp/tippecanoe-checkpoint-sigterm/cp/state.json
+	! test -d /tmp/tippecanoe-checkpoint-sigterm/cp/blobs
 
 layer-json-test: tippecanoe tippecanoe-decode
 	# GeoJSON with description and named layer

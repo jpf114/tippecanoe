@@ -9,19 +9,32 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
+#ifdef __linux__
+#include <sys/sendfile.h>
+#endif
+
 #include "errors.hpp"
+#include "jsonpull/jsonpull.h"
 #include "serial.hpp"
 
 extern char **av;
 
 namespace checkpoint {
 
+// ===========================================================================
+// 匿名命名空间：内部辅助函数
+// ===========================================================================
+
 namespace {
+
+// --- SHA-256 指纹计算（用于 checkpoint 内部一致性校验）---
 
 void sha256(const unsigned char *data, size_t len, unsigned char out[32]) {
 	static const uint32_t k[64] = {
@@ -122,15 +135,6 @@ void json_escape(std::string const &s, std::string &out) {
 	}
 }
 
-void exec_sql(sqlite3 *db, char const *sql) {
-	char *err = NULL;
-	if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
-		fprintf(stderr, "%s: checkpoint sqlite: %s\n", *av, err ? err : "unknown error");
-		sqlite3_free(err);
-		exit(EXIT_SQLITE);
-	}
-}
-
 int64_t now_unix() {
 	return (int64_t) time(NULL);
 }
@@ -171,12 +175,298 @@ void write_blob_file(std::string const &path, void const *data, size_t len) {
 	}
 }
 
-// Layermaps blob format version.
-//
-// v1: segs, [layers, [(nlen, name, id, minz, maxz)]]
-// v2: version, segs, [layers, [(nlen, name, id, minz, maxz, points, lines, polygons, retain)]]
-// v3: v2 + description + full tilestats (so metadata.vector_layers.fields and
-//     metadata.tilestats can be reconstructed on resume).
+// --- 信号处理 ---
+
+volatile sig_atomic_t g_shutdown_requested = 0;
+
+void signal_handler(int sig) {
+	(void) sig;
+	g_shutdown_requested = 1;
+}
+
+// --- JSON 序列化辅助 ---
+
+void jw_str(std::string &out, const char *key, std::string const &val, bool first = false) {
+	if (!first) out += ",";
+	out += "\"";
+	out += key;
+	out += "\":\"";
+	json_escape(val, out);
+	out += "\"";
+}
+
+void jw_int(std::string &out, const char *key, long long val, bool first = false) {
+	if (!first) out += ",";
+	out += "\"";
+	out += key;
+	out += "\":";
+	out += std::to_string(val);
+}
+
+void jw_uint(std::string &out, const char *key, uint64_t val, bool first = false) {
+	if (!first) out += ",";
+	out += "\"";
+	out += key;
+	out += "\":";
+	out += std::to_string(val);
+}
+
+void jw_bool(std::string &out, const char *key, bool val, bool first = false) {
+	if (!first) out += ",";
+	out += "\"";
+	out += key;
+	out += "\":";
+	out += val ? "true" : "false";
+}
+
+// 序列化 CheckpointState 为 JSON 字符串
+std::string serialize_state(CheckpointState const &s) {
+	std::string j;
+	j += "{";
+	jw_int(j, "format_version", s.format_version, true);
+	jw_str(j, "fingerprint", s.fingerprint);
+	jw_str(j, "command_line", s.command_line);
+	jw_str(j, "normalized_cmd", s.normalized_cmd);
+	jw_str(j, "output_mode", s.output_mode);
+	jw_str(j, "output_path", s.output_path);
+	jw_int(j, "temp_files", (long long) s.temp_files);
+	jw_int(j, "cpus", (long long) s.cpus);
+	jw_int(j, "created_at", s.created_at);
+	jw_int(j, "updated_at", s.updated_at);
+
+	// input_files 数组
+	j += ",\"input_files\":[";
+	for (size_t i = 0; i < s.input_files.size(); i++) {
+		if (i > 0) j += ",";
+		j += "{";
+		jw_str(j, "path", s.input_files[i].path, true);
+		jw_int(j, "size", s.input_files[i].size);
+		jw_int(j, "mtime_sec", s.input_files[i].mtime_sec);
+		jw_int(j, "mtime_nsec", s.input_files[i].mtime_nsec);
+		j += "}";
+	}
+	j += "]";
+
+	// tiling 对象
+	j += ",\"tiling\":{";
+	jw_int(j, "iz", s.iz, true);
+	jw_int(j, "minzoom", s.minzoom);
+	jw_int(j, "maxzoom", s.maxzoom);
+	jw_int(j, "basezoom", s.basezoom);
+	jw_int(j, "last_completed_zoom", s.last_completed_zoom);
+	jw_int(j, "midx", (long long) s.midx);
+	jw_int(j, "midy", (long long) s.midy);
+	jw_int(j, "nodepos", s.nodepos);
+	jw_bool(j, "entry_snapshot_done", s.entry_snapshot_done);
+	j += "}";
+
+	jw_uint(j, "generation", s.generation);
+
+	// zoom_commits 对象
+	j += ",\"zoom_commits\":{";
+	bool first_commit = true;
+	for (auto const &kv : s.zoom_commits) {
+		if (!first_commit) j += ",";
+		first_commit = false;
+		j += "\"";
+		j += std::to_string(kv.first);
+		j += "\":{";
+		jw_int(j, "committed_at", kv.second.committed_at, true);
+		jw_int(j, "geom_total_bytes", kv.second.geom_total_bytes);
+		jw_uint(j, "generation", kv.second.generation);
+		j += "}";
+	}
+	j += "}";
+
+	j += "}";
+	return j;
+}
+
+// 从 JSON 字符串解析 CheckpointState（使用 jsonpull）
+bool parse_state(std::string const &json_str, CheckpointState &out) {
+	json_pull *jp = json_begin_string(json_str.c_str());
+	if (jp == NULL) {
+		return false;
+	}
+	json_object *root = json_read_tree(jp);
+	if (root == NULL || root->type != JSON_HASH) {
+		if (root) json_free(root);
+		json_end(jp);
+		return false;
+	}
+
+	json_object *v;
+
+	v = json_hash_get(root, "format_version");
+	if (v && v->type == JSON_NUMBER) out.format_version = (int) v->value.number.number;
+
+	v = json_hash_get(root, "fingerprint");
+	if (v && v->type == JSON_STRING) out.fingerprint = v->value.string.string;
+
+	v = json_hash_get(root, "command_line");
+	if (v && v->type == JSON_STRING) out.command_line = v->value.string.string;
+
+	v = json_hash_get(root, "normalized_cmd");
+	if (v && v->type == JSON_STRING) out.normalized_cmd = v->value.string.string;
+
+	v = json_hash_get(root, "output_mode");
+	if (v && v->type == JSON_STRING) out.output_mode = v->value.string.string;
+
+	v = json_hash_get(root, "output_path");
+	if (v && v->type == JSON_STRING) out.output_path = v->value.string.string;
+
+	v = json_hash_get(root, "temp_files");
+	if (v && v->type == JSON_NUMBER) out.temp_files = (size_t) v->value.number.number;
+
+	v = json_hash_get(root, "cpus");
+	if (v && v->type == JSON_NUMBER) out.cpus = (size_t) v->value.number.number;
+
+	v = json_hash_get(root, "created_at");
+	if (v && v->type == JSON_NUMBER) out.created_at = (int64_t) v->value.number.number;
+
+	v = json_hash_get(root, "updated_at");
+	if (v && v->type == JSON_NUMBER) out.updated_at = (int64_t) v->value.number.number;
+
+	// input_files
+	v = json_hash_get(root, "input_files");
+	if (v && v->type == JSON_ARRAY) {
+		for (size_t i = 0; i < v->value.array.length; i++) {
+			json_object *item = v->value.array.array[i];
+			if (item && item->type == JSON_HASH) {
+				InputFileStat ifs;
+				json_object *p = json_hash_get(item, "path");
+				if (p && p->type == JSON_STRING) ifs.path = p->value.string.string;
+				json_object *sz = json_hash_get(item, "size");
+				if (sz && sz->type == JSON_NUMBER) ifs.size = (int64_t) sz->value.number.number;
+				json_object *ms = json_hash_get(item, "mtime_sec");
+				if (ms && ms->type == JSON_NUMBER) ifs.mtime_sec = (int64_t) ms->value.number.number;
+				json_object *mn = json_hash_get(item, "mtime_nsec");
+				if (mn && mn->type == JSON_NUMBER) ifs.mtime_nsec = (int64_t) mn->value.number.number;
+				out.input_files.push_back(ifs);
+			}
+		}
+	}
+
+	// tiling
+	json_object *t = json_hash_get(root, "tiling");
+	if (t && t->type == JSON_HASH) {
+		v = json_hash_get(t, "iz");
+		if (v && v->type == JSON_NUMBER) out.iz = (int) v->value.number.number;
+		v = json_hash_get(t, "minzoom");
+		if (v && v->type == JSON_NUMBER) out.minzoom = (int) v->value.number.number;
+		v = json_hash_get(t, "maxzoom");
+		if (v && v->type == JSON_NUMBER) out.maxzoom = (int) v->value.number.number;
+		v = json_hash_get(t, "basezoom");
+		if (v && v->type == JSON_NUMBER) out.basezoom = (int) v->value.number.number;
+		v = json_hash_get(t, "last_completed_zoom");
+		if (v && v->type == JSON_NUMBER) out.last_completed_zoom = (int) v->value.number.number;
+		v = json_hash_get(t, "midx");
+		if (v && v->type == JSON_NUMBER) out.midx = (unsigned) v->value.number.number;
+		v = json_hash_get(t, "midy");
+		if (v && v->type == JSON_NUMBER) out.midy = (unsigned) v->value.number.number;
+		v = json_hash_get(t, "nodepos");
+		if (v && v->type == JSON_NUMBER) out.nodepos = (int64_t) v->value.number.number;
+		v = json_hash_get(t, "entry_snapshot_done");
+		if (v && (v->type == JSON_TRUE || v->type == JSON_FALSE)) out.entry_snapshot_done = (v->type == JSON_TRUE);
+	}
+
+	v = json_hash_get(root, "generation");
+	if (v && v->type == JSON_NUMBER) out.generation = (uint64_t) v->value.number.number;
+
+	// zoom_commits
+	json_object *zc = json_hash_get(root, "zoom_commits");
+	if (zc && zc->type == JSON_HASH) {
+		for (size_t i = 0; i < zc->value.object.length; i++) {
+			json_object *key = zc->value.object.keys[i];
+			json_object *val = zc->value.object.values[i];
+			if (key && key->type == JSON_STRING && val && val->type == JSON_HASH) {
+				int zoom = atoi(key->value.string.string);
+				ZoomCommit commit;
+				json_object *ca = json_hash_get(val, "committed_at");
+				if (ca && ca->type == JSON_NUMBER) commit.committed_at = (int64_t) ca->value.number.number;
+				json_object *gtb = json_hash_get(val, "geom_total_bytes");
+				if (gtb && gtb->type == JSON_NUMBER) commit.geom_total_bytes = (int64_t) gtb->value.number.number;
+				json_object *gen = json_hash_get(val, "generation");
+				if (gen && gen->type == JSON_NUMBER) commit.generation = (uint64_t) gen->value.number.number;
+				out.zoom_commits[zoom] = commit;
+			}
+		}
+	}
+
+	json_free(root);
+	json_end(jp);
+	return true;
+}
+
+// 读取整个文件为字符串
+std::string read_file_to_string(std::string const &path) {
+	FILE *fp = fopen(path.c_str(), "rb");
+	if (fp == NULL) {
+		return "";
+	}
+	std::string out;
+	fseek(fp, 0, SEEK_END);
+	long sz = ftell(fp);
+	fseek(fp, 0, SEEK_SET);
+	if (sz > 0) {
+		out.resize((size_t) sz);
+		if (fread(&out[0], 1, (size_t) sz, fp) != (size_t) sz) {
+			fclose(fp);
+			return "";
+		}
+	}
+	fclose(fp);
+	return out;
+}
+
+// C 递归删除目录（替代 system("rm -rf")，避免命令注入）
+void rmrf_path(std::string const &path) {
+	struct stat st;
+	if (stat(path.c_str(), &st) != 0) {
+		return;
+	}
+	if (S_ISDIR(st.st_mode)) {
+		DIR *d = opendir(path.c_str());
+		if (d != NULL) {
+			struct dirent *dp;
+			while ((dp = readdir(d)) != NULL) {
+				if (strcmp(dp->d_name, ".") == 0 || strcmp(dp->d_name, "..") == 0) {
+					continue;
+				}
+				std::string child = path + "/" + dp->d_name;
+				rmrf_path(child);
+			}
+			closedir(d);
+		}
+		rmdir(path.c_str());
+	} else {
+		unlink(path.c_str());
+	}
+}
+
+}  // namespace
+
+// ===========================================================================
+// 信号处理公开接口
+// ===========================================================================
+
+void install_signal_handlers() {
+	struct sigaction sa;
+	sa.sa_handler = signal_handler;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0;
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGINT, &sa, NULL);
+}
+
+bool shutdown_requested() {
+	return g_shutdown_requested != 0;
+}
+
+// ===========================================================================
+// layermaps blob 格式 v3（与之前版本完全一致）
+// ===========================================================================
+
 constexpr uint32_t LAYERMAPS_FORMAT_VERSION = 3;
 
 static void write_str_field(FILE *fp, std::string const &s) {
@@ -279,7 +569,6 @@ void write_layermaps_blob(std::string const &path, std::vector<std::map<std::str
 void read_layermaps_blob(std::string const &path, std::vector<std::map<std::string, layermap_entry>> &layermaps) {
 	FILE *fp = fopen(path.c_str(), "rb");
 	if (fp == NULL) {
-		// File may not exist if the initial snapshot was never written.
 		return;
 	}
 	uint32_t version = 0;
@@ -288,9 +577,6 @@ void read_layermaps_blob(std::string const &path, std::vector<std::map<std::stri
 		return;
 	}
 	if (version != LAYERMAPS_FORMAT_VERSION) {
-		// Older format — field layout is incompatible. Return empty layermaps;
-		// metadata.vector_layers will be empty but tile content is unaffected.
-		// User should re-run from scratch with a v3-capable binary for full metadata.
 		fprintf(stderr, "%s: warning: layermaps.bin format version %u does not match expected %u; vector_layers metadata will be empty\n",
 			*av, version, LAYERMAPS_FORMAT_VERSION);
 		fclose(fp);
@@ -348,6 +634,10 @@ void read_layermaps_blob(std::string const &path, std::vector<std::map<std::stri
 	fclose(fp);
 }
 
+// ===========================================================================
+// skip_children / strategies blob 读写（与之前版本完全一致）
+// ===========================================================================
+
 void write_skip_children_blob(std::string const &path, std::set<zxy> const &skip) {
 	FILE *fp = fopen(path.c_str(), "wb");
 	if (fp == NULL) {
@@ -370,7 +660,6 @@ void write_skip_children_blob(std::string const &path, std::set<zxy> const &skip
 void read_skip_children_blob(std::string const &path, std::set<zxy> &skip) {
 	FILE *fp = fopen(path.c_str(), "rb");
 	if (fp == NULL) {
-		// File may not exist if no zooms were completed before interruption
 		return;
 	}
 	uint32_t count = 0;
@@ -407,7 +696,6 @@ void write_strategies_blob(std::string const &path, std::vector<strategy> const 
 void read_strategies_blob(std::string const &path, std::vector<strategy> &strategies) {
 	FILE *fp = fopen(path.c_str(), "rb");
 	if (fp == NULL) {
-		// File may not exist if no zooms were completed before interruption
 		return;
 	}
 	uint32_t count = 0;
@@ -436,7 +724,9 @@ void read_strategies_blob(std::string const &path, std::vector<strategy> &strate
 	fclose(fp);
 }
 
-}  // namespace
+// ===========================================================================
+// TilingRestore 构造/析构（与之前版本一致）
+// ===========================================================================
 
 TilingRestore::TilingRestore() {
 	geomfd.resize(TEMP_FILES, -1);
@@ -464,13 +754,16 @@ TilingRestore::~TilingRestore() {
 	}
 }
 
+// ===========================================================================
+// 路径与指纹工具函数（与之前版本一致）
+// ===========================================================================
+
 std::string absolute_path_or_die(const char *path) {
 	if (path == NULL || path[0] == '\0') {
 		return "";
 	}
 	char resolved[PATH_MAX];
 	if (realpath(path, resolved) == NULL) {
-		// File may not exist yet (output); resolve directory + basename
 		std::string p(path);
 		size_t slash = p.find_last_of('/');
 		if (slash == std::string::npos) {
@@ -525,7 +818,6 @@ static bool is_fingerprint_ignored_flag(std::string const &tok) {
 	       tok == "--force";
 }
 
-// Flags that take a separate argument (space-separated) and should be skipped along with their argument
 static bool is_fingerprint_ignored_flag_with_arg(std::string const &tok) {
 	return tok == "--checkpoint-dir" || tok == "--resume";
 }
@@ -547,7 +839,6 @@ std::string normalize_command_line_for_fingerprint(std::string const &command_li
 			if (!tok.empty()) {
 				std::string bare = strip_shell_quotes(tok);
 				if (skip_next) {
-					// This token is the argument to a previously-seen flag like --checkpoint-dir
 					skip_next = false;
 				} else if (!is_fingerprint_ignored_flag(bare)) {
 					if (!first) {
@@ -623,17 +914,19 @@ std::string compute_fingerprint(FingerprintParams const &params) {
 	return hex_encode(hash, 32);
 }
 
+// ===========================================================================
+// Session 实现
+// ===========================================================================
+
 Session::Session(const char *dir, bool is_resume)
     : dir_(dir),
       active_(true),
-      is_resume_(is_resume) {
+      is_resume_(is_resume),
+      start_time_(now_unix()) {
 }
 
 Session::~Session() {
-	if (db_ != nullptr) {
-		sqlite3_close(db_);
-		db_ = nullptr;
-	}
+	release_lock();
 }
 
 std::string Session::path_blob(const char *name) const {
@@ -644,6 +937,10 @@ std::string Session::path_staging(const char *name) const {
 	return dir_ + "/staging/" + name;
 }
 
+std::string Session::path_commits() const {
+	return dir_ + "/commits";
+}
+
 void Session::fsync_path(std::string const &path) {
 	int fd = open(path.c_str(), O_RDONLY);
 	if (fd >= 0) {
@@ -652,426 +949,225 @@ void Session::fsync_path(std::string const &path) {
 	}
 }
 
+void Session::fsync_dir(std::string const &dirpath) {
+	int fd = open(dirpath.c_str(), O_RDONLY | O_DIRECTORY);
+	if (fd >= 0) {
+		fsync(fd);
+		close(fd);
+	}
+}
+
 void Session::copy_fd_to_file(int fd, size_t nbytes, std::string const &dest) {
 	off_t saved_pos = lseek(fd, 0, SEEK_CUR);
-	FILE *out = fopen(dest.c_str(), "wb");
-	if (out == NULL) {
+	int outfd = open(dest.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (outfd < 0) {
 		perror(dest.c_str());
 		exit(EXIT_WRITE);
 	}
-	if (lseek(fd, 0, SEEK_SET) < 0) {
-		perror("lseek checkpoint copy");
-		exit(EXIT_SEEK);
-	}
-	char buf[65536];
+
 	size_t remaining = nbytes;
-	while (remaining > 0) {
-		size_t chunk = remaining > sizeof(buf) ? sizeof(buf) : remaining;
-		ssize_t n = read(fd, buf, chunk);
-		if (n < 0) {
-			perror("read checkpoint copy");
-			exit(EXIT_READ);
-		}
-		if (n == 0) {
-			break;
-		}
-		if (fwrite(buf, 1, (size_t) n, out) != (size_t) n) {
-			perror(dest.c_str());
+
+#ifdef __linux__
+	// 使用 sendfile 零拷贝（Linux 专有），不修改 fd 偏移量
+	{
+		off_t offset = 0;
+		while (remaining > 0) {
+			ssize_t n = sendfile(outfd, fd, &offset, remaining);
+			if (n > 0) {
+				remaining -= (size_t) n;
+				continue;
+			}
+			if (n == 0) break;
+			if (errno == EINVAL || errno == ENOSYS) break;  // 回退到 read+write
+			perror("sendfile checkpoint copy");
 			exit(EXIT_WRITE);
 		}
-		remaining -= (size_t) n;
 	}
-	if (fclose(out) != 0) {
-		perror(dest.c_str());
+#endif
+
+	// read+write 回退路径（1MB 缓冲区）
+	if (remaining > 0) {
+		if (lseek(fd, 0, SEEK_SET) < 0) {
+			perror("lseek checkpoint copy");
+			exit(EXIT_SEEK);
+		}
+		char buf[1 << 20];  // 1MB
+		while (remaining > 0) {
+			size_t chunk = remaining > sizeof(buf) ? sizeof(buf) : remaining;
+			ssize_t rn = read(fd, buf, chunk);
+			if (rn <= 0) break;
+			ssize_t wn = 0;
+			while (wn < rn) {
+				ssize_t w = write(outfd, (char *) buf + wn, (size_t)(rn - wn));
+				if (w < 0) {
+					perror("write checkpoint copy");
+					exit(EXIT_WRITE);
+				}
+				wn += w;
+			}
+			remaining -= (size_t) rn;
+		}
+	}
+
+	if (fsync(outfd) < 0) {
+		perror("fsync checkpoint copy");
+	}
+	if (close(outfd) < 0) {
+		perror("close checkpoint copy");
 		exit(EXIT_CLOSE);
 	}
-	lseek(fd, saved_pos, SEEK_SET);
-	fsync_path(dest);
+	lseek(fd, saved_pos, SEEK_SET);  // 恢复原始偏移量
 }
 
-void Session::open_db(bool create) {
-	std::string dbpath = dir_ + "/state.sqlite";
-	if (create) {
-		mkdir_p(dir_);
-		mkdir_p(dir_ + "/blobs");
-		mkdir_p(dir_ + "/staging");
+void Session::rmrf(std::string const &path) {
+	rmrf_path(path);
+}
+
+// --- 并发锁（flock）---
+
+void Session::acquire_lock() {
+	std::string lockpath = dir_ + "/.lock";
+	lock_fd_ = open(lockpath.c_str(), O_CREAT | O_RDWR, 0644);
+	if (lock_fd_ < 0) {
+		perror(lockpath.c_str());
+		exit(EXIT_OPEN);
 	}
-	if (sqlite3_open(dbpath.c_str(), &db_) != SQLITE_OK) {
-		fprintf(stderr, "%s: checkpoint: cannot open %s: %s\n", *av, dbpath.c_str(), sqlite3_errmsg(db_));
-		exit(EXIT_SQLITE);
-	}
-	exec_sql(db_, "PRAGMA journal_mode=WAL;");
-	if (create) {
-		init_schema();
+	if (flock(lock_fd_, LOCK_EX | LOCK_NB) != 0) {
+		fprintf(stderr, "%s: checkpoint directory %s is locked by another process\n", *av, dir_.c_str());
+		close(lock_fd_);
+		lock_fd_ = -1;
+		exit(EXIT_ARGS);
 	}
 }
 
-void Session::init_schema() {
-	exec_sql(db_,
-		 "CREATE TABLE IF NOT EXISTS job ("
-		 "id INTEGER PRIMARY KEY CHECK (id = 1),"
-		 "format_version INTEGER NOT NULL,"
-		 "fingerprint TEXT NOT NULL,"
-		 "command_line TEXT NOT NULL,"
-		 "normalized_cmd TEXT NOT NULL DEFAULT '',"
-		 "output_mode TEXT NOT NULL,"
-		 "output_path TEXT NOT NULL,"
-		 "temp_files INTEGER NOT NULL,"
-		 "cpus INTEGER NOT NULL,"
-		 "created_at INTEGER NOT NULL,"
-		 "updated_at INTEGER NOT NULL"
-		 ");"
-		 "CREATE TABLE IF NOT EXISTS input_file ("
-		 "path TEXT PRIMARY KEY,"
-		 "size INTEGER NOT NULL,"
-		 "mtime_sec INTEGER NOT NULL,"
-		 "mtime_nsec INTEGER NOT NULL"
-		 ");"
-		 "CREATE TABLE IF NOT EXISTS tiling_state ("
-		 "id INTEGER PRIMARY KEY CHECK (id = 1),"
-		 "iz INTEGER NOT NULL,"
-		 "minzoom INTEGER NOT NULL,"
-		 "maxzoom INTEGER NOT NULL,"
-		 "basezoom INTEGER NOT NULL,"
-		 "last_completed_zoom INTEGER,"
-		 "midx INTEGER NOT NULL,"
-		 "midy INTEGER NOT NULL,"
-		 "pool_off INTEGER NOT NULL,"
-		 "initial_x INTEGER NOT NULL,"
-		 "initial_y INTEGER NOT NULL,"
-		 "nodepos INTEGER NOT NULL,"
-		 "entry_snapshot_done INTEGER NOT NULL DEFAULT 0"
-		 ");"
-		 "CREATE TABLE IF NOT EXISTS zoom_commit ("
-		 "zoom INTEGER PRIMARY KEY,"
-		 "status TEXT NOT NULL,"
-		 "committed_at INTEGER NOT NULL,"
-		 "geom_total_bytes INTEGER NOT NULL,"
-		 "generation INTEGER NOT NULL"
-		 ");");
+void Session::release_lock() {
+	if (lock_fd_ >= 0) {
+		flock(lock_fd_, LOCK_UN);
+		close(lock_fd_);
+		lock_fd_ = -1;
+	}
 }
+
+// --- JSON state 原子读写 ---
+
+void Session::load_state() {
+	std::string jsonpath = dir_ + "/state.json";
+	std::string json_str = read_file_to_string(jsonpath);
+	if (json_str.empty()) {
+		fprintf(stderr, "%s: cannot read checkpoint state: %s\n", *av, jsonpath.c_str());
+		exit(EXIT_ARGS);
+	}
+	if (!parse_state(json_str, state_)) {
+		fprintf(stderr, "%s: checkpoint state is corrupt: %s\n", *av, jsonpath.c_str());
+		exit(EXIT_ARGS);
+	}
+}
+
+void Session::save_state_atomic() {
+	state_.updated_at = now_unix();
+	std::string json = serialize_state(state_);
+
+	std::string tmppath = dir_ + "/state.json.tmp";
+	FILE *fp = fopen(tmppath.c_str(), "wb");
+	if (fp == NULL) {
+		perror(tmppath.c_str());
+		exit(EXIT_WRITE);
+	}
+	if (fwrite(json.data(), 1, json.size(), fp) != json.size()) {
+		perror(tmppath.c_str());
+		exit(EXIT_WRITE);
+	}
+	if (fflush(fp) != 0) {
+		perror(tmppath.c_str());
+		exit(EXIT_WRITE);
+	}
+	if (fsync(fileno(fp)) < 0) {
+		perror("fsync state.json.tmp");
+	}
+	if (fclose(fp) != 0) {
+		perror(tmppath.c_str());
+		exit(EXIT_CLOSE);
+	}
+
+	// 原子 rename
+	std::string jsonpath = dir_ + "/state.json";
+	if (rename(tmppath.c_str(), jsonpath.c_str()) != 0) {
+		perror("rename state.json");
+		exit(EXIT_WRITE);
+	}
+
+	// fsync 父目录，保证 rename 持久化
+	fsync_dir(dir_);
+}
+
+void Session::save_state() {
+	save_state_atomic();
+}
+
+// --- 工作区清理 ---
 
 void Session::clear_workspace() {
-	// Remove blobs and staging contents; keep state.sqlite shell for rewrite
-	std::string rm_blobs = "rm -rf '" + dir_ + "/blobs' '" + dir_ + "/staging'";
-	if (system(rm_blobs.c_str()) != 0) {
-		fprintf(stderr, "%s: warning: could not clear checkpoint blobs\n", *av);
-	}
+	rmrf_path(dir_ + "/blobs");
+	rmrf_path(dir_ + "/staging");
+	rmrf_path(dir_ + "/commits");
 	mkdir_p(dir_ + "/blobs");
 	mkdir_p(dir_ + "/staging");
-	exec_sql(db_, "DELETE FROM input_file; DELETE FROM tiling_state; DELETE FROM zoom_commit; DELETE FROM job;");
+	mkdir_p(dir_ + "/commits");
+	// 删除旧的 state.json（若存在）
+	unlink((dir_ + "/state.json").c_str());
+	unlink((dir_ + "/state.json.tmp").c_str());
 }
 
-void Session::write_job_row(FingerprintParams const &params, std::string const &fingerprint, std::string const &normalized_cmd) {
-	sqlite3_stmt *stmt = NULL;
-	int64_t ts = now_unix();
-	const char *sql =
-	    "INSERT OR REPLACE INTO job (id, format_version, fingerprint, command_line, normalized_cmd, output_mode, output_path, temp_files, cpus, created_at, updated_at) "
-	    "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
-	if (sqlite3_prepare_v2(db_, sql, -1, &stmt, NULL) != SQLITE_OK) {
-		exit(EXIT_SQLITE);
-	}
-	sqlite3_bind_int(stmt, 1, TIPPECANOE_CHECKPOINT_FORMAT);
-	sqlite3_bind_text(stmt, 2, fingerprint.c_str(), -1, SQLITE_STATIC);
-	sqlite3_bind_text(stmt, 3, params.command_line.c_str(), -1, SQLITE_STATIC);
-	sqlite3_bind_text(stmt, 4, normalized_cmd.c_str(), -1, SQLITE_STATIC);
-	sqlite3_bind_text(stmt, 5, params.output_mode.c_str(), -1, SQLITE_STATIC);
-	sqlite3_bind_text(stmt, 6, params.output_path.c_str(), -1, SQLITE_STATIC);
-	sqlite3_bind_int64(stmt, 7, (sqlite3_int64) params.temp_files);
-	sqlite3_bind_int64(stmt, 8, (sqlite3_int64) params.cpus);
-	sqlite3_bind_int64(stmt, 9, ts);
-	sqlite3_bind_int64(stmt, 10, ts);
-	if (sqlite3_step(stmt) != SQLITE_DONE) {
-		exit(EXIT_SQLITE);
-	}
-	sqlite3_finalize(stmt);
-
-	exec_sql(db_, "DELETE FROM input_file;");
-	for (auto const &in : params.inputs) {
-		const char *isql = "INSERT INTO input_file (path, size, mtime_sec, mtime_nsec) VALUES (?, ?, ?, ?);";
-		if (sqlite3_prepare_v2(db_, isql, -1, &stmt, NULL) != SQLITE_OK) {
-			exit(EXIT_SQLITE);
-		}
-		sqlite3_bind_text(stmt, 1, in.path.c_str(), -1, SQLITE_STATIC);
-		sqlite3_bind_int64(stmt, 2, in.size);
-		sqlite3_bind_int64(stmt, 3, in.mtime_sec);
-		sqlite3_bind_int64(stmt, 4, in.mtime_nsec);
-		if (sqlite3_step(stmt) != SQLITE_DONE) {
-			exit(EXIT_SQLITE);
-		}
-		sqlite3_finalize(stmt);
-	}
-}
+// --- 指纹内部一致性校验 ---
 
 void Session::verify_fingerprint_internal() {
-	// Read stored fingerprint, normalized_cmd, output info, and input files from DB.
-	// Reconstruct FingerprintParams, recompute fingerprint, compare.
-	sqlite3_stmt *stmt = NULL;
-
-	std::string stored_fp;
-	std::string normalized_cmd;
-	std::string output_mode;
-	std::string output_path;
-	int64_t temp_files = 0;
-	int64_t cpus = 0;
-
-	if (sqlite3_prepare_v2(db_,
-			       "SELECT fingerprint, normalized_cmd, output_mode, output_path, temp_files, cpus FROM job WHERE id=1;",
-			       -1, &stmt, NULL) != SQLITE_OK) {
-		exit(EXIT_SQLITE);
-	}
-	if (sqlite3_step(stmt) == SQLITE_ROW) {
-		stored_fp = (char const *) sqlite3_column_text(stmt, 0);
-		normalized_cmd = (char const *) sqlite3_column_text(stmt, 1);
-		output_mode = (char const *) sqlite3_column_text(stmt, 2);
-		output_path = (char const *) sqlite3_column_text(stmt, 3);
-		temp_files = sqlite3_column_int64(stmt, 4);
-		cpus = sqlite3_column_int64(stmt, 5);
-	}
-	sqlite3_finalize(stmt);
-
-	if (output_mode == "pmtiles") {
+	if (state_.output_mode == "pmtiles") {
 		fprintf(stderr, "%s: --resume is not supported for PMTiles output; use -o out.mbtiles or -e directory first\n", *av);
 		exit(EXIT_ARGS);
 	}
 
-	// Rebuild FingerprintParams from stored data
+	// 从 state_ 重建 FingerprintParams，重新计算指纹，与存储的指纹比较
 	FingerprintParams fp;
-	fp.command_line = normalized_cmd;  // already normalized
-	fp.output_mode = output_mode;
-	fp.output_path = output_path;
-	fp.temp_files = (size_t) temp_files;
-	fp.cpus = (size_t) cpus;
-
-	if (sqlite3_prepare_v2(db_, "SELECT path, size, mtime_sec, mtime_nsec FROM input_file ORDER BY path;",
-			       -1, &stmt, NULL) == SQLITE_OK) {
-		while (sqlite3_step(stmt) == SQLITE_ROW) {
-			InputFileStat s;
-			s.path = (char const *) sqlite3_column_text(stmt, 0);
-			s.size = sqlite3_column_int64(stmt, 1);
-			s.mtime_sec = sqlite3_column_int64(stmt, 2);
-			s.mtime_nsec = sqlite3_column_int64(stmt, 3);
-			fp.inputs.push_back(s);
-		}
-		sqlite3_finalize(stmt);
-	}
+	fp.command_line = state_.normalized_cmd;  // 已规范化
+	fp.output_mode = state_.output_mode;
+	fp.output_path = state_.output_path;
+	fp.temp_files = state_.temp_files;
+	fp.cpus = state_.cpus;
+	fp.inputs = state_.input_files;
 
 	std::string expected = compute_fingerprint(fp);
-	if (stored_fp != expected) {
-		fprintf(stderr, "%s: checkpoint fingerprint mismatch (command line, output path, or input files changed)\n", *av);
-		fprintf(stderr, "  stored:   %s\n", stored_fp.c_str());
+	if (state_.fingerprint != expected) {
+		fprintf(stderr, "%s: checkpoint fingerprint mismatch (state.json is corrupt or has been tampered with)\n", *av);
+		fprintf(stderr, "  stored:   %s\n", state_.fingerprint.c_str());
 		fprintf(stderr, "  expected: %s\n", expected.c_str());
 		exit(EXIT_ARGS);
 	}
 }
 
-// --- resume info reader (no session needed) ---
+// --- 进度报告 ---
 
-ResumeInfo read_resume_info(const char *dir) {
-	struct stat st;
-	if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
-		fprintf(stderr, "%s: checkpoint directory %s does not exist\n", *av, dir);
-		exit(EXIT_ARGS);
-	}
+void Session::report_progress(int zoom) const {
+	int completed = zoom - state_.minzoom + 1;
+	int total = state_.maxzoom - state_.minzoom + 1;
+	if (total <= 0) total = 1;
+	int percent = 100 * completed / total;
 
-	std::string dbpath = std::string(dir) + "/state.sqlite";
-	sqlite3 *db = NULL;
-	if (sqlite3_open(dbpath.c_str(), &db) != SQLITE_OK) {
-		fprintf(stderr, "%s: cannot open checkpoint database: %s\n", *av, sqlite3_errmsg(db));
-		exit(EXIT_SQLITE);
-	}
+	int64_t elapsed = now_unix() - start_time_;
+	if (elapsed < 0) elapsed = 0;
 
-	ResumeInfo info;
-	sqlite3_stmt *stmt = NULL;
-
-	if (sqlite3_prepare_v2(db,
-			       "SELECT output_mode, output_path, command_line, normalized_cmd FROM job WHERE id=1;",
-			       -1, &stmt, NULL) == SQLITE_OK) {
-		if (sqlite3_step(stmt) == SQLITE_ROW) {
-			info.output_mode = (char const *) sqlite3_column_text(stmt, 0);
-			info.output_path = (char const *) sqlite3_column_text(stmt, 1);
-			info.original_cmd = (char const *) sqlite3_column_text(stmt, 2);
-			info.normalized_cmd = (char const *) sqlite3_column_text(stmt, 3);
-		}
-		sqlite3_finalize(stmt);
-	}
-
-	if (info.output_mode.empty()) {
-		fprintf(stderr, "%s: checkpoint database %s is missing job record\n", *av, dbpath.c_str());
-		sqlite3_close(db);
-		exit(EXIT_ARGS);
-	}
-
-	if (sqlite3_prepare_v2(db,
-			       "SELECT minzoom, maxzoom, basezoom, last_completed_zoom, entry_snapshot_done FROM tiling_state WHERE id=1;",
-			       -1, &stmt, NULL) == SQLITE_OK) {
-		if (sqlite3_step(stmt) == SQLITE_ROW) {
-			info.minzoom = sqlite3_column_int(stmt, 0);
-			info.maxzoom = sqlite3_column_int(stmt, 1);
-			info.basezoom = sqlite3_column_int(stmt, 2);
-			if (sqlite3_column_type(stmt, 3) != SQLITE_NULL) {
-				info.last_completed_zoom = sqlite3_column_int(stmt, 3);
-			}
-			info.entry_snapshot_done = sqlite3_column_int(stmt, 4) != 0;
-		}
-		sqlite3_finalize(stmt);
-	}
-
-	if (sqlite3_prepare_v2(db, "SELECT path FROM input_file ORDER BY path;", -1, &stmt, NULL) == SQLITE_OK) {
-		while (sqlite3_step(stmt) == SQLITE_ROW) {
-			info.input_files.push_back((char const *) sqlite3_column_text(stmt, 0));
-		}
-		sqlite3_finalize(stmt);
-	}
-
-	sqlite3_close(db);
-	return info;
-}
-
-// --- output cleanup helpers ---
-
-void cleanup_resume_wal(const char *output_path) {
-	// Remove WAL and SHM files left by a killed process.
-	// NOTE: we deliberately do NOT delete the -journal file here: if a hot
-	// journal exists, SQLite must replay it on open to roll back the
-	// incomplete transaction. Deleting it first would leave the database
-	// in an inconsistent state and subsequent PRAGMA executions would fail
-	// with "database is locked".
-	std::string wal = std::string(output_path) + "-wal";
-	std::string shm = std::string(output_path) + "-shm";
-	std::string journal = std::string(output_path) + "-journal";
-
-	unlink(wal.c_str());
-	unlink(shm.c_str());
-
-	// If the database file header still indicates WAL mode (bytes 18-19 = 0x02 0x00),
-	// SQLite will refuse to open it without the WAL files (database is locked).
-	// Reset the header to rollback journal mode (0x01 0x00).
-	int fd = open(output_path, O_RDWR);
-	if (fd >= 0) {
-		unsigned char buf[2];
-		if (pread(fd, buf, 2, 18) == 2) {
-			if (buf[0] == 0x02 && buf[1] == 0x00) {
-				buf[0] = 0x01;
-				pwrite(fd, buf, 2, 18);
-			}
-		}
-		close(fd);
-	}
-
-	// Open the database to perform journal recovery (replay any hot journal
-	// from the killed process) and switch to DELETE journal mode.
-	// This must be done before tippecanoe opens the database, because
-	// tippecanoe's mbtiles_open uses EXCLUSIVE locking and its async workers
-	// will conflict with a database that still has an unrecovered journal.
-	sqlite3 *db = NULL;
-	if (sqlite3_open(output_path, &db) == SQLITE_OK) {
-		// Set a busy timeout so journal replay can complete if there is
-		// any transient lock contention.
-		sqlite3_busy_timeout(db, 30000);
-		char *err = NULL;
-		int rc = sqlite3_exec(db, "PRAGMA journal_mode=DELETE;", NULL, NULL, &err);
-		if (rc != SQLITE_OK) {
-			fprintf(stderr, "checkpoint: warning: journal recovery for %s failed: %s\n", output_path, err ? err : "(unknown)");
-		}
-		sqlite3_free(err);
-		sqlite3_close(db);
-	}
-
-	// After recovery the hot journal should be gone; remove any stragglers.
-	unlink(journal.c_str());
-}
-
-void cleanup_resume_dirs(const char *output_path, int last_completed_zoom, int maxzoom) {
-	for (int z = last_completed_zoom + 1; z <= maxzoom; z++) {
-		std::string zdir = std::string(output_path) + "/" + std::to_string(z);
-		struct stat st;
-		if (stat(zdir.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
-			std::string rm_cmd = "rm -rf '" + zdir + "'";
-			system(rm_cmd.c_str());
-		}
+	if (elapsed > 0 && completed > 1) {
+		int64_t est_total = elapsed * total / completed;
+		int64_t est_remaining = est_total - elapsed;
+		if (est_remaining < 0) est_remaining = 0;
+		fprintf(stderr, "[checkpoint] zoom %d/%d committed (%d%%), elapsed %llds, est. remaining %llds\n",
+			zoom, state_.maxzoom, percent, (long long) elapsed, (long long) est_remaining);
+	} else {
+		fprintf(stderr, "[checkpoint] zoom %d/%d committed (%d%%), elapsed %llds\n",
+			zoom, state_.maxzoom, percent, (long long) elapsed);
 	}
 }
 
-void cleanup_resume_tiles(sqlite3 *outdb, int last_completed_zoom) {
-	if (outdb == NULL || last_completed_zoom < 0) {
-		return;
-	}
-
-	// Switch to DELETE journal mode for reliability after a crash
-	char *err = NULL;
-	if (sqlite3_exec(outdb, "PRAGMA journal_mode=DELETE;", NULL, NULL, &err) != SQLITE_OK) {
-		fprintf(stderr, "%s: warning: could not set journal mode: %s\n", *av, err ? err : "unknown error");
-		sqlite3_free(err);
-	}
-
-	// Remove tiles from uncommitted zooms (those > last_completed_zoom)
-	sqlite3_stmt *stmt = NULL;
-	if (sqlite3_prepare_v2(outdb, "DELETE FROM map WHERE zoom_level > ?;", -1, &stmt, NULL) == SQLITE_OK) {
-		sqlite3_bind_int(stmt, 1, last_completed_zoom);
-		int rc = sqlite3_step(stmt);
-		int changes = sqlite3_changes(outdb);
-		sqlite3_finalize(stmt);
-		(void) rc;
-		fprintf(stderr, "%s: cleaned up %d uncommitted tiles (zoom > %d)\n", *av, changes, last_completed_zoom);
-	}
-
-	// Remove orphaned images
-	if (sqlite3_prepare_v2(outdb, "DELETE FROM images WHERE tile_id NOT IN (SELECT tile_id FROM map);",
-			       -1, &stmt, NULL) == SQLITE_OK) {
-		int rc = sqlite3_step(stmt);
-		(void) rc;
-		sqlite3_finalize(stmt);
-	}
-}
-
-// --- self-contained open_resume ---
-
-std::unique_ptr<Session> Session::open_resume(const char *dir) {
-	struct stat st;
-	if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
-		fprintf(stderr, "%s: checkpoint directory %s does not exist\n", *av, dir);
-		exit(EXIT_ARGS);
-	}
-	auto s = std::unique_ptr<Session>(new Session(dir, true));
-	s->open_db(false);
-
-	// Self-contained fingerprint verification using stored data
-	s->verify_fingerprint_internal();
-
-	sqlite3_stmt *stmt = NULL;
-	if (sqlite3_prepare_v2(s->db_,
-			       "SELECT entry_snapshot_done, last_completed_zoom, iz, minzoom, maxzoom, basezoom, midx, midy FROM tiling_state WHERE id=1;",
-			       -1, &stmt, NULL) != SQLITE_OK) {
-		exit(EXIT_SQLITE);
-	}
-	if (sqlite3_step(stmt) == SQLITE_ROW) {
-		s->entry_snapshot_done_ = sqlite3_column_int(stmt, 0) != 0;
-		if (sqlite3_column_type(stmt, 1) != SQLITE_NULL) {
-			s->last_completed_zoom_ = sqlite3_column_int(stmt, 1);
-		}
-		s->resume_iz_ = sqlite3_column_int(stmt, 2);
-		s->tiling_minzoom_ = sqlite3_column_int(stmt, 3);
-		s->tiling_maxzoom_ = sqlite3_column_int(stmt, 4);
-		s->tiling_basezoom_ = sqlite3_column_int(stmt, 5);
-		s->tiling_midx_ = (unsigned) sqlite3_column_int(stmt, 6);
-		s->tiling_midy_ = (unsigned) sqlite3_column_int(stmt, 7);
-	}
-	sqlite3_finalize(stmt);
-
-	if (sqlite3_prepare_v2(s->db_, "SELECT MAX(generation) FROM zoom_commit;", -1, &stmt, NULL) == SQLITE_OK) {
-		if (sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
-			s->generation_ = (uint64_t) sqlite3_column_int64(stmt, 0);
-		}
-		sqlite3_finalize(stmt);
-	}
-
-	if (s->last_completed_zoom_ >= 0) {
-		s->resume_iz_ = s->last_completed_zoom_ + 1;
-	}
-
-	return s;
-}
+// --- open_new / open_resume ---
 
 std::unique_ptr<Session> Session::open_new(const char *dir, bool force, FingerprintParams const &params) {
 	auto s = std::unique_ptr<Session>(new Session(dir, false));
@@ -1085,21 +1181,85 @@ std::unique_ptr<Session> Session::open_new(const char *dir, bool force, Fingerpr
 		mkdir_p(dir);
 	}
 
-	std::string dbpath = std::string(dir) + "/state.sqlite";
-	struct stat dbst;
-	bool has_job = stat(dbpath.c_str(), &dbst) == 0;
+	// 检查是否已有作业
+	std::string jsonpath = std::string(dir) + "/state.json";
+	bool has_job = stat(jsonpath.c_str(), &st) == 0;
 	if (has_job && !force) {
 		fprintf(stderr, "%s: checkpoint directory %s already has a job; use --checkpoint-force to replace\n", *av, dir);
 		exit(EXIT_EXISTS);
 	}
 
-	s->open_db(true);
+	// 创建目录结构
+	mkdir_p(std::string(dir) + "/blobs");
+	mkdir_p(std::string(dir) + "/staging");
+	mkdir_p(std::string(dir) + "/commits");
+
+	// 获取并发锁
+	s->acquire_lock();
+
 	if (has_job && force) {
 		s->clear_workspace();
 	}
-	std::string fp = compute_fingerprint(params);
-	std::string norm_cmd = normalize_command_line_for_fingerprint(params.command_line);
-	s->write_job_row(params, fp, norm_cmd);
+
+	// 初始化 state
+	s->state_.format_version = TIPPECANOE_CHECKPOINT_FORMAT;
+	s->state_.fingerprint = compute_fingerprint(params);
+	s->state_.command_line = params.command_line;
+	s->state_.normalized_cmd = normalize_command_line_for_fingerprint(params.command_line);
+	s->state_.output_mode = params.output_mode;
+	s->state_.output_path = params.output_path;
+	s->state_.temp_files = params.temp_files;
+	s->state_.cpus = params.cpus;
+	s->state_.created_at = now_unix();
+	s->state_.updated_at = s->state_.created_at;
+	s->state_.input_files = params.inputs;
+	s->state_.last_completed_zoom = -1;
+	s->state_.entry_snapshot_done = false;
+	s->state_.generation = 0;
+
+	s->save_state_atomic();
+	return s;
+}
+
+std::unique_ptr<Session> Session::open_resume(const char *dir) {
+	struct stat st;
+	if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+		fprintf(stderr, "%s: checkpoint directory %s does not exist\n", *av, dir);
+		exit(EXIT_ARGS);
+	}
+
+	auto s = std::unique_ptr<Session>(new Session(dir, true));
+
+	// 清理可能残留的 state.json.tmp
+	std::string tmppath = std::string(dir) + "/state.json.tmp";
+	if (stat(tmppath.c_str(), &st) == 0) {
+		unlink(tmppath.c_str());
+	}
+
+	// 获取并发锁
+	s->acquire_lock();
+
+	// 加载 state.json
+	s->load_state();
+
+	// 校验指纹（内部一致性）
+	s->verify_fingerprint_internal();
+
+	// 同步到成员变量
+	s->entry_snapshot_done_ = s->state_.entry_snapshot_done;
+	s->last_completed_zoom_ = s->state_.last_completed_zoom;
+	s->resume_iz_ = s->state_.iz;
+	s->tiling_minzoom_ = s->state_.minzoom;
+	s->tiling_maxzoom_ = s->state_.maxzoom;
+	s->tiling_basezoom_ = s->state_.basezoom;
+	s->tiling_midx_ = s->state_.midx;
+	s->tiling_midy_ = s->state_.midy;
+	s->generation_ = s->state_.generation;
+
+	if (s->last_completed_zoom_ >= 0) {
+		s->resume_iz_ = s->last_completed_zoom_ + 1;
+	}
+
 	return s;
 }
 
@@ -1111,9 +1271,7 @@ int Session::resume_iz() const {
 	return resume_iz_;
 }
 
-void Session::commit_generation() {
-	generation_++;
-}
+// --- snapshot_tiling_entry ---
 
 void Session::snapshot_tiling_entry(int poolfd, size_t pool_size, long long const *pool_off, unsigned const *initial_x, unsigned const *initial_y,
 				   int geomfd, off_t geom_size, node *shared_nodes_map, size_t nodepos, std::string const &shared_nodes_bloom,
@@ -1153,7 +1311,7 @@ void Session::snapshot_tiling_entry(int poolfd, size_t pool_size, long long cons
 		write_blob_file(path_staging("file_bbox2.bin"), file_bbox2, sizeof(long long) * 4);
 	}
 
-	// Promote staging -> blobs
+	// 原子 promote: staging → blobs
 	rename(path_staging("stringpool").c_str(), path_blob("stringpool").c_str());
 	if (geom_size > 0) {
 		rename(path_staging("geom.initial").c_str(), path_blob("geom.initial").c_str());
@@ -1178,24 +1336,20 @@ void Session::snapshot_tiling_entry(int poolfd, size_t pool_size, long long cons
 		rename(path_staging("file_bbox2.bin").c_str(), path_blob("file_bbox2.bin").c_str());
 	}
 
-	commit_generation();
+	// fsync blobs 目录
+	fsync_dir(dir_ + "/blobs");
 
-	sqlite3_stmt *stmt = NULL;
-	const char *sql =
-	    "INSERT OR REPLACE INTO tiling_state (id, iz, minzoom, maxzoom, basezoom, last_completed_zoom, midx, midy, pool_off, initial_x, initial_y, nodepos, entry_snapshot_done) "
-	    "VALUES (1, ?, ?, ?, ?, NULL, 0, 0, 0, 0, 0, ?, 1);";
-	if (sqlite3_prepare_v2(db_, sql, -1, &stmt, NULL) != SQLITE_OK) {
-		exit(EXIT_SQLITE);
-	}
-	sqlite3_bind_int(stmt, 1, iz);
-	sqlite3_bind_int(stmt, 2, minzoom);
-	sqlite3_bind_int(stmt, 3, maxzoom);
-	sqlite3_bind_int(stmt, 4, basezoom);
-	sqlite3_bind_int64(stmt, 5, (sqlite3_int64) nodepos);
-	if (sqlite3_step(stmt) != SQLITE_DONE) {
-		exit(EXIT_SQLITE);
-	}
-	sqlite3_finalize(stmt);
+	// 更新 state
+	state_.generation++;
+	state_.iz = iz;
+	state_.minzoom = minzoom;
+	state_.maxzoom = maxzoom;
+	state_.basezoom = basezoom;
+	state_.nodepos = (int64_t) nodepos;
+	state_.entry_snapshot_done = true;
+	state_.last_completed_zoom = -1;  // 尚未完成任何 zoom
+
+	save_state_atomic();
 
 	entry_snapshot_done_ = true;
 	resume_iz_ = iz;
@@ -1203,6 +1357,8 @@ void Session::snapshot_tiling_entry(int poolfd, size_t pool_size, long long cons
 	tiling_maxzoom_ = maxzoom;
 	tiling_basezoom_ = basezoom;
 }
+
+// --- restore_tiling ---
 
 bool Session::restore_tiling(TilingRestore &out) {
 	if (!can_resume_tiling()) {
@@ -1231,7 +1387,7 @@ bool Session::restore_tiling(TilingRestore &out) {
 	off_t geom_total = 0;
 
 	if (last_completed_zoom_ < 0) {
-		// No zoom has been completed — load the initial snapshot (uncompressed)
+		// 无 zoom 完成 — 加载初始快照（未压缩）
 		std::string geom_init = path_blob("geom.initial");
 		struct stat gst;
 		if (stat(geom_init.c_str(), &gst) == 0) {
@@ -1241,20 +1397,12 @@ bool Session::restore_tiling(TilingRestore &out) {
 			geom_total += gst.st_size;
 		}
 	} else {
-		// Zooms have been completed — load the latest generation's geom files
-		// Find the latest generation from zoom_commit
-		uint64_t latest_gen = 0;
-		sqlite3_stmt *gstmt = NULL;
-		if (sqlite3_prepare_v2(db_, "SELECT MAX(generation) FROM zoom_commit;", -1, &gstmt, NULL) == SQLITE_OK) {
-			if (sqlite3_step(gstmt) == SQLITE_ROW && sqlite3_column_type(gstmt, 0) != SQLITE_NULL) {
-				latest_gen = (uint64_t) sqlite3_column_int64(gstmt, 0);
-			}
-			sqlite3_finalize(gstmt);
-		}
+		// 有 zoom 完成 — 加载最新代数的 geom 文件
+		uint64_t latest_gen = state_.generation;
 
 		for (size_t j = 0; j < TEMP_FILES; j++) {
 			char name[64];
-			snprintf(name, sizeof(name), "geom.%zu.g%llu", j, (unsigned long long)latest_gen);
+			snprintf(name, sizeof(name), "geom.%zu.g%llu", j, (unsigned long long) latest_gen);
 			std::string gp = path_blob(name);
 			struct stat gs;
 			if (stat(gp.c_str(), &gs) == 0) {
@@ -1265,13 +1413,12 @@ bool Session::restore_tiling(TilingRestore &out) {
 			}
 		}
 
-		// Clean up stale initial snapshot and old-generation geom files
+		// 清理旧代数和初始快照
 		DIR *d = opendir((dir_ + "/blobs").c_str());
 		if (d != NULL) {
 			struct dirent *dp;
 			while ((dp = readdir(d)) != NULL) {
 				if (strncmp(dp->d_name, "geom.", 5) == 0) {
-					// Check if this is a generation-suffixed file that's NOT the latest gen
 					const char *dot = strrchr(dp->d_name, '.');
 					if (dot != NULL && strncmp(dot, ".g", 2) == 0) {
 						uint64_t file_gen = (uint64_t) strtoull(dot + 2, NULL, 10);
@@ -1280,7 +1427,6 @@ bool Session::restore_tiling(TilingRestore &out) {
 							unlink(old.c_str());
 						}
 					} else if (strcmp(dp->d_name, "geom.initial") == 0) {
-						// Old initial snapshot, clean up
 						std::string old = dir_ + "/blobs/" + dp->d_name;
 						unlink(old.c_str());
 					}
@@ -1290,7 +1436,7 @@ bool Session::restore_tiling(TilingRestore &out) {
 		}
 	}
 	fprintf(stderr, "  [checkpoint restore_tiling] loaded %d geom files, total=%lld bytes, iz=%d maxzoom=%d\n",
-		geom_loaded, (long long)geom_total, resume_iz_, tiling_maxzoom_);
+		geom_loaded, (long long) geom_total, resume_iz_, tiling_maxzoom_);
 
 	FILE *fp = fopen(path_blob("pool_off.bin").c_str(), "rb");
 	if (fp != NULL) {
@@ -1340,8 +1486,7 @@ bool Session::restore_tiling(TilingRestore &out) {
 	read_skip_children_blob(path_blob("skip_children.bin"), out.skip_children);
 	read_strategies_blob(path_blob("strategies.bin"), out.strategies);
 
-	// Restore file_bbox / file_bbox1 / file_bbox2 (used by metadata.bounds).
-	// Missing files leave the TilingRestore defaults in place.
+	// 恢复 file_bbox / file_bbox1 / file_bbox2
 	for (int which = 0; which < 3; which++) {
 		const char *name = which == 0 ? "file_bbox.bin" : which == 1 ? "file_bbox1.bin" : "file_bbox2.bin";
 		long long *dst = which == 0 ? out.file_bbox : which == 1 ? out.file_bbox1 : out.file_bbox2;
@@ -1349,7 +1494,7 @@ bool Session::restore_tiling(TilingRestore &out) {
 		FILE *bfp = fopen(p.c_str(), "rb");
 		if (bfp != NULL) {
 			if (fread(dst, sizeof(long long), 4, bfp) != 4) {
-				// short read — leave defaults
+				// 短读 — 保留默认值
 			}
 			fclose(bfp);
 		}
@@ -1365,13 +1510,15 @@ bool Session::restore_tiling(TilingRestore &out) {
 	return true;
 }
 
+// --- on_zoom_complete ---
+
 void Session::on_zoom_complete(ZoomCompleteContext const &ctx) {
 	if (!active_ || ctx.geomfd == nullptr || ctx.geom_size == nullptr) {
 		return;
 	}
 
-	commit_generation();
-	uint64_t gen = generation_;
+	state_.generation++;
+	uint64_t gen = state_.generation;
 
 	std::string staging = dir_ + "/staging";
 	mkdir_p(staging);
@@ -1380,7 +1527,7 @@ void Session::on_zoom_complete(ZoomCompleteContext const &ctx) {
 	int saved_count = 0;
 	for (size_t j = 0; j < TEMP_FILES; j++) {
 		char name[64];
-		snprintf(name, sizeof(name), "geom.%zu.g%llu", j, (unsigned long long)gen);
+		snprintf(name, sizeof(name), "geom.%zu.g%llu", j, (unsigned long long) gen);
 		if (ctx.geomfd[j] >= 0 && ctx.geom_size[j] > 0) {
 			copy_fd_to_file(ctx.geomfd[j], (size_t) ctx.geom_size[j], path_staging(name));
 			total_geom += ctx.geom_size[j];
@@ -1388,7 +1535,7 @@ void Session::on_zoom_complete(ZoomCompleteContext const &ctx) {
 		}
 	}
 	fprintf(stderr, "  [checkpoint on_zoom_complete zoom=%d] saved %d geom files, total=%lld bytes\n",
-		ctx.zoom, saved_count, (long long)total_geom);
+		ctx.zoom, saved_count, (long long) total_geom);
 	if (ctx.skip_children != nullptr) {
 		write_skip_children_blob(path_staging("skip_children.bin"), *ctx.skip_children);
 	}
@@ -1396,12 +1543,10 @@ void Session::on_zoom_complete(ZoomCompleteContext const &ctx) {
 		write_strategies_blob(path_staging("strategies.bin"), *ctx.strategies);
 	}
 
-	// Atomically replace: rename new files from staging to blobs first.
-	// rename() is atomic, so each file is either the old version or the new version.
-	// This is safe even if we crash: new-gen files are in blobs/ alongside old-gen.
+	// 原子替换: 先 rename staging → blobs
 	for (size_t j = 0; j < TEMP_FILES; j++) {
 		char name[64];
-		snprintf(name, sizeof(name), "geom.%zu.g%llu", j, (unsigned long long)gen);
+		snprintf(name, sizeof(name), "geom.%zu.g%llu", j, (unsigned long long) gen);
 		std::string sp = path_staging(name);
 		struct stat st;
 		if (stat(sp.c_str(), &st) == 0) {
@@ -1409,9 +1554,7 @@ void Session::on_zoom_complete(ZoomCompleteContext const &ctx) {
 		}
 	}
 
-	// Now clean up old-generation geom files from blobs/.
-	// We do this AFTER renaming so that even if we crash here,
-	// the new-gen files are safely in blobs/.
+	// 清理旧代数 geom 文件（新代数已安全 rename 到 blobs/）
 	{
 		DIR *d = opendir((dir_ + "/blobs").c_str());
 		if (d != NULL) {
@@ -1446,57 +1589,312 @@ void Session::on_zoom_complete(ZoomCompleteContext const &ctx) {
 		}
 	}
 
+	// fsync blobs 目录
+	fsync_dir(dir_ + "/blobs");
+
+	// 原子更新 state.json（包含 last_completed_zoom 和 generation）
 	int64_t ts = now_unix();
-	sqlite3_stmt *stmt = NULL;
-	const char *zsql =
-	    "INSERT OR REPLACE INTO zoom_commit (zoom, status, committed_at, geom_total_bytes, generation) VALUES (?, 'committed', ?, ?, ?);";
-	if (sqlite3_prepare_v2(db_, zsql, -1, &stmt, NULL) != SQLITE_OK) {
-		exit(EXIT_SQLITE);
-	}
-	sqlite3_bind_int(stmt, 1, ctx.zoom);
-	sqlite3_bind_int64(stmt, 2, ts);
-	sqlite3_bind_int64(stmt, 3, (sqlite3_int64) total_geom);
-	sqlite3_bind_int64(stmt, 4, (sqlite3_int64) generation_);
-	if (sqlite3_step(stmt) != SQLITE_DONE) {
-		exit(EXIT_SQLITE);
-	}
-	sqlite3_finalize(stmt);
+	state_.last_completed_zoom = ctx.zoom;
+	state_.maxzoom = ctx.maxzoom;
+	state_.midx = ctx.midx;
+	state_.midy = ctx.midy;
 
-	const char *tsql = "UPDATE tiling_state SET last_completed_zoom=?, maxzoom=?, midx=?, midy=? WHERE id=1;";
-	if (sqlite3_prepare_v2(db_, tsql, -1, &stmt, NULL) != SQLITE_OK) {
-		exit(EXIT_SQLITE);
-	}
-	sqlite3_bind_int(stmt, 1, ctx.zoom);
-	sqlite3_bind_int(stmt, 2, ctx.maxzoom);
-	sqlite3_bind_int(stmt, 3, (int) ctx.midx);
-	sqlite3_bind_int(stmt, 4, (int) ctx.midy);
-	if (sqlite3_step(stmt) != SQLITE_DONE) {
-		exit(EXIT_SQLITE);
-	}
-	sqlite3_finalize(stmt);
+	ZoomCommit commit;
+	commit.committed_at = ts;
+	commit.geom_total_bytes = (int64_t) total_geom;
+	commit.generation = gen;
+	state_.zoom_commits[ctx.zoom] = commit;
 
+	save_state_atomic();
+
+	// 创建 zoom 完成标记文件（防御性校验）
+	{
+		char marker[64];
+		snprintf(marker, sizeof(marker), "%s/zoom-%d.done", path_commits().c_str(), ctx.zoom);
+		FILE *mf = fopen(marker, "w");
+		if (mf != NULL) {
+			fprintf(mf, "%lld\n", (long long) ts);
+			fclose(mf);
+		}
+	}
+
+	// 更新成员变量
 	last_completed_zoom_ = ctx.zoom;
 	tiling_maxzoom_ = ctx.maxzoom;
 	tiling_midx_ = ctx.midx;
 	tiling_midy_ = ctx.midy;
 	resume_iz_ = ctx.zoom + 1;
+	generation_ = gen;
+
+	// 进度报告
+	report_progress(ctx.zoom);
 }
 
+// --- finalize_success ---
+
 void Session::finalize_success() {
-	if (!active_ || db_ == nullptr) {
+	if (!active_) {
 		return;
 	}
-	int64_t ts = now_unix();
+	state_.updated_at = now_unix();
+	save_state_atomic();
+	// 释放锁
+	release_lock();
+}
+
+// ===========================================================================
+// 输出清理辅助函数（操作 mbtiles 输出文件，不是 checkpoint 状态）
+// ===========================================================================
+
+void cleanup_resume_wal(const char *output_path) {
+	// 清理 WAL 和 SHM 文件（kill -9 残留）
+	// 注意：不先删除 -journal 文件，SQLite 需要回滚热日志中的未完成事务
+	std::string wal = std::string(output_path) + "-wal";
+	std::string shm = std::string(output_path) + "-shm";
+	std::string journal = std::string(output_path) + "-journal";
+
+	unlink(wal.c_str());
+	unlink(shm.c_str());
+
+	// 若 DB header 仍指示 WAL 模式（bytes 18-19 = 0x02 0x00），
+	// 重置为 DELETE 模式（0x01 0x00），否则 SQLite 无法打开
+	int fd = open(output_path, O_RDWR);
+	if (fd >= 0) {
+		unsigned char buf[2];
+		if (pread(fd, buf, 2, 18) == 2) {
+			if (buf[0] == 0x02 && buf[1] == 0x00) {
+				buf[0] = 0x01;
+				pwrite(fd, buf, 2, 18);
+			}
+		}
+		close(fd);
+	}
+
+	// 打开数据库回滚热日志
+	sqlite3 *db = NULL;
+	if (sqlite3_open(output_path, &db) == SQLITE_OK) {
+		sqlite3_busy_timeout(db, 30000);
+		char *err = NULL;
+		int rc = sqlite3_exec(db, "PRAGMA journal_mode=DELETE;", NULL, NULL, &err);
+		if (rc != SQLITE_OK) {
+			fprintf(stderr, "checkpoint: warning: journal recovery for %s failed: %s\n", output_path, err ? err : "(unknown)");
+		}
+		sqlite3_free(err);
+		sqlite3_close(db);
+	}
+
+	// 回滚完成后清理残留 journal
+	unlink(journal.c_str());
+}
+
+void cleanup_resume_dirs(const char *output_path, int last_completed_zoom, int maxzoom) {
+	for (int z = last_completed_zoom + 1; z <= maxzoom; z++) {
+		std::string zdir = std::string(output_path) + "/" + std::to_string(z);
+		struct stat st;
+		if (stat(zdir.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+			rmrf_path(zdir);
+		}
+	}
+}
+
+void cleanup_resume_tiles(sqlite3 *outdb, int last_completed_zoom) {
+	if (outdb == NULL || last_completed_zoom < 0) {
+		return;
+	}
+
+	char *err = NULL;
+	if (sqlite3_exec(outdb, "PRAGMA journal_mode=DELETE;", NULL, NULL, &err) != SQLITE_OK) {
+		fprintf(stderr, "%s: warning: could not set journal mode: %s\n", *av, err ? err : "unknown error");
+		sqlite3_free(err);
+	}
+
 	sqlite3_stmt *stmt = NULL;
-	if (sqlite3_prepare_v2(db_, "UPDATE job SET updated_at=? WHERE id=1;", -1, &stmt, NULL) == SQLITE_OK) {
-		sqlite3_bind_int64(stmt, 1, ts);
-		sqlite3_step(stmt);
+	if (sqlite3_prepare_v2(outdb, "DELETE FROM map WHERE zoom_level > ?;", -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_int(stmt, 1, last_completed_zoom);
+		int rc = sqlite3_step(stmt);
+		int changes = sqlite3_changes(outdb);
+		sqlite3_finalize(stmt);
+		(void) rc;
+		fprintf(stderr, "%s: cleaned up %d uncommitted tiles (zoom > %d)\n", *av, changes, last_completed_zoom);
+	}
+
+	if (sqlite3_prepare_v2(outdb, "DELETE FROM images WHERE tile_id NOT IN (SELECT tile_id FROM map);",
+			       -1, &stmt, NULL) == SQLITE_OK) {
+		int rc = sqlite3_step(stmt);
+		(void) rc;
 		sqlite3_finalize(stmt);
 	}
-	if (sqlite3_close(db_) != SQLITE_OK) {
-		fprintf(stderr, "%s: checkpoint: sqlite close: %s\n", *av, sqlite3_errmsg(db_));
+}
+
+// ===========================================================================
+// read_resume_info（从 state.json 读取，不打开 Session）
+// ===========================================================================
+
+ResumeInfo read_resume_info(const char *dir) {
+	struct stat st;
+	if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+		fprintf(stderr, "%s: checkpoint directory %s does not exist\n", *av, dir);
+		exit(EXIT_ARGS);
 	}
-	db_ = nullptr;
+
+	// 清理残留的 state.json.tmp
+	std::string tmppath = std::string(dir) + "/state.json.tmp";
+	if (stat(tmppath.c_str(), &st) == 0) {
+		unlink(tmppath.c_str());
+	}
+
+	std::string jsonpath = std::string(dir) + "/state.json";
+	std::string json_str = read_file_to_string(jsonpath);
+	if (json_str.empty()) {
+		fprintf(stderr, "%s: cannot read checkpoint state: %s\n", *av, jsonpath.c_str());
+		exit(EXIT_ARGS);
+	}
+
+	CheckpointState state;
+	if (!parse_state(json_str, state)) {
+		fprintf(stderr, "%s: checkpoint state is corrupt: %s\n", *av, jsonpath.c_str());
+		exit(EXIT_ARGS);
+	}
+
+	ResumeInfo info;
+	info.output_mode = state.output_mode;
+	info.output_path = state.output_path;
+	info.original_cmd = state.command_line;
+	info.normalized_cmd = state.normalized_cmd;
+	info.maxzoom = state.maxzoom;
+	info.minzoom = state.minzoom;
+	info.basezoom = state.basezoom;
+	info.last_completed_zoom = state.last_completed_zoom;
+	info.entry_snapshot_done = state.entry_snapshot_done;
+
+	for (auto const &f : state.input_files) {
+		info.input_files.push_back(f.path);
+	}
+
+	return info;
+}
+
+// ===========================================================================
+// 管理命令
+// ===========================================================================
+
+int checkpoint_status(const char *dir) {
+	struct stat st;
+	if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+		fprintf(stderr, "%s: checkpoint directory %s does not exist\n", *av, dir);
+		return EXIT_ARGS;
+	}
+
+	std::string jsonpath = std::string(dir) + "/state.json";
+	std::string json_str = read_file_to_string(jsonpath);
+	if (json_str.empty()) {
+		fprintf(stderr, "%s: no checkpoint state found: %s\n", *av, dir);
+		return EXIT_ARGS;
+	}
+
+	CheckpointState state;
+	if (!parse_state(json_str, state)) {
+		fprintf(stderr, "%s: checkpoint state is corrupt\n", *av);
+		return EXIT_ARGS;
+	}
+
+	fprintf(stderr, "=== Checkpoint: %s ===\n", dir);
+	fprintf(stderr, "  Command: %s\n", state.command_line.c_str());
+	fprintf(stderr, "  Output: %s (%s)\n", state.output_path.c_str(), state.output_mode.c_str());
+
+	if (!state.input_files.empty()) {
+		fprintf(stderr, "  Input: ");
+		for (size_t i = 0; i < state.input_files.size(); i++) {
+			if (i > 0) fprintf(stderr, ", ");
+			fprintf(stderr, "%s", state.input_files[i].path.c_str());
+		}
+		fprintf(stderr, "\n");
+	}
+
+	fprintf(stderr, "  Zoom range: %d-%d", state.minzoom, state.maxzoom);
+	if (state.last_completed_zoom >= 0) {
+		int total = state.maxzoom - state.minzoom + 1;
+		int completed = state.last_completed_zoom - state.minzoom + 1;
+		if (total <= 0) total = 1;
+		int pct = 100 * completed / total;
+		fprintf(stderr, ", completed: %d/%d (%d%%)", completed, total, pct);
+	} else {
+		fprintf(stderr, ", no zooms completed yet");
+	}
+	fprintf(stderr, "\n");
+
+	fprintf(stderr, "  Entry snapshot: %s\n", state.entry_snapshot_done ? "done" : "pending");
+	fprintf(stderr, "  Generation: %llu\n", (unsigned long long) state.generation);
+	fprintf(stderr, "  Zoom commits: %zu\n", state.zoom_commits.size());
+
+	// 计算磁盘占用
+	long long blob_size = 0;
+	std::string blobs_dir = std::string(dir) + "/blobs";
+	DIR *d = opendir(blobs_dir.c_str());
+	if (d != NULL) {
+		struct dirent *dp;
+		while ((dp = readdir(d)) != NULL) {
+			if (dp->d_name[0] == '.') continue;
+			std::string fp = blobs_dir + "/" + dp->d_name;
+			struct stat bs;
+			if (stat(fp.c_str(), &bs) == 0) {
+				blob_size += bs.st_size;
+			}
+		}
+		closedir(d);
+	}
+	fprintf(stderr, "  Blob size: %lld bytes (%.1f MB)\n", blob_size, blob_size / (1024.0 * 1024.0));
+
+	time_t created = (time_t) state.created_at;
+	time_t updated = (time_t) state.updated_at;
+	fprintf(stderr, "  Created: %s", ctime(&created));
+	fprintf(stderr, "  Updated: %s", ctime(&updated));
+
+	return 0;
+}
+
+int checkpoint_prune(const char *dir) {
+	struct stat st;
+	if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+		fprintf(stderr, "%s: checkpoint directory %s does not exist\n", *av, dir);
+		return EXIT_ARGS;
+	}
+
+	std::string jsonpath = std::string(dir) + "/state.json";
+	if (stat(jsonpath.c_str(), &st) != 0) {
+		fprintf(stderr, "%s: no checkpoint state found: %s\n", *av, dir);
+		return EXIT_ARGS;
+	}
+
+	// 删除 blobs/、staging/、commits/，保留 state.json 作为日志
+	long long freed = 0;
+
+	// 计算 blobs 大小
+	std::string blobs_dir = std::string(dir) + "/blobs";
+	DIR *d = opendir(blobs_dir.c_str());
+	if (d != NULL) {
+		struct dirent *dp;
+		while ((dp = readdir(d)) != NULL) {
+			if (dp->d_name[0] == '.') continue;
+			std::string fp = blobs_dir + "/" + dp->d_name;
+			struct stat bs;
+			if (stat(fp.c_str(), &bs) == 0) {
+				freed += bs.st_size;
+			}
+		}
+		closedir(d);
+	}
+
+	rmrf_path(blobs_dir);
+	rmrf_path(std::string(dir) + "/staging");
+	rmrf_path(std::string(dir) + "/commits");
+	unlink((std::string(dir) + "/.lock").c_str());
+
+	fprintf(stderr, "%s: pruned checkpoint %s, freed %lld bytes (%.1f MB)\n",
+		*av, dir, freed, freed / (1024.0 * 1024.0));
+	fprintf(stderr, "  state.json preserved as log\n");
+
+	return 0;
 }
 
 }  // namespace checkpoint

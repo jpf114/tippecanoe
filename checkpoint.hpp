@@ -1,15 +1,17 @@
 #ifndef CHECKPOINT_HPP
 #define CHECKPOINT_HPP
 
+#include <atomic>
 #include <climits>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
 #include <vector>
 
-#include <sqlite3.h>
+#include <sqlite3.h>  // 仅用于 mbtiles 输出格式的 WAL 清理，不用于 checkpoint 状态存储
 
 #include "dirtiles.hpp"
 #include "main.hpp"
@@ -19,7 +21,22 @@
 
 namespace checkpoint {
 
-constexpr int TIPPECANOE_CHECKPOINT_FORMAT = 1;
+constexpr int TIPPECANOE_CHECKPOINT_FORMAT = 2;  // v2: 纯文件系统方案（JSON state）
+
+// ---------------------------------------------------------------------------
+// 信号处理：优雅退出
+// ---------------------------------------------------------------------------
+
+// 注册 SIGTERM/SIGINT 处理器，设置优雅退出标志。
+void install_signal_handlers();
+
+// 检查是否收到退出信号（SIGTERM/SIGINT）。
+// 在 zoom 边界调用，若返回 true 则提交当前 zoom 后退出。
+bool shutdown_requested();
+
+// ---------------------------------------------------------------------------
+// 数据结构
+// ---------------------------------------------------------------------------
 
 struct InputFileStat {
 	std::string path;
@@ -37,6 +54,47 @@ struct FingerprintParams {
 	int prevent[256]{};
 	int additional[256]{};
 	std::vector<InputFileStat> inputs;
+};
+
+// 单个 zoom 的提交记录
+struct ZoomCommit {
+	int64_t committed_at = 0;
+	int64_t geom_total_bytes = 0;
+	uint64_t generation = 0;
+};
+
+// checkpoint 的完整状态，序列化为 state.json
+// 使用原子 rename 更新（state.json.tmp → state.json），保证崩溃一致性。
+struct CheckpointState {
+	// --- job ---
+	int format_version = TIPPECANOE_CHECKPOINT_FORMAT;
+	std::string fingerprint;
+	std::string command_line;     // 原始命令行（用于显示）
+	std::string normalized_cmd;   // 规范化命令行（用于指纹计算）
+	std::string output_mode;      // "mbtiles" / "directory"
+	std::string output_path;      // 绝对输出路径
+	size_t temp_files = 0;
+	size_t cpus = 0;
+	int64_t created_at = 0;
+	int64_t updated_at = 0;
+	std::vector<InputFileStat> input_files;
+
+	// --- tiling_state ---
+	int iz = 0;
+	int minzoom = 0;
+	int maxzoom = 0;
+	int basezoom = 0;
+	int last_completed_zoom = -1;  // -1 表示尚无 zoom 完成
+	unsigned midx = 0;
+	unsigned midy = 0;
+	int64_t nodepos = 0;
+	bool entry_snapshot_done = false;
+
+	// --- generation ---
+	uint64_t generation = 0;
+
+	// --- zoom commits ---
+	std::map<int, ZoomCommit> zoom_commits;
 };
 
 struct TilingRestore {
@@ -81,45 +139,55 @@ struct ZoomCompleteContext {
 	unsigned midy = 0;
 };
 
-// Lightweight snapshot of all parameters needed to resume — read from state.sqlite
-// without opening a full Session.
+// 从 state.json 读取的续跑元数据（不需要打开完整 Session）
 struct ResumeInfo {
-	std::string output_mode;       // "mbtiles" or "directory"
-	std::string output_path;       // absolute output path
-	std::vector<std::string> input_files;  // input file paths (from input_file table)
+	std::string output_mode;
+	std::string output_path;
+	std::vector<std::string> input_files;
 	int maxzoom = 0;
 	int minzoom = 0;
 	int basezoom = 0;
-	int last_completed_zoom = -1;  // -1 if no zoom committed yet
-	bool entry_snapshot_done = false;  // true if initial snapshot was saved
-	std::string original_cmd;      // original command line (for display)
-	std::string normalized_cmd;    // normalized command line (for fingerprint)
+	int last_completed_zoom = -1;
+	bool entry_snapshot_done = false;
+	std::string original_cmd;
+	std::string normalized_cmd;
 };
+
+// ---------------------------------------------------------------------------
+// 工具函数
+// ---------------------------------------------------------------------------
 
 std::string normalize_command_line_for_fingerprint(std::string const &command_line);
 std::string compute_fingerprint(FingerprintParams const &params);
 std::vector<InputFileStat> stat_input_paths(std::vector<std::string> const &paths);
 std::string absolute_path_or_die(const char *path);
 
-// Read resume metadata from state.sqlite.  Does NOT open a Session.
-// Exits with error if the directory or state.sqlite is missing/corrupt.
+// 从 state.json 读取续跑元数据（不打开 Session）
 ResumeInfo read_resume_info(const char *dir);
 
-// Output cleanup helpers for resuming after kill -9.
-// WAL / SHM / JOURNAL cleanup (mbtiles only, safe to call before opening the DB).
+// 输出清理辅助函数（操作 mbtiles 输出文件，不是 checkpoint 状态）
 void cleanup_resume_wal(const char *output_path);
-// Remove uncommitted-zoom directories (directory output mode).
 void cleanup_resume_dirs(const char *output_path, int last_completed_zoom, int maxzoom);
-// Remove uncommitted-zoom tiles from an already-open mbtiles database.
 void cleanup_resume_tiles(sqlite3 *outdb, int last_completed_zoom);
+
+// ---------------------------------------------------------------------------
+// 管理命令
+// ---------------------------------------------------------------------------
+
+// 查询 checkpoint 状态（不启动 resume），打印到 stderr
+int checkpoint_status(const char *dir);
+
+// 清理 checkpoint 目录中的 blobs/（保留 state.json 作为日志）
+int checkpoint_prune(const char *dir);
+
+// ---------------------------------------------------------------------------
+// Session 类
+// ---------------------------------------------------------------------------
 
 class Session {
       public:
 	static std::unique_ptr<Session> open_new(const char *dir, bool force, FingerprintParams const &params);
-	// Self-contained resume: reads all params from state.sqlite, verifies fingerprint
-	// internally.  Does NOT need the caller to pass FingerprintParams.
 	static std::unique_ptr<Session> open_resume(const char *dir);
-
 	~Session();
 
 	Session(Session const &) = delete;
@@ -144,20 +212,31 @@ class Session {
       private:
 	Session(const char *dir, bool is_resume);
 
-	void open_db(bool create);
-	void init_schema();
-	void clear_workspace();
-	void write_job_row(FingerprintParams const &params, std::string const &fingerprint, std::string const &normalized_cmd);
-	// Self-contained verification: reads stored fingerprint & params from DB,
-	// recomputes fingerprint, and exits on mismatch.
-	void verify_fingerprint_internal();
+	// JSON state 原子读写
+	void load_state();
+	void save_state();
+	void save_state_atomic();  // 写 state.json.tmp → fsync → rename → fsync dir
+
+	// 并发锁
+	void acquire_lock();
+	void release_lock();
+
+	// 文件系统辅助
 	std::string path_blob(const char *name) const;
 	std::string path_staging(const char *name) const;
+	std::string path_commits() const;
 	void fsync_path(std::string const &path);
+	void fsync_dir(std::string const &dirpath);
 	void copy_fd_to_file(int fd, size_t nbytes, std::string const &dest);
-	void commit_generation();
+	void rmrf(std::string const &path);  // C 递归删除（替代 system("rm -rf")）
+	void clear_workspace();
+	void verify_fingerprint_internal();
 
-	sqlite3 *db_ = nullptr;
+	// 进度报告
+	void report_progress(int zoom) const;
+
+	CheckpointState state_;
+	int lock_fd_ = -1;
 	std::string dir_;
 	bool active_ = false;
 	bool is_resume_ = false;
@@ -170,6 +249,7 @@ class Session {
 	unsigned tiling_midx_ = 0;
 	unsigned tiling_midy_ = 0;
 	uint64_t generation_ = 0;
+	int64_t start_time_ = 0;  // 用于进度报告
 };
 
 }  // namespace checkpoint

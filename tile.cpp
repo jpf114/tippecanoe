@@ -3561,6 +3561,16 @@ int traverse_zooms(int *geomfd, off_t *geom_size, char *global_stringpool, std::
 		if (err != INT_MAX) {
 			return err;
 		}
+
+		// Graceful shutdown: if SIGTERM/SIGINT was received, stop after the
+		// current zoom.  When checkpointing is active, on_zoom_complete() has
+		// already persisted the state, so the next run can resume from here.
+		if (checkpoint::shutdown_requested()) {
+			if (!quiet) {
+				fprintf(stderr, "\nShutdown signal received; stopping after zoom %d.\n", z);
+			}
+			break;
+		}
 	}
 
 	if (largest_written >= 0 && maxzoom > largest_written) {
