@@ -631,6 +631,48 @@ checkpoint-test: tippecanoe
 	./tippecanoe --checkpoint-prune=/tmp/tippecanoe-checkpoint-sigterm/cp 2>/dev/null
 	test -f /tmp/tippecanoe-checkpoint-sigterm/cp/state.json
 	! test -d /tmp/tippecanoe-checkpoint-sigterm/cp/blobs
+	# 6) Simulate power loss: delete a blob file that state.json claims exists.
+	#    verify_blobs_consistency must detect this and exit with EXIT_CHECKPOINT=121,
+	#    refusing to resume from a corrupted checkpoint.
+	rm -rf /tmp/tippecanoe-checkpoint-powerloss
+	mkdir -p /tmp/tippecanoe-checkpoint-powerloss
+	./tippecanoe -q -z3 -f -o /tmp/tippecanoe-checkpoint-powerloss/baseline.mbtiles tests/onefeature/in.json
+	./tippecanoe -q -z3 -o /tmp/tippecanoe-checkpoint-powerloss/out.mbtiles --checkpoint-dir=/tmp/tippecanoe-checkpoint-powerloss/cp tests/onefeature/in.json
+	# Verify at least one zoom was committed
+	grep -q '"zoom_commits":{"[0-9]' /tmp/tippecanoe-checkpoint-powerloss/cp/state.json
+	# Delete an entry-required blob file (simulate power loss where blobs/ fsync
+	# did not complete, so the file is missing on reboot). layermaps.bin is always
+	# required by verify_blobs_consistency when entry_snapshot_done=true.
+	rm /tmp/tippecanoe-checkpoint-powerloss/cp/blobs/layermaps.bin
+	# Resume must fail with EXIT_CHECKPOINT=121, not silently produce corrupt output
+	if ./tippecanoe -q --resume=/tmp/tippecanoe-checkpoint-powerloss/cp 2>/dev/null; then \
+	  echo "ERROR: resume should have failed after blob deletion"; exit 1; \
+	else \
+	  echo "OK: resume correctly refused to start after blob deletion"; \
+	fi
+	# 7) Simulate power loss: corrupt a blob file's content (CRC32 mismatch).
+	#    restore_tiling's CRC32 verification must catch this and exit 121.
+	rm -rf /tmp/tippecanoe-checkpoint-crc
+	mkdir -p /tmp/tippecanoe-checkpoint-crc
+	./tippecanoe -q -z3 -o /tmp/tippecanoe-checkpoint-crc/out.mbtiles --checkpoint-dir=/tmp/tippecanoe-checkpoint-crc/cp tests/onefeature/in.json
+	# Pick any small blob file and flip some bytes in the middle
+	BLOB=$$(ls /tmp/tippecanoe-checkpoint-crc/cp/blobs/pool_off.bin /tmp/tippecanoe-checkpoint-crc/cp/blobs/initial_x.bin 2>/dev/null | head -1) && \
+	  test -n "$$BLOB" && \
+	  python3 -c "import sys; p=sys.argv[1]; d=open(p,'rb').read(); d=d[:8]+bytes([d[8]^0xFF])+d[9:]; open(p,'wb').write(d)" "$$BLOB"
+	# Resume must fail with EXIT_CHECKPOINT=121
+	if ./tippecanoe -q --resume=/tmp/tippecanoe-checkpoint-crc/cp 2>/dev/null; then \
+	  echo "ERROR: resume should have failed after CRC corruption"; exit 1; \
+	else \
+	  echo "OK: resume correctly refused to start after CRC corruption"; \
+	fi
+	# 8) After a clean run with all blobs intact, resume must succeed (positive control)
+	#    Re-run a fresh checkpoint, then resume without any corruption — this verifies
+	#    that our new consistency checks don't produce false positives.
+	rm -rf /tmp/tippecanoe-checkpoint-clean
+	mkdir -p /tmp/tippecanoe-checkpoint-clean
+	./tippecanoe -q -z3 -o /tmp/tippecanoe-checkpoint-clean/out.mbtiles --checkpoint-dir=/tmp/tippecanoe-checkpoint-clean/cp tests/onefeature/in.json
+	./tippecanoe -q --resume=/tmp/tippecanoe-checkpoint-clean/cp
+	sqlite3 /tmp/tippecanoe-checkpoint-clean/out.mbtiles 'SELECT COUNT(*) FROM map;' | grep -q '^[1-9]'
 
 layer-json-test: tippecanoe tippecanoe-decode
 	# GeoJSON with description and named layer

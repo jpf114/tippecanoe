@@ -208,6 +208,8 @@ uint32_t crc32_compute(void const *data, size_t len) {
 }
 
 // 写入 blob 文件（可选追加 CRC32 后缀）
+// v3.1: 加入 fflush + fsync，保证文件内容在 fclose 前已刷盘，
+// 防止突然断电后 blobs/ 中存在空文件或部分写入文件。
 void write_blob_file_with_crc(std::string const &path, void const *data, size_t len, bool append_crc) {
 	FILE *fp = fopen(path.c_str(), "wb");
 	if (fp == NULL) {
@@ -224,6 +226,14 @@ void write_blob_file_with_crc(std::string const &path, void const *data, size_t 
 			perror(path.c_str());
 			exit(EXIT_WRITE);
 		}
+	}
+	if (fflush(fp) != 0) {
+		perror(path.c_str());
+		exit(EXIT_WRITE);
+	}
+	// v3.1: 同步 fsync 文件内容，确保断电一致性
+	if (fsync(fileno(fp)) < 0) {
+		perror("fsync blob file");
 	}
 	if (fclose(fp) != 0) {
 		perror(path.c_str());
@@ -1065,6 +1075,9 @@ Session::Session(const char *dir, bool is_resume)
 }
 
 Session::~Session() {
+	// v3.1: 析构前必须等待异步 fsync 完成，否则 detached 线程可能被强杀，
+	// 导致 blobs/ 目录条目未持久化，断电后 state.json 与 blobs 不一致。
+	wait_pending_fsync();
 	release_lock();
 }
 
@@ -1286,15 +1299,32 @@ void Session::cleanup_old_gen_files_indexed() {
 
 // 异步 fsync blobs 目录（后台线程，立即返回）
 // 用于减少 on_zoom_complete 的阻塞时间
+// v3.1: 改用 std::async + std::future，替代 detached std::thread。
+// 原因：detached thread 在进程退出时会被强杀，fsync 可能未完成，
+// 导致断电后 state.json 已持久化但 blobs/ 目录条目未持久化。
+// 使用 future 后，析构时和 save_state_atomic 之前都能 wait。
 void Session::async_fsync_blob_dir() {
+	// 串行化：先等前一个 fsync 完成，避免多个 fsync 排队
+	wait_pending_fsync();
 	std::string blobs_dir = dir_ + "/blobs";
-	std::thread([blobs_dir]() {
+	pending_fsync_ = std::async(std::launch::async, [blobs_dir]() {
 		int fd = open(blobs_dir.c_str(), O_RDONLY | O_DIRECTORY);
 		if (fd >= 0) {
 			fsync(fd);
 			close(fd);
 		}
-	}).detach();
+	});
+}
+
+// v3.1: 等待 pending fsync 完成
+void Session::wait_pending_fsync() {
+	if (pending_fsync_.valid()) {
+		try {
+			pending_fsync_.get();
+		} catch (...) {
+			fprintf(stderr, "%s: warning: async fsync of blobs/ threw an exception\n", *av);
+		}
+	}
 }
 
 // --- 并发锁（flock）---
@@ -1338,6 +1368,11 @@ void Session::load_state() {
 }
 
 void Session::save_state_atomic() {
+	// v3.1: 持久化 state.json 之前，必须先确保 blobs/ 目录的 fsync 已完成。
+	// 否则会出现 state.json 说 "zoom N 已完成" 但 blobs/ 中的文件目录条目未刷盘，
+	// 断电后 resume 找不到 geom.N.g{gen}，导致续做失败。
+	wait_pending_fsync();
+
 	state_.updated_at = now_unix();
 	std::string json = serialize_state(state_);
 
@@ -1415,6 +1450,64 @@ void Session::verify_fingerprint_internal() {
 		fprintf(stderr, "  stored:   %s\n", state_.fingerprint.c_str());
 		fprintf(stderr, "  expected: %s\n", expected.c_str());
 		exit(EXIT_ARGS);
+	}
+}
+
+// v3.1: 检查 blobs/ 文件存在性，防止断电后 state.json 与 blobs 不一致
+// 如果 state.json 说某 zoom 已完成，但 blobs/ 中对应的 geom 文件缺失，
+// 说明上次运行遭遇断电，fsync 未完成。此时直接报错，要求用户用
+// --checkpoint-force 从头重跑，避免基于损坏状态续做。
+void Session::verify_blobs_consistency() {
+	if (!state_.entry_snapshot_done) {
+		// 入口快照未完成，无法 resume
+		return;
+	}
+
+	std::vector<std::string> missing;
+
+	// 入口快照必备文件（这些文件无论数据大小都一定存在）
+	// 注意：stringpool / shared_nodes / geom.initial 在数据为空时可能不创建，不检查
+	static const char *required_entry_blobs[] = {
+	    "layermaps.bin",  // layermap 总是有内容
+	    "pool_off.bin",   // pool_off 是 CPUS 个 long long，总有内容
+	    "initial_x.bin",  // initial_x 是 CPUS 个 unsigned，总有内容
+	    "initial_y.bin",  // initial_y 是 CPUS 个 unsigned，总有内容
+	    "file_bbox.bin",  // file_bbox 是 4 个 long long，初始值也会写入
+	};
+	for (auto name : required_entry_blobs) {
+		std::string full = dir_ + "/blobs/" + name;
+		struct stat st;
+		if (stat(full.c_str(), &st) != 0) {
+			missing.push_back(name);
+		}
+	}
+
+	// 检查当前 generation 的 geom 文件（state.json 明确记录的文件列表）
+	// 这是检测断电不一致最可靠的依据：state.json 说这些文件存在，如果 blobs/ 中
+	// 找不到，说明 rename 后 fsync 未完成就被断电打断。
+	if (state_.last_completed_zoom >= 0) {
+		for (auto const &name : state_.current_gen_files) {
+			if (name == "geom.initial") {
+				continue;  // 初始快照，可能为空，不检查
+			}
+			std::string full = dir_ + "/blobs/" + name;
+			struct stat st;
+			if (stat(full.c_str(), &st) != 0) {
+				missing.push_back(name);
+			}
+		}
+	}
+
+	if (!missing.empty()) {
+		fprintf(stderr, "%s: checkpoint blobs/ is inconsistent with state.json\n", *av);
+		fprintf(stderr, "  state.json claims last_completed_zoom=%d, but the following blob files are missing:\n",
+			state_.last_completed_zoom);
+		for (auto const &name : missing) {
+			fprintf(stderr, "    - blobs/%s\n", name.c_str());
+		}
+		fprintf(stderr, "%s: this usually indicates a power loss or crash before fsync completed.\n", *av);
+		fprintf(stderr, "%s: cannot safely resume. Please re-run from scratch with --checkpoint-force.\n", *av);
+		exit(EXIT_CHECKPOINT);
 	}
 }
 
@@ -1518,6 +1611,9 @@ std::unique_ptr<Session> Session::open_resume(const char *dir) {
 
 	// 校验指纹（内部一致性）
 	s->verify_fingerprint_internal();
+
+	// v3.1: 校验 blobs/ 文件存在性（防止断电后不一致）
+	s->verify_blobs_consistency();
 
 	// 同步到成员变量
 	s->entry_snapshot_done_ = s->state_.entry_snapshot_done;

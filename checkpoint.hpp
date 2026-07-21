@@ -5,6 +5,7 @@
 #include <climits>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <map>
 #include <memory>
 #include <set>
@@ -241,6 +242,9 @@ class Session {
 	void rmrf(std::string const &path);  // C 递归删除（替代 system("rm -rf")）
 	void clear_workspace();
 	void verify_fingerprint_internal();
+	// v3.1: open_resume 时检查 blobs/ 文件存在性，防止断电后 state.json
+	// 与 blobs 不一致导致续做失败。
+	void verify_blobs_consistency();
 
 	// v3 新增：CRC32 校验
 	bool blob_has_crc() const;  // 当前 state 是否启用 CRC（format_version >= 3）
@@ -257,7 +261,10 @@ class Session {
 	void cleanup_old_gen_files_indexed();
 
 	// v3 新增：异步 fsync（后台线程）
+	// v3.1: 改用 std::future + 析构时 wait，保证进程退出前 fsync 完成
 	void async_fsync_blob_dir();
+	// v3.1: 等待 pending fsync 完成（用于 save_state_atomic 之前和析构时）
+	void wait_pending_fsync();
 
 	// 进度报告
 	void report_progress(int zoom) const;
@@ -277,6 +284,7 @@ class Session {
 	unsigned tiling_midy_ = 0;
 	uint64_t generation_ = 0;
 	int64_t start_time_ = 0;  // 用于进度报告
+	std::future<void> pending_fsync_;  // v3.1: 异步 fsync 的 future，析构时 wait
 };
 
 }  // namespace checkpoint
