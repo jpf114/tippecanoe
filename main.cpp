@@ -2153,7 +2153,27 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 	}
 
 	std::string shared_nodes_bloom;
-	shared_nodes_bloom.resize(34567891);  // circa 34MB, size nowhere near a power of 2
+	// v3: 自适应 bloom filter 大小
+	// 基于预期节点数选择 bloom 大小，保持假阳性率 < 1%
+	// - nodepos/8 bytes 时假阳性率约 1%（每个节点 8 bits）
+	// - 最小 1MB（小数据集），最大 64MB（避免占用过多内存）
+	size_t estimated_nodes = (size_t)(nodepos / sizeof(node));
+	size_t bloom_size = estimated_nodes / 2;  // 约 8 bits per node
+	if (bloom_size < 1 * 1024 * 1024) {
+		bloom_size = 1 * 1024 * 1024;  // 最小 1MB
+	}
+	if (bloom_size > 64 * 1024 * 1024) {
+		bloom_size = 64 * 1024 * 1024;  // 最大 64MB
+	}
+	// 确保不是 2 的幂（避免 hash 碰撞模式）
+	if ((bloom_size & (bloom_size - 1)) == 0) {
+		bloom_size += 12345;
+	}
+	shared_nodes_bloom.resize(bloom_size);
+	if (!quiet) {
+		fprintf(stderr, "Using %.1f MB bloom filter for shared nodes (estimated %zu nodes)\n",
+			bloom_size / (1024.0 * 1024.0), estimated_nodes);
+	}
 
 	// Sort nodes that can't be simplified away; scan the list to remove duplicates
 

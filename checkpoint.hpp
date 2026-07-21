@@ -21,7 +21,8 @@
 
 namespace checkpoint {
 
-constexpr int TIPPECANOE_CHECKPOINT_FORMAT = 2;  // v2: 纯文件系统方案（JSON state）
+constexpr int TIPPECANOE_CHECKPOINT_FORMAT = 3;  // v3: 纯文件系统方案 + CRC32 校验 + 磁盘空间检查
+                                                  // v2: 纯文件系统方案（JSON state），向后兼容
 
 // ---------------------------------------------------------------------------
 // 信号处理：优雅退出
@@ -43,6 +44,7 @@ struct InputFileStat {
 	int64_t size = 0;
 	int64_t mtime_sec = 0;
 	int64_t mtime_nsec = 0;
+	std::string content_hash;  // v3: 小文件（< 100MB）的 SHA-256 内容哈希，大文件为空
 };
 
 struct FingerprintParams {
@@ -95,6 +97,14 @@ struct CheckpointState {
 
 	// --- zoom commits ---
 	std::map<int, ZoomCommit> zoom_commits;
+
+	// --- v3 新增字段 ---
+	// 当前 generation 的 geom 文件列表（世代清理索引化，避免 O(n) 目录扫描）
+	std::vector<std::string> current_gen_files;
+	// 磁盘空间预算（字节），0 表示不限制
+	int64_t disk_budget = 0;
+	// 已使用的 blob 空间（字节，估算值）
+	int64_t blob_size_estimate = 0;
 };
 
 struct TilingRestore {
@@ -231,6 +241,23 @@ class Session {
 	void rmrf(std::string const &path);  // C 递归删除（替代 system("rm -rf")）
 	void clear_workspace();
 	void verify_fingerprint_internal();
+
+	// v3 新增：CRC32 校验
+	bool blob_has_crc() const;  // 当前 state 是否启用 CRC（format_version >= 3）
+	void write_blob_with_crc(std::string const &path, void const *data, size_t len);
+	// 读取整个 blob 文件（含 CRC 校验，返回 data 部分）
+	std::vector<unsigned char> read_blob_with_crc(std::string const &path);
+	// 校验已 mmap 的 blob（data 位于 mmap 区域末尾的 4 字节为 CRC32）
+	bool verify_mmap_crc(void const *mapped, size_t mapped_size, std::string const &path);
+
+	// v3 新增：磁盘空间检查
+	bool check_disk_space(int64_t required_bytes) const;
+
+	// v3 新增：世代清理索引化
+	void cleanup_old_gen_files_indexed();
+
+	// v3 新增：异步 fsync（后台线程）
+	void async_fsync_blob_dir();
 
 	// 进度报告
 	void report_progress(int zoom) const;

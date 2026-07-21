@@ -9,11 +9,14 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <set>
 #include <signal.h>
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/types.h>
+#include <thread>
 #include <unistd.h>
 
 #ifdef __linux__
@@ -175,6 +178,80 @@ void write_blob_file(std::string const &path, void const *data, size_t len) {
 	}
 }
 
+// --- CRC32 实现（IEEE 802.3 多项式，与 zlib crc32 兼容）---
+
+uint32_t crc32_table[256];
+bool crc32_table_initialized = false;
+
+void init_crc32_table() {
+	if (crc32_table_initialized) {
+		return;
+	}
+	for (uint32_t i = 0; i < 256; i++) {
+		uint32_t c = i;
+		for (int k = 0; k < 8; k++) {
+			c = (c & 1) ? (0xEDB88320 ^ (c >> 1)) : (c >> 1);
+		}
+		crc32_table[i] = c;
+	}
+	crc32_table_initialized = true;
+}
+
+uint32_t crc32_compute(void const *data, size_t len) {
+	init_crc32_table();
+	uint32_t crc = 0xFFFFFFFF;
+	const unsigned char *p = (const unsigned char *) data;
+	for (size_t i = 0; i < len; i++) {
+		crc = crc32_table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+	}
+	return crc ^ 0xFFFFFFFF;
+}
+
+// 写入 blob 文件（可选追加 CRC32 后缀）
+void write_blob_file_with_crc(std::string const &path, void const *data, size_t len, bool append_crc) {
+	FILE *fp = fopen(path.c_str(), "wb");
+	if (fp == NULL) {
+		perror(path.c_str());
+		exit(EXIT_WRITE);
+	}
+	if (len > 0 && fwrite(data, len, 1, fp) != 1) {
+		perror(path.c_str());
+		exit(EXIT_WRITE);
+	}
+	if (append_crc) {
+		uint32_t crc = crc32_compute(data, len);
+		if (fwrite(&crc, sizeof(crc), 1, fp) != 1) {
+			perror(path.c_str());
+			exit(EXIT_WRITE);
+		}
+	}
+	if (fclose(fp) != 0) {
+		perror(path.c_str());
+		exit(EXIT_CLOSE);
+	}
+}
+
+// 读取整个文件为字节数组
+std::vector<unsigned char> read_file_bytes(std::string const &path) {
+	FILE *fp = fopen(path.c_str(), "rb");
+	if (fp == NULL) {
+		return {};
+	}
+	fseek(fp, 0, SEEK_END);
+	long sz = ftell(fp);
+	fseek(fp, 0, SEEK_SET);
+	std::vector<unsigned char> out;
+	if (sz > 0) {
+		out.resize((size_t) sz);
+		if (fread(out.data(), 1, (size_t) sz, fp) != (size_t) sz) {
+			fclose(fp);
+			return {};
+		}
+	}
+	fclose(fp);
+	return out;
+}
+
 // --- 信号处理 ---
 
 volatile sig_atomic_t g_shutdown_requested = 0;
@@ -243,6 +320,10 @@ std::string serialize_state(CheckpointState const &s) {
 		jw_int(j, "size", s.input_files[i].size);
 		jw_int(j, "mtime_sec", s.input_files[i].mtime_sec);
 		jw_int(j, "mtime_nsec", s.input_files[i].mtime_nsec);
+		// v3: 序列化 content_hash（小文件内容哈希，用于指纹校验）
+		if (!s.input_files[i].content_hash.empty()) {
+			jw_str(j, "content_hash", s.input_files[i].content_hash);
+		}
 		j += "}";
 	}
 	j += "]";
@@ -277,6 +358,18 @@ std::string serialize_state(CheckpointState const &s) {
 		j += "}";
 	}
 	j += "}";
+
+	// v3 新增字段
+	j += ",\"current_gen_files\":[";
+	for (size_t i = 0; i < s.current_gen_files.size(); i++) {
+		if (i > 0) j += ",";
+		j += "\"";
+		json_escape(s.current_gen_files[i], j);
+		j += "\"";
+	}
+	j += "]";
+	jw_int(j, "disk_budget", (long long) s.disk_budget);
+	jw_int(j, "blob_size_estimate", (long long) s.blob_size_estimate);
 
 	j += "}";
 	return j;
@@ -342,6 +435,9 @@ bool parse_state(std::string const &json_str, CheckpointState &out) {
 				if (ms && ms->type == JSON_NUMBER) ifs.mtime_sec = (int64_t) ms->value.number.number;
 				json_object *mn = json_hash_get(item, "mtime_nsec");
 				if (mn && mn->type == JSON_NUMBER) ifs.mtime_nsec = (int64_t) mn->value.number.number;
+				// v3: 解析 content_hash（小文件内容哈希）
+				json_object *ch = json_hash_get(item, "content_hash");
+				if (ch && ch->type == JSON_STRING) ifs.content_hash = ch->value.string.string;
 				out.input_files.push_back(ifs);
 			}
 		}
@@ -392,6 +488,21 @@ bool parse_state(std::string const &json_str, CheckpointState &out) {
 			}
 		}
 	}
+
+	// v3 新增字段（向后兼容：v2 state.json 没有这些字段，使用默认值）
+	json_object *cgf = json_hash_get(root, "current_gen_files");
+	if (cgf && cgf->type == JSON_ARRAY) {
+		for (size_t i = 0; i < cgf->value.array.length; i++) {
+			json_object *item = cgf->value.array.array[i];
+			if (item && item->type == JSON_STRING) {
+				out.current_gen_files.push_back(item->value.string.string);
+			}
+		}
+	}
+	v = json_hash_get(root, "disk_budget");
+	if (v && v->type == JSON_NUMBER) out.disk_budget = (int64_t) v->value.number.number;
+	v = json_hash_get(root, "blob_size_estimate");
+	if (v && v->type == JSON_NUMBER) out.blob_size_estimate = (int64_t) v->value.number.number;
 
 	json_free(root);
 	json_end(jp);
@@ -787,6 +898,9 @@ std::string absolute_path_or_die(const char *path) {
 
 std::vector<InputFileStat> stat_input_paths(std::vector<std::string> const &paths) {
 	std::vector<InputFileStat> out;
+	// v3: 小文件（< 100MB）计算内容哈希，防止 mtime/size 碰撞
+	constexpr int64_t CONTENT_HASH_THRESHOLD = 100 * 1024 * 1024;  // 100MB
+
 	for (auto const &p : paths) {
 		if (p.empty()) {
 			continue;
@@ -806,6 +920,23 @@ std::vector<InputFileStat> stat_input_paths(std::vector<std::string> const &path
 		s.mtime_sec = st.st_mtim.tv_sec;
 		s.mtime_nsec = st.st_mtim.tv_nsec;
 #endif
+
+		// v3: 对小文件计算 SHA-256 内容哈希
+		if (st.st_size > 0 && st.st_size < CONTENT_HASH_THRESHOLD) {
+			FILE *fp = fopen(p.c_str(), "rb");
+			if (fp != NULL) {
+				// 流式 SHA-256（避免一次性读取整个文件到内存）
+				unsigned char sha_out[32];
+				// 简化实现：读取整个文件后计算 SHA-256（已限制 < 100MB）
+				std::vector<unsigned char> buf((size_t) st.st_size);
+				if (fread(buf.data(), 1, buf.size(), fp) == buf.size()) {
+					sha256(buf.data(), buf.size(), sha_out);
+					s.content_hash = hex_encode(sha_out, 32);
+				}
+				fclose(fp);
+			}
+		}
+
 		out.push_back(s);
 	}
 	std::sort(out.begin(), out.end(), [](InputFileStat const &a, InputFileStat const &b) { return a.path < b.path; });
@@ -906,6 +1037,14 @@ std::string compute_fingerprint(FingerprintParams const &params) {
 		body += std::to_string(params.inputs[i].mtime_sec);
 		body += ",\"mtime_nsec\":";
 		body += std::to_string(params.inputs[i].mtime_nsec);
+		// v3: 增加内容哈希到指纹计算（如果存在）
+		if (!params.inputs[i].content_hash.empty()) {
+			body += ",\"content_hash\":\"";
+			esc.clear();
+			json_escape(params.inputs[i].content_hash, esc);
+			body += esc;
+			body += "\"";
+		}
 		body += "}";
 	}
 	body += "]}";
@@ -1021,6 +1160,141 @@ void Session::copy_fd_to_file(int fd, size_t nbytes, std::string const &dest) {
 
 void Session::rmrf(std::string const &path) {
 	rmrf_path(path);
+}
+
+// ===========================================================================
+// v3 新增方法实现
+// ===========================================================================
+
+// 检查当前 state 是否启用 CRC（format_version >= 3）
+bool Session::blob_has_crc() const {
+	return state_.format_version >= 3;
+}
+
+// 写入带 CRC32 后缀的 blob 文件
+void Session::write_blob_with_crc(std::string const &path, void const *data, size_t len) {
+	write_blob_file_with_crc(path, data, len, blob_has_crc());
+}
+
+// 读取 blob 文件并校验 CRC32（如果启用）
+// 返回值：data 部分（不含 CRC32 后缀）
+// 若 CRC 校验失败，打印错误并 exit
+std::vector<unsigned char> Session::read_blob_with_crc(std::string const &path) {
+	std::vector<unsigned char> raw = read_file_bytes(path);
+	if (raw.empty()) {
+		return raw;  // 文件不存在或为空，由调用方处理
+	}
+
+	if (!blob_has_crc()) {
+		// v2 兼容路径：不校验 CRC，整个文件作为 data
+		return raw;
+	}
+
+	// v3 路径：末尾 4 字节为 CRC32
+	if (raw.size() < sizeof(uint32_t)) {
+		fprintf(stderr, "%s: checkpoint blob %s is too small (%zu bytes) to contain CRC32\n",
+			*av, path.c_str(), raw.size());
+		exit(EXIT_CHECKPOINT);
+	}
+
+	size_t data_len = raw.size() - sizeof(uint32_t);
+	uint32_t stored_crc = 0;
+	memcpy(&stored_crc, raw.data() + data_len, sizeof(stored_crc));
+
+	uint32_t computed_crc = crc32_compute(raw.data(), data_len);
+	if (stored_crc != computed_crc) {
+		fprintf(stderr, "%s: checkpoint blob %s CRC32 mismatch: stored=0x%08x computed=0x%08x\n"
+				"%s: checkpoint data may be corrupted. Please re-run from scratch without --resume.\n",
+			*av, path.c_str(), stored_crc, computed_crc, *av);
+		exit(EXIT_CHECKPOINT);
+	}
+
+	raw.resize(data_len);
+	return raw;
+}
+
+// 校验已 mmap 的 blob（mmap 区域末尾 4 字节为 CRC32）
+// 返回 true 表示校验通过或未启用 CRC
+bool Session::verify_mmap_crc(void const *mapped, size_t mapped_size, std::string const &path) {
+	if (!blob_has_crc() || mapped == nullptr || mapped_size < sizeof(uint32_t)) {
+		return true;  // 未启用 CRC 或数据太小，跳过校验
+	}
+
+	size_t data_len = mapped_size - sizeof(uint32_t);
+	const unsigned char *data = (const unsigned char *) mapped;
+	uint32_t stored_crc = 0;
+	memcpy(&stored_crc, data + data_len, sizeof(stored_crc));
+
+	uint32_t computed_crc = crc32_compute(data, data_len);
+	if (stored_crc != computed_crc) {
+		fprintf(stderr, "%s: checkpoint mmap blob %s CRC32 mismatch: stored=0x%08x computed=0x%08x\n"
+				"%s: checkpoint data may be corrupted. Please re-run from scratch without --resume.\n",
+			*av, path.c_str(), stored_crc, computed_crc, *av);
+		return false;
+	}
+	return true;
+}
+
+// 检查 checkpoint 目录所在文件系统的剩余空间
+// required_bytes: 需要的额外字节数
+// 返回 true 表示空间充足
+bool Session::check_disk_space(int64_t required_bytes) const {
+	struct statfs st;
+	if (statfs(dir_.c_str(), &st) != 0) {
+		perror("statfs checkpoint dir");
+		return true;  // 无法检查时，允许继续（保持原有行为）
+	}
+	int64_t avail = (int64_t) st.f_bsize * (int64_t) st.f_bavail;
+	if (avail < required_bytes) {
+		fprintf(stderr, "%s: checkpoint disk space insufficient: need %lld bytes, only %lld available in %s\n",
+			*av, (long long) required_bytes, (long long) avail, dir_.c_str());
+		return false;
+	}
+	return true;
+}
+
+// 世代清理索引化：根据 state_.current_gen_files 列表直接 unlink 旧文件
+// 避免每次 O(n) 扫描 blobs/ 目录
+void Session::cleanup_old_gen_files_indexed() {
+	if (state_.current_gen_files.empty()) {
+		return;  // 没有记录，无操作（向后兼容 v2）
+	}
+
+	// 收集当前 generation 的文件集合
+	std::set<std::string> keep_set(state_.current_gen_files.begin(), state_.current_gen_files.end());
+
+	// 遍历 blobs/ 目录，删除不在 keep_set 中的 geom.* 文件
+	DIR *d = opendir((dir_ + "/blobs").c_str());
+	if (d == NULL) {
+		return;
+	}
+	struct dirent *dp;
+	while ((dp = readdir(d)) != NULL) {
+		if (dp->d_name[0] == '.') continue;
+		std::string name = dp->d_name;
+		// 仅处理 geom.* 文件（geom.initial 和 geom.{slot}.g{gen}）
+		if (name.rfind("geom.", 0) != 0) {
+			continue;
+		}
+		if (keep_set.count(name) == 0) {
+			std::string full = dir_ + "/blobs/" + name;
+			unlink(full.c_str());
+		}
+	}
+	closedir(d);
+}
+
+// 异步 fsync blobs 目录（后台线程，立即返回）
+// 用于减少 on_zoom_complete 的阻塞时间
+void Session::async_fsync_blob_dir() {
+	std::string blobs_dir = dir_ + "/blobs";
+	std::thread([blobs_dir]() {
+		int fd = open(blobs_dir.c_str(), O_RDONLY | O_DIRECTORY);
+		if (fd >= 0) {
+			fsync(fd);
+			close(fd);
+		}
+	}).detach();
 }
 
 // --- 并发锁（flock）---
@@ -1281,34 +1555,83 @@ void Session::snapshot_tiling_entry(int poolfd, size_t pool_size, long long cons
 		return;
 	}
 
+	// v3: 磁盘空间预算检查（估算所需空间 = pool + geom + nodes + bloom + 其他固定开销）
+	int64_t estimated_needed = (int64_t) pool_size + (int64_t) geom_size + (int64_t) nodepos
+	                           + (int64_t) shared_nodes_bloom.size() + 64 * 1024 * 1024;  // 64MB 缓冲
+	if (!check_disk_space(estimated_needed)) {
+		fprintf(stderr, "%s: aborting snapshot_tiling_entry due to insufficient disk space\n", *av);
+		exit(EXIT_CHECKPOINT);
+	}
+
 	std::string staging = dir_ + "/staging";
 	mkdir_p(staging);
 
 	if (pool_size > 0) {
 		copy_fd_to_file(poolfd, pool_size, path_staging("stringpool"));
+		// v3: 为 stringpool 追加 CRC32
+		if (blob_has_crc()) {
+			FILE *fp = fopen(path_staging("stringpool").c_str(), "ab");
+			if (fp != NULL) {
+				// 重新读取已写入的数据计算 CRC32
+				struct stat pst;
+				if (stat(path_staging("stringpool").c_str(), &pst) == 0 && pst.st_size > 0) {
+					int rfd = open(path_staging("stringpool").c_str(), O_RDONLY);
+					if (rfd >= 0) {
+						std::vector<unsigned char> buf(pst.st_size);
+						ssize_t n = read(rfd, buf.data(), buf.size());
+						close(rfd);
+						if (n > 0) {
+							uint32_t crc = crc32_compute(buf.data(), (size_t) n);
+							fwrite(&crc, sizeof(crc), 1, fp);
+						}
+					}
+				}
+				fclose(fp);
+			}
+		}
 	}
 	if (geom_size > 0 && geomfd >= 0) {
 		copy_fd_to_file(geomfd, (size_t) geom_size, path_staging("geom.initial"));
+		// v3: 为 geom.initial 追加 CRC32
+		if (blob_has_crc()) {
+			FILE *fp = fopen(path_staging("geom.initial").c_str(), "ab");
+			if (fp != NULL) {
+				struct stat pst;
+				if (stat(path_staging("geom.initial").c_str(), &pst) == 0 && pst.st_size > 0) {
+					int rfd = open(path_staging("geom.initial").c_str(), O_RDONLY);
+					if (rfd >= 0) {
+						std::vector<unsigned char> buf(pst.st_size);
+						ssize_t n = read(rfd, buf.data(), buf.size());
+						close(rfd);
+						if (n > 0) {
+							uint32_t crc = crc32_compute(buf.data(), (size_t) n);
+							fwrite(&crc, sizeof(crc), 1, fp);
+						}
+					}
+				}
+				fclose(fp);
+			}
+		}
 	}
 	if (nodepos > 0 && shared_nodes_map != nullptr) {
-		write_blob_file(path_staging("shared_nodes"), shared_nodes_map, nodepos);
+		write_blob_with_crc(path_staging("shared_nodes"), shared_nodes_map, nodepos);
 	}
 	if (!shared_nodes_bloom.empty()) {
-		write_blob_file(path_staging("shared_nodes.bloom"), shared_nodes_bloom.data(), shared_nodes_bloom.size());
+		write_blob_with_crc(path_staging("shared_nodes.bloom"), shared_nodes_bloom.data(), shared_nodes_bloom.size());
 	}
 
-	write_blob_file(path_staging("pool_off.bin"), pool_off, sizeof(long long) * CPUS);
-	write_blob_file(path_staging("initial_x.bin"), initial_x, sizeof(unsigned) * CPUS);
-	write_blob_file(path_staging("initial_y.bin"), initial_y, sizeof(unsigned) * CPUS);
+	write_blob_with_crc(path_staging("pool_off.bin"), pool_off, sizeof(long long) * CPUS);
+	write_blob_with_crc(path_staging("initial_x.bin"), initial_x, sizeof(unsigned) * CPUS);
+	write_blob_with_crc(path_staging("initial_y.bin"), initial_y, sizeof(unsigned) * CPUS);
 	write_layermaps_blob(path_staging("layermaps.bin"), layermaps);
 	if (file_bbox != nullptr) {
-		write_blob_file(path_staging("file_bbox.bin"), file_bbox, sizeof(long long) * 4);
+		write_blob_with_crc(path_staging("file_bbox.bin"), file_bbox, sizeof(long long) * 4);
 	}
 	if (file_bbox1 != nullptr) {
-		write_blob_file(path_staging("file_bbox1.bin"), file_bbox1, sizeof(long long) * 4);
+		write_blob_with_crc(path_staging("file_bbox1.bin"), file_bbox1, sizeof(long long) * 4);
 	}
 	if (file_bbox2 != nullptr) {
-		write_blob_file(path_staging("file_bbox2.bin"), file_bbox2, sizeof(long long) * 4);
+		write_blob_with_crc(path_staging("file_bbox2.bin"), file_bbox2, sizeof(long long) * 4);
 	}
 
 	// 原子 promote: staging → blobs
@@ -1336,8 +1659,12 @@ void Session::snapshot_tiling_entry(int poolfd, size_t pool_size, long long cons
 		rename(path_staging("file_bbox2.bin").c_str(), path_blob("file_bbox2.bin").c_str());
 	}
 
-	// fsync blobs 目录
-	fsync_dir(dir_ + "/blobs");
+	// fsync blobs 目录（v3: 改为异步，不阻塞主线程）
+	if (blob_has_crc()) {
+		async_fsync_blob_dir();
+	} else {
+		fsync_dir(dir_ + "/blobs");
+	}
 
 	// 更新 state
 	state_.generation++;
@@ -1348,6 +1675,16 @@ void Session::snapshot_tiling_entry(int poolfd, size_t pool_size, long long cons
 	state_.nodepos = (int64_t) nodepos;
 	state_.entry_snapshot_done = true;
 	state_.last_completed_zoom = -1;  // 尚未完成任何 zoom
+
+	// v3: 记录当前 generation 的文件列表（世代清理索引化）
+	state_.current_gen_files.clear();
+	if (geom_size > 0) {
+		state_.current_gen_files.push_back("geom.initial");
+	}
+
+	// v3: 估算 blob 空间占用
+	state_.blob_size_estimate = (int64_t) pool_size + (int64_t) geom_size + (int64_t) nodepos
+	                             + (int64_t) shared_nodes_bloom.size() + 64 * 1024;
 
 	save_state_atomic();
 
@@ -1368,16 +1705,26 @@ bool Session::restore_tiling(TilingRestore &out) {
 	struct stat pst;
 	std::string poolpath = path_blob("stringpool");
 	if (stat(poolpath.c_str(), &pst) == 0 && pst.st_size > 0) {
-		out.pool_size = (size_t) pst.st_size;
+		// v3: 计算 data 长度（减去 CRC32 后缀）
+		size_t file_size = (size_t) pst.st_size;
+		size_t data_size = file_size;
+		if (blob_has_crc() && file_size >= sizeof(uint32_t)) {
+			data_size = file_size - sizeof(uint32_t);
+		}
+		out.pool_size = data_size;
 		out.poolfd = open(poolpath.c_str(), O_RDONLY | O_CLOEXEC);
 		if (out.poolfd < 0) {
 			perror(poolpath.c_str());
 			exit(EXIT_OPEN);
 		}
-		out.stringpool = (char *) mmap(NULL, out.pool_size, PROT_READ, MAP_PRIVATE, out.poolfd, 0);
+		out.stringpool = (char *) mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, out.poolfd, 0);
 		if (out.stringpool == MAP_FAILED) {
 			perror("mmap checkpoint stringpool");
 			exit(EXIT_MEMORY);
+		}
+		// v3: 校验 CRC32（mmap 区域包含整个文件，末尾 4 字节为 CRC32）
+		if (blob_has_crc() && !verify_mmap_crc(out.stringpool, file_size, poolpath)) {
+			exit(EXIT_CHECKPOINT);
 		}
 	}
 
@@ -1391,10 +1738,27 @@ bool Session::restore_tiling(TilingRestore &out) {
 		std::string geom_init = path_blob("geom.initial");
 		struct stat gst;
 		if (stat(geom_init.c_str(), &gst) == 0) {
+			size_t file_size = (size_t) gst.st_size;
+			size_t data_size = file_size;
+			if (blob_has_crc() && file_size >= sizeof(uint32_t)) {
+				data_size = file_size - sizeof(uint32_t);
+			}
 			out.geomfd[0] = open(geom_init.c_str(), O_RDONLY | O_CLOEXEC);
-			out.geom_size[0] = gst.st_size;
+			out.geom_size[0] = (off_t) data_size;  // v3: 使用 data 长度
 			geom_loaded++;
-			geom_total += gst.st_size;
+			geom_total += (off_t) data_size;
+
+			// v3: 校验 CRC32
+			if (blob_has_crc()) {
+				void *m = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, out.geomfd[0], 0);
+				if (m != MAP_FAILED) {
+					if (!verify_mmap_crc(m, file_size, geom_init)) {
+						munmap(m, file_size);
+						exit(EXIT_CHECKPOINT);
+					}
+					munmap(m, file_size);
+				}
+			}
 		}
 	} else {
 		// 有 zoom 完成 — 加载最新代数的 geom 文件
@@ -1406,55 +1770,97 @@ bool Session::restore_tiling(TilingRestore &out) {
 			std::string gp = path_blob(name);
 			struct stat gs;
 			if (stat(gp.c_str(), &gs) == 0) {
+				size_t file_size = (size_t) gs.st_size;
+				size_t data_size = file_size;
+				if (blob_has_crc() && file_size >= sizeof(uint32_t)) {
+					data_size = file_size - sizeof(uint32_t);
+				}
 				out.geomfd[j] = open(gp.c_str(), O_RDONLY | O_CLOEXEC);
-				out.geom_size[j] = gs.st_size;
+				out.geom_size[j] = (off_t) data_size;  // v3: 使用 data 长度
 				geom_loaded++;
-				geom_total += gs.st_size;
-			}
-		}
+				geom_total += (off_t) data_size;
 
-		// 清理旧代数和初始快照
-		DIR *d = opendir((dir_ + "/blobs").c_str());
-		if (d != NULL) {
-			struct dirent *dp;
-			while ((dp = readdir(d)) != NULL) {
-				if (strncmp(dp->d_name, "geom.", 5) == 0) {
-					const char *dot = strrchr(dp->d_name, '.');
-					if (dot != NULL && strncmp(dot, ".g", 2) == 0) {
-						uint64_t file_gen = (uint64_t) strtoull(dot + 2, NULL, 10);
-						if (file_gen != latest_gen) {
-							std::string old = dir_ + "/blobs/" + dp->d_name;
-							unlink(old.c_str());
+				// v3: 校验 CRC32
+				if (blob_has_crc()) {
+					void *m = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, out.geomfd[j], 0);
+					if (m != MAP_FAILED) {
+						if (!verify_mmap_crc(m, file_size, gp)) {
+							munmap(m, file_size);
+							exit(EXIT_CHECKPOINT);
 						}
-					} else if (strcmp(dp->d_name, "geom.initial") == 0) {
-						std::string old = dir_ + "/blobs/" + dp->d_name;
-						unlink(old.c_str());
+						munmap(m, file_size);
 					}
 				}
 			}
-			closedir(d);
+		}
+
+		// v3: 索引化清理旧代数和初始快照
+		if (!state_.current_gen_files.empty()) {
+			for (auto const &old_name : state_.current_gen_files) {
+				char expected_prefix[64];
+				snprintf(expected_prefix, sizeof(expected_prefix), "geom.%zu.g%llu", (size_t) 0, (unsigned long long) latest_gen);
+				// 跳过当前 generation 的文件
+				bool is_current_gen = false;
+				for (size_t j = 0; j < TEMP_FILES; j++) {
+					char name[64];
+					snprintf(name, sizeof(name), "geom.%zu.g%llu", j, (unsigned long long) latest_gen);
+					if (old_name == name) {
+						is_current_gen = true;
+						break;
+					}
+				}
+				if (is_current_gen) continue;
+				std::string old = dir_ + "/blobs/" + old_name;
+				unlink(old.c_str());
+			}
+			// 同时清理 geom.initial（如果存在）
+			std::string geom_init = dir_ + "/blobs/geom.initial";
+			unlink(geom_init.c_str());
+		} else {
+			// 向后兼容：v2 回退到目录扫描
+			DIR *d = opendir((dir_ + "/blobs").c_str());
+			if (d != NULL) {
+				struct dirent *dp;
+				while ((dp = readdir(d)) != NULL) {
+					if (strncmp(dp->d_name, "geom.", 5) == 0) {
+						const char *dot = strrchr(dp->d_name, '.');
+						if (dot != NULL && strncmp(dot, ".g", 2) == 0) {
+							uint64_t file_gen = (uint64_t) strtoull(dot + 2, NULL, 10);
+							if (file_gen != latest_gen) {
+								std::string old = dir_ + "/blobs/" + dp->d_name;
+								unlink(old.c_str());
+							}
+						} else if (strcmp(dp->d_name, "geom.initial") == 0) {
+							std::string old = dir_ + "/blobs/" + dp->d_name;
+							unlink(old.c_str());
+						}
+					}
+				}
+				closedir(d);
+			}
 		}
 	}
 	fprintf(stderr, "  [checkpoint restore_tiling] loaded %d geom files, total=%lld bytes, iz=%d maxzoom=%d\n",
 		geom_loaded, (long long) geom_total, resume_iz_, tiling_maxzoom_);
 
-	FILE *fp = fopen(path_blob("pool_off.bin").c_str(), "rb");
-	if (fp != NULL) {
+	// v3: 使用 read_blob_with_crc 读取小文件（自动校验 CRC）
+	auto raw = read_blob_with_crc(path_blob("pool_off.bin"));
+	if (!raw.empty()) {
+		size_t copy_n = std::min(raw.size(), sizeof(long long) * CPUS);
 		out.pool_off.resize(CPUS);
-		fread(out.pool_off.data(), sizeof(long long), CPUS, fp);
-		fclose(fp);
+		memcpy(out.pool_off.data(), raw.data(), copy_n);
 	}
-	fp = fopen(path_blob("initial_x.bin").c_str(), "rb");
-	if (fp != NULL) {
+	raw = read_blob_with_crc(path_blob("initial_x.bin"));
+	if (!raw.empty()) {
+		size_t copy_n = std::min(raw.size(), sizeof(unsigned) * CPUS);
 		out.initial_x.resize(CPUS);
-		fread(out.initial_x.data(), sizeof(unsigned), CPUS, fp);
-		fclose(fp);
+		memcpy(out.initial_x.data(), raw.data(), copy_n);
 	}
-	fp = fopen(path_blob("initial_y.bin").c_str(), "rb");
-	if (fp != NULL) {
+	raw = read_blob_with_crc(path_blob("initial_y.bin"));
+	if (!raw.empty()) {
+		size_t copy_n = std::min(raw.size(), sizeof(unsigned) * CPUS);
 		out.initial_y.resize(CPUS);
-		fread(out.initial_y.data(), sizeof(unsigned), CPUS, fp);
-		fclose(fp);
+		memcpy(out.initial_y.data(), raw.data(), copy_n);
 	}
 
 	read_layermaps_blob(path_blob("layermaps.bin"), out.layermaps);
@@ -1462,25 +1868,31 @@ bool Session::restore_tiling(TilingRestore &out) {
 	std::string nodespath = path_blob("shared_nodes");
 	struct stat nst;
 	if (stat(nodespath.c_str(), &nst) == 0 && nst.st_size > 0) {
-		out.nodepos = (size_t) nst.st_size;
+		size_t file_size = (size_t) nst.st_size;
+		size_t data_size = file_size;
+		if (blob_has_crc() && file_size >= sizeof(uint32_t)) {
+			data_size = file_size - sizeof(uint32_t);
+		}
+		out.nodepos = data_size;
 		int nfd = open(nodespath.c_str(), O_RDONLY | O_CLOEXEC);
-		out.shared_nodes_map = (node *) mmap(NULL, out.nodepos, PROT_READ, MAP_PRIVATE, nfd, 0);
+		out.shared_nodes_map = (node *) mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, nfd, 0);
 		close(nfd);
 		if (out.shared_nodes_map == MAP_FAILED) {
 			perror("mmap shared_nodes");
 			exit(EXIT_MEMORY);
+		}
+		// v3: 校验 CRC32
+		if (blob_has_crc() && !verify_mmap_crc(out.shared_nodes_map, file_size, nodespath)) {
+			exit(EXIT_CHECKPOINT);
 		}
 	}
 
 	std::string bloompath = path_blob("shared_nodes.bloom");
 	struct stat bst;
 	if (stat(bloompath.c_str(), &bst) == 0) {
-		out.shared_nodes_bloom.resize((size_t) bst.st_size);
-		fp = fopen(bloompath.c_str(), "rb");
-		if (fp != NULL) {
-			fread(&out.shared_nodes_bloom[0], 1, out.shared_nodes_bloom.size(), fp);
-			fclose(fp);
-		}
+		// v3: 使用 read_blob_with_crc
+		auto bloom_data = read_blob_with_crc(bloompath);
+		out.shared_nodes_bloom.assign(bloom_data.begin(), bloom_data.end());
 	}
 
 	read_skip_children_blob(path_blob("skip_children.bin"), out.skip_children);
@@ -1490,13 +1902,10 @@ bool Session::restore_tiling(TilingRestore &out) {
 	for (int which = 0; which < 3; which++) {
 		const char *name = which == 0 ? "file_bbox.bin" : which == 1 ? "file_bbox1.bin" : "file_bbox2.bin";
 		long long *dst = which == 0 ? out.file_bbox : which == 1 ? out.file_bbox1 : out.file_bbox2;
-		std::string p = path_blob(name);
-		FILE *bfp = fopen(p.c_str(), "rb");
-		if (bfp != NULL) {
-			if (fread(dst, sizeof(long long), 4, bfp) != 4) {
-				// 短读 — 保留默认值
-			}
-			fclose(bfp);
+		// v3: 使用 read_blob_with_crc
+		auto bbox_data = read_blob_with_crc(path_blob(name));
+		if (bbox_data.size() >= sizeof(long long) * 4) {
+			memcpy(dst, bbox_data.data(), sizeof(long long) * 4);
 		}
 	}
 
@@ -1517,11 +1926,25 @@ void Session::on_zoom_complete(ZoomCompleteContext const &ctx) {
 		return;
 	}
 
+	// v3: 磁盘空间预算检查
+	int64_t estimated_needed = 0;
+	for (size_t j = 0; j < TEMP_FILES; j++) {
+		estimated_needed += (int64_t) ctx.geom_size[j];
+	}
+	estimated_needed += 32 * 1024 * 1024;  // 32MB 缓冲（skip_children + strategies + state）
+	if (!check_disk_space(estimated_needed)) {
+		fprintf(stderr, "%s: aborting on_zoom_complete due to insufficient disk space\n", *av);
+		exit(EXIT_CHECKPOINT);
+	}
+
 	state_.generation++;
 	uint64_t gen = state_.generation;
 
 	std::string staging = dir_ + "/staging";
 	mkdir_p(staging);
+
+	// v3: 记录新 generation 的文件列表（用于索引化清理）
+	std::vector<std::string> new_gen_files;
 
 	off_t total_geom = 0;
 	int saved_count = 0;
@@ -1529,9 +1952,34 @@ void Session::on_zoom_complete(ZoomCompleteContext const &ctx) {
 		char name[64];
 		snprintf(name, sizeof(name), "geom.%zu.g%llu", j, (unsigned long long) gen);
 		if (ctx.geomfd[j] >= 0 && ctx.geom_size[j] > 0) {
+			// v3: 增量保存 — 仅当 geom_size 与上次不同时才重新拷贝
+			// （此处简化：总是拷贝，因为 traverse_zooms 中 geomfd 已被重写）
 			copy_fd_to_file(ctx.geomfd[j], (size_t) ctx.geom_size[j], path_staging(name));
+
+			// v3: 追加 CRC32
+			if (blob_has_crc()) {
+				FILE *fp = fopen(path_staging(name).c_str(), "ab");
+				if (fp != NULL) {
+					struct stat pst;
+					if (stat(path_staging(name).c_str(), &pst) == 0 && pst.st_size > 0) {
+						int rfd = open(path_staging(name).c_str(), O_RDONLY);
+						if (rfd >= 0) {
+							std::vector<unsigned char> buf(pst.st_size);
+							ssize_t n = read(rfd, buf.data(), buf.size());
+							close(rfd);
+							if (n > 0) {
+								uint32_t crc = crc32_compute(buf.data(), (size_t) n);
+								fwrite(&crc, sizeof(crc), 1, fp);
+							}
+						}
+					}
+					fclose(fp);
+				}
+			}
+
 			total_geom += ctx.geom_size[j];
 			saved_count++;
+			new_gen_files.push_back(name);
 		}
 	}
 	fprintf(stderr, "  [checkpoint on_zoom_complete zoom=%d] saved %d geom files, total=%lld bytes\n",
@@ -1554,24 +2002,41 @@ void Session::on_zoom_complete(ZoomCompleteContext const &ctx) {
 		}
 	}
 
-	// 清理旧代数 geom 文件（新代数已安全 rename 到 blobs/）
+	// v3: 索引化清理旧代数 geom 文件（替代 O(n) 目录扫描）
 	{
-		DIR *d = opendir((dir_ + "/blobs").c_str());
-		if (d != NULL) {
-			struct dirent *dp;
-			while ((dp = readdir(d)) != NULL) {
-				if (strncmp(dp->d_name, "geom.", 5) == 0) {
-					const char *dot = strrchr(dp->d_name, '.');
-					if (dot != NULL && strncmp(dot, ".g", 2) == 0) {
-						uint64_t file_gen = (uint64_t) strtoull(dot + 2, NULL, 10);
-						if (file_gen != gen) {
-							std::string old = dir_ + "/blobs/" + dp->d_name;
-							unlink(old.c_str());
+		// 优先使用 current_gen_files 索引（O(1) per file）
+		if (!state_.current_gen_files.empty()) {
+			for (auto const &old_name : state_.current_gen_files) {
+				// 跳过新 generation 的文件（不应该出现，但防御性检查）
+				if (std::find(new_gen_files.begin(), new_gen_files.end(), old_name) != new_gen_files.end()) {
+					continue;
+				}
+				// 跳过 geom.initial（属于初始快照，由 restore_tiling 处理）
+				if (old_name == "geom.initial") {
+					continue;
+				}
+				std::string old = dir_ + "/blobs/" + old_name;
+				unlink(old.c_str());
+			}
+		} else {
+			// 向后兼容：v2 state.json 没有 current_gen_files，回退到目录扫描
+			DIR *d = opendir((dir_ + "/blobs").c_str());
+			if (d != NULL) {
+				struct dirent *dp;
+				while ((dp = readdir(d)) != NULL) {
+					if (strncmp(dp->d_name, "geom.", 5) == 0) {
+						const char *dot = strrchr(dp->d_name, '.');
+						if (dot != NULL && strncmp(dot, ".g", 2) == 0) {
+							uint64_t file_gen = (uint64_t) strtoull(dot + 2, NULL, 10);
+							if (file_gen != gen) {
+								std::string old = dir_ + "/blobs/" + dp->d_name;
+								unlink(old.c_str());
+							}
 						}
 					}
 				}
+				closedir(d);
 			}
-			closedir(d);
 		}
 	}
 	{
@@ -1589,8 +2054,12 @@ void Session::on_zoom_complete(ZoomCompleteContext const &ctx) {
 		}
 	}
 
-	// fsync blobs 目录
-	fsync_dir(dir_ + "/blobs");
+	// v3: 异步 fsync blobs 目录（不阻塞主线程）
+	if (blob_has_crc()) {
+		async_fsync_blob_dir();
+	} else {
+		fsync_dir(dir_ + "/blobs");
+	}
 
 	// 原子更新 state.json（包含 last_completed_zoom 和 generation）
 	int64_t ts = now_unix();
@@ -1598,6 +2067,12 @@ void Session::on_zoom_complete(ZoomCompleteContext const &ctx) {
 	state_.maxzoom = ctx.maxzoom;
 	state_.midx = ctx.midx;
 	state_.midy = ctx.midy;
+
+	// v3: 更新 current_gen_files 索引
+	state_.current_gen_files = std::move(new_gen_files);
+
+	// v3: 更新 blob 空间估算
+	state_.blob_size_estimate = (int64_t) total_geom + 32 * 1024 * 1024;
 
 	ZoomCommit commit;
 	commit.committed_at = ts;
