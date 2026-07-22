@@ -381,6 +381,12 @@ std::string serialize_state(CheckpointState const &s) {
 	jw_int(j, "disk_budget", (long long) s.disk_budget);
 	jw_int(j, "blob_size_estimate", (long long) s.blob_size_estimate);
 
+	// v3.2: tileset metadata（空字符串也写入，便于 resume 时区分"未指定"与"未持久化"）
+	// 注意：旧版本 state.json 没有这些字段，parse_state 会默认为空字符串，行为兼容
+	jw_str(j, "name", s.name);
+	jw_str(j, "description", s.description);
+	jw_str(j, "attribution", s.attribution);
+
 	j += "}";
 	return j;
 }
@@ -513,6 +519,14 @@ bool parse_state(std::string const &json_str, CheckpointState &out) {
 	if (v && v->type == JSON_NUMBER) out.disk_budget = (int64_t) v->value.number.number;
 	v = json_hash_get(root, "blob_size_estimate");
 	if (v && v->type == JSON_NUMBER) out.blob_size_estimate = (int64_t) v->value.number.number;
+
+	// v3.2: tileset metadata（向后兼容：旧 state.json 没有这些字段，默认为空字符串）
+	v = json_hash_get(root, "name");
+	if (v && v->type == JSON_STRING) out.name = v->value.string.string;
+	v = json_hash_get(root, "description");
+	if (v && v->type == JSON_STRING) out.description = v->value.string.string;
+	v = json_hash_get(root, "attribution");
+	if (v && v->type == JSON_STRING) out.attribution = v->value.string.string;
 
 	json_free(root);
 	json_end(jp);
@@ -1583,6 +1597,10 @@ std::unique_ptr<Session> Session::open_new(const char *dir, bool force, Fingerpr
 	s->state_.last_completed_zoom = -1;
 	s->state_.entry_snapshot_done = false;
 	s->state_.generation = 0;
+	// v3.2: 持久化 tileset metadata，resume 时恢复
+	s->state_.name = params.name;
+	s->state_.description = params.description;
+	s->state_.attribution = params.attribution;
 
 	s->save_state_atomic();
 	return s;
@@ -2337,6 +2355,10 @@ ResumeInfo read_resume_info(const char *dir) {
 	info.basezoom = state.basezoom;
 	info.last_completed_zoom = state.last_completed_zoom;
 	info.entry_snapshot_done = state.entry_snapshot_done;
+	// v3.2: 恢复 tileset metadata
+	info.name = state.name;
+	info.description = state.description;
+	info.attribution = state.attribution;
 
 	for (auto const &f : state.input_files) {
 		info.input_files.push_back(f.path);

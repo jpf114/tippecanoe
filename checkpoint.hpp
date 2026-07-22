@@ -57,6 +57,11 @@ struct FingerprintParams {
 	int prevent[256]{};
 	int additional[256]{};
 	std::vector<InputFileStat> inputs;
+	// v3.2: tileset metadata 字段（不参与指纹计算，仅用于持久化到 state.json）
+	// 指纹通过 normalized_cmd 隐式包含 -n/-N/-A 参数
+	std::string name;          // -n / tilename
+	std::string description;   // -N
+	std::string attribution;   // -A
 };
 
 // 单个 zoom 的提交记录
@@ -106,6 +111,13 @@ struct CheckpointState {
 	int64_t disk_budget = 0;
 	// 已使用的 blob 空间（字节，估算值）
 	int64_t blob_size_estimate = 0;
+
+	// --- v3.2 新增字段：tileset metadata（用于 resume 时恢复） ---
+	// 这些字段不参与指纹计算（指纹通过 normalized_cmd 隐式包含 -n/-N/-A）
+	// 空字符串表示用户未指定，resume 时不覆盖默认行为
+	std::string name;          // -n / tilename
+	std::string description;   // -N
+	std::string attribution;   // -A
 };
 
 struct TilingRestore {
@@ -162,6 +174,10 @@ struct ResumeInfo {
 	bool entry_snapshot_done = false;
 	std::string original_cmd;
 	std::string normalized_cmd;
+	// v3.2: tileset metadata（空字符串表示原命令未指定，不覆盖）
+	std::string name;
+	std::string description;
+	std::string attribution;
 };
 
 // ---------------------------------------------------------------------------

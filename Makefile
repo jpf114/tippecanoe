@@ -673,6 +673,37 @@ checkpoint-test: tippecanoe
 	./tippecanoe -q -z3 -o /tmp/tippecanoe-checkpoint-clean/out.mbtiles --checkpoint-dir=/tmp/tippecanoe-checkpoint-clean/cp tests/onefeature/in.json
 	./tippecanoe -q --resume=/tmp/tippecanoe-checkpoint-clean/cp
 	sqlite3 /tmp/tippecanoe-checkpoint-clean/out.mbtiles 'SELECT COUNT(*) FROM map;' | grep -q '^[1-9]'
+	# 9) v3.2 G-1 fix: name/description/attribution must persist to state.json and
+	#    be restored during resume. Run with -n/-N/-A, kill -9 mid-run, resume,
+	#    then verify mbtiles metadata matches a baseline (no interrupt) run.
+	rm -rf /tmp/tippecanoe-checkpoint-metadata
+	mkdir -p /tmp/tippecanoe-checkpoint-metadata
+	# Baseline (no interrupt)
+	./tippecanoe -q -z12 -f -n "MetaName" -N "MetaDesc" -A "MetaAttr" -o /tmp/tippecanoe-checkpoint-metadata/baseline.mbtiles tests/ne_110m_populated_places/in.json
+	# Interrupted run with checkpoint (same -z12, kill -9 mid-run)
+	TIPPECANOE_MAX_THREADS=1 ./tippecanoe -q -f -z12 -n "MetaName" -N "MetaDesc" -A "MetaAttr" --checkpoint-dir=/tmp/tippecanoe-checkpoint-metadata/cp -o /tmp/tippecanoe-checkpoint-metadata/out.mbtiles tests/ne_110m_populated_places/in.json & echo $$! > /tmp/tippecanoe-checkpoint-metadata/pid
+	# Poll for first zoom commit, then kill (ensures kill catches mid-run)
+	for i in $$(seq 1 60); do \
+	    if [ -f /tmp/tippecanoe-checkpoint-metadata/cp/state.json ] && \
+	       grep -q '"last_completed_zoom":[0-9]' /tmp/tippecanoe-checkpoint-metadata/cp/state.json 2>/dev/null; then \
+	        break; \
+	    fi; \
+	    sleep 0.5; \
+	done
+	kill -9 `cat /tmp/tippecanoe-checkpoint-metadata/pid` 2>/dev/null || true
+	wait `cat /tmp/tippecanoe-checkpoint-metadata/pid` 2>/dev/null || true
+	# state.json must contain the metadata fields
+	grep -q '"name":"MetaName"' /tmp/tippecanoe-checkpoint-metadata/cp/state.json
+	grep -q '"description":"MetaDesc"' /tmp/tippecanoe-checkpoint-metadata/cp/state.json
+	grep -q '"attribution":"MetaAttr"' /tmp/tippecanoe-checkpoint-metadata/cp/state.json
+	# Resume
+	./tippecanoe -q --resume=/tmp/tippecanoe-checkpoint-metadata/cp
+	# mbtiles metadata must match baseline
+	test "$$(sqlite3 /tmp/tippecanoe-checkpoint-metadata/out.mbtiles 'SELECT value FROM metadata WHERE name='"'"'name'"'"';')" = "MetaName"
+	test "$$(sqlite3 /tmp/tippecanoe-checkpoint-metadata/out.mbtiles 'SELECT value FROM metadata WHERE name='"'"'description'"'"';')" = "MetaDesc"
+	test "$$(sqlite3 /tmp/tippecanoe-checkpoint-metadata/out.mbtiles 'SELECT value FROM metadata WHERE name='"'"'attribution'"'"';')" = "MetaAttr"
+	# Tile count must match baseline (data not lost during interrupt/resume)
+	test "$$(sqlite3 /tmp/tippecanoe-checkpoint-metadata/out.mbtiles 'SELECT COUNT(*) FROM map;')" = "$$(sqlite3 /tmp/tippecanoe-checkpoint-metadata/baseline.mbtiles 'SELECT COUNT(*) FROM map;')"
 
 layer-json-test: tippecanoe tippecanoe-decode
 	# GeoJSON with description and named layer

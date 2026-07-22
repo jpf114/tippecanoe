@@ -3998,6 +3998,19 @@ int main(int argc, char **argv) {
 		maxzoom = info.maxzoom;
 		minzoom = info.minzoom;
 
+		// v3.2: 恢复 tileset metadata（name / description / attribution）
+		// 仅当 checkpoint 中持久化了对应字段时才覆盖命令行传入的值
+		// （持久化为空字符串表示用户原本就未指定 -n/-N/-A，与本地变量 NULL 一致）
+		if (!info.name.empty()) {
+			name = strdup(info.name.c_str());
+		}
+		if (!info.description.empty()) {
+			description = strdup(info.description.c_str());
+		}
+		if (!info.attribution.empty()) {
+			attribution = strdup(info.attribution.c_str());
+		}
+
 		// Recalculate geometry_scale since maxzoom/minzoom changed from defaults
 		if (extra_detail >= 0 || prevent[P_SIMPLIFY_SHARED_NODES] || additional[A_EXTEND_ZOOMS] || extend_zooms_max > 0) {
 			geometry_scale = 0;
@@ -4110,6 +4123,10 @@ int main(int argc, char **argv) {
 	fingerprint.cpus = CPUS;
 	memcpy(fingerprint.prevent, prevent, sizeof(prevent));
 	memcpy(fingerprint.additional, additional, sizeof(additional));
+	// v3.2: 持久化 tileset metadata（-n / -N / -A），resume 时恢复
+	if (name != NULL) fingerprint.name = name;
+	if (description != NULL) fingerprint.description = description;
+	if (attribution != NULL) fingerprint.attribution = attribution;
 	std::vector<std::string> input_paths;
 	for (size_t a = 0; a < sources.size(); a++) {
 		if (!sources[a].file.empty()) {
