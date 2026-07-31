@@ -3112,9 +3112,6 @@ void *run_thread(void *vargs) {
 		std::atomic<long long> geompos(0);
 		long long prevgeom = 0;
 
-		int features_in_slot = 0;
-		int tiles_written_from_slot = 0;
-
 		while (1) {
 			int z;
 			unsigned x, y;
@@ -3132,12 +3129,6 @@ void *run_thread(void *vargs) {
 			dc.deserialize_uint(&x, &geompos);
 			dc.deserialize_uint(&y, &geompos);
 
-			features_in_slot++;
-			if (features_in_slot == 1) {
-				fprintf(stderr, "  [tile first z=%d x=%u y=%u thread=%zu zoom=%d slot=%d compressed=%d]\n",
-					z, x, y, arg->threadno, arg->zoom, j, arg->compressed);
-			}
-
 			if (arg->compressed) {
 				dc.begin();
 			}
@@ -3151,10 +3142,6 @@ void *run_thread(void *vargs) {
 			} else {
 				arg->wrote_zoom = z;
 				len = write_tile(&dc, &geompos, arg->global_stringpool, z, x, y, z == arg->maxzoom ? arg->full_detail : arg->low_detail, arg->min_detail, arg->outdb, arg->outdir, arg->buffer, arg->fname, arg->geomfile, arg->geompos, arg->minzoom, arg->maxzoom, arg->todo, arg->along, geompos, arg->gamma, arg->child_shards, arg->pool_off, arg->initial_x, arg->initial_y, arg->running, arg->simplification, arg->layermaps, arg->layer_unmaps, arg->tiling_seg, arg->pass, arg->mingap, arg->minextent, arg->mindrop_sequence, arg->minattribute, arg->prefilter, arg->postfilter, arg->filter, arg, arg->strategy, arg->compressed, arg->shared_nodes_map, arg->nodepos, *(arg->shared_nodes_bloom), (*arg->unidecode_data), estimated_complexity, arg->skip_children_out);
-				tiles_written_from_slot++;
-				if (features_in_slot <= 3) {
-					fprintf(stderr, "  [tile result z=%d x=%u y=%u len=%lld compressed=%d]\n", z, x, y, (long long)len, arg->compressed);
-				}
 			}
 
 			if (pthread_mutex_lock(&var_lock) != 0) {
@@ -3210,8 +3197,6 @@ void *run_thread(void *vargs) {
 			arg->geomfd[j] = newfd;
 		}
 
-		fprintf(stderr, "  [tile thread=%zu zoom=%d slot=%d] features=%d tiles=%d\n", arg->threadno, arg->zoom, j, features_in_slot, tiles_written_from_slot);
-
 		if (fclose(geom) != 0) {
 			perror("close geom");
 			exit(EXIT_CLOSE);
@@ -3222,7 +3207,7 @@ void *run_thread(void *vargs) {
 	return err_or_null;
 }
 
-int traverse_zooms(int *geomfd, off_t *geom_size, char *global_stringpool, std::atomic<unsigned> *midx, std::atomic<unsigned> *midy, int &maxzoom, int minzoom, sqlite3 *outdb, const char *outdir, int buffer, const char *fname, const char *tmpdir, double gamma, int full_detail, int low_detail, int min_detail, long long *pool_off, unsigned *initial_x, unsigned *initial_y, double simplification, double maxzoom_simplification, std::vector<std::map<std::string, layermap_entry>> &layermaps, const char *prefilter, const char *postfilter, std::unordered_map<std::string, attribute_op> const *attribute_accum, json_object *filter, std::vector<strategy> &strategies, int iz, node *shared_nodes_map, size_t nodepos, std::string const &shared_nodes_bloom, int basezoom, double droprate, std::vector<std::string> const &unidecode_data, std::string const *drop_by_attribute_as_needed_attribute, bool drop_by_attribute_descending, std::set<zxy> const *initial_skip_children, checkpoint::Session *session) {
+int traverse_zooms(int *geomfd, off_t *geom_size, char *global_stringpool, std::atomic<unsigned> *midx, std::atomic<unsigned> *midy, int &maxzoom, int minzoom, sqlite3 *outdb, const char *outdir, int buffer, const char *fname, const char *tmpdir, double gamma, int full_detail, int low_detail, int min_detail, long long *pool_off, unsigned *initial_x, unsigned *initial_y, double simplification, double maxzoom_simplification, std::vector<std::map<std::string, layermap_entry>> &layermaps, const char *prefilter, const char *postfilter, std::unordered_map<std::string, attribute_op> const *attribute_accum, json_object *filter, std::vector<strategy> &strategies, int iz, node *shared_nodes_map, size_t nodepos, std::string const &shared_nodes_bloom, int basezoom, double droprate, std::vector<std::string> const &unidecode_data, std::string const *drop_by_attribute_as_needed_attribute, bool drop_by_attribute_descending, std::set<zxy> const *initial_skip_children, checkpoint::Session *session, bool initial_compressed) {
 	last_progress = 0;
 
 	// The existing layermaps are one table per input thread.
@@ -3421,7 +3406,13 @@ int traverse_zooms(int *geomfd, off_t *geom_size, char *global_stringpool, std::
 				args[thread].still_dropping = false;
 				args[thread].strategy = &strategy;
 				args[thread].zoom = z;
-				args[thread].compressed = (z != minzoom);
+				// At z == iz the geomfd holds uncompressed data (the original input
+				// pool, kept uncompressed so the sort/fixup can rewrite features).
+				// At z > iz it holds compressed data written out during the previous
+				// zoom.  When resuming from a checkpoint at iz = last_completed_zoom+1,
+				// even the first zoom's data is already compressed, so the caller must
+				// pass initial_compressed=true for that case.
+				args[thread].compressed = (z != iz) || initial_compressed;
 				args[thread].shared_nodes_map = shared_nodes_map;
 				args[thread].nodepos = nodepos;
 				args[thread].shared_nodes_bloom = &shared_nodes_bloom;

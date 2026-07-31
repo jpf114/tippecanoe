@@ -1243,7 +1243,7 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 		std::vector<strategy> strategies = std::move(restored.strategies);
 		std::vector<std::map<std::string, layermap_entry>> layermaps = std::move(restored.layermaps);
 
-		int written = traverse_zooms(restored.geomfd.data(), restored.geom_size.data(), restored.stringpool, &midx, &midy, maxzoom, minzoom, outdb, outdir, buffer, fname, tmpdir, gamma, full_detail, low_detail, min_detail, restored.pool_off.data(), restored.initial_x.data(), restored.initial_y.data(), simplification, maxzoom_simplification, layermaps, prefilter, postfilter, attribute_accum, filter, strategies, restored.iz, restored.shared_nodes_map, restored.nodepos, restored.shared_nodes_bloom, basezoom, droprate, unidecode_data, &drop_by_attribute_as_needed_attribute, drop_by_attribute_descending, &restored.skip_children, checkpoint_session);
+		int written = traverse_zooms(restored.geomfd.data(), restored.geom_size.data(), restored.stringpool, &midx, &midy, maxzoom, minzoom, outdb, outdir, buffer, fname, tmpdir, gamma, full_detail, low_detail, min_detail, restored.pool_off.data(), restored.initial_x.data(), restored.initial_y.data(), simplification, maxzoom_simplification, layermaps, prefilter, postfilter, attribute_accum, filter, strategies, restored.iz, restored.shared_nodes_map, restored.nodepos, restored.shared_nodes_bloom, basezoom, droprate, unidecode_data, &drop_by_attribute_as_needed_attribute, drop_by_attribute_descending, &restored.skip_children, checkpoint_session, restored.initial_compressed);
 
 		if (maxzoom != written) {
 			if (written > minzoom) {

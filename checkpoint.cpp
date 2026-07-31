@@ -2029,6 +2029,10 @@ bool Session::restore_tiling(TilingRestore &out) {
 	out.basezoom = tiling_basezoom_;
 	out.midx = tiling_midx_;
 	out.midy = tiling_midy_;
+	// If at least one zoom was committed, resume_iz_ = last_completed_zoom+1 and
+	// the restored geomfd contains compressed data written during that zoom.
+	// Otherwise resume_iz_ == the original iz and the data is uncompressed.
+	out.initial_compressed = (last_completed_zoom_ >= 0);
 
 	return true;
 }

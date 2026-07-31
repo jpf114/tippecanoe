@@ -141,6 +141,11 @@ struct TilingRestore {
 	int minzoom = 0;
 	int maxzoom = 0;
 	int basezoom = 0;
+	// Whether the geomfd data at z == iz is already compressed.
+	// False on a fresh start (iz is the original input zoom, data uncompressed).
+	// True when resuming after at least one zoom completed (iz = last_completed_zoom+1,
+	// data is the compressed output written during the previous zoom).
+	bool initial_compressed = false;
 	// Data global bbox in z=32 pixel coordinates, used to reconstruct
 	// metadata.bounds / antimeridian_adjusted_bounds on resume.
 	long long file_bbox[4] = {UINT_MAX, UINT_MAX, 0, 0};
