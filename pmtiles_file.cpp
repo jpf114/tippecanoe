@@ -8,6 +8,7 @@
 #include <sqlite3.h>
 #include "errors.hpp"
 #include "pmtiles_file.hpp"
+#include "projection.hpp"
 #include "mvt.hpp"
 #include "write_json.hpp"
 #include "main.hpp"
@@ -112,6 +113,15 @@ std::string metadata_to_pmtiles_json(metadata m) {
 
 	out(state, "generator", m.generator);
 	out(state, "generator_options", m.generator_options);
+	const char *matrix_crs = NULL;
+	double matrix_ox = 0, matrix_oy = 0, matrix_z0 = 0;
+	if (output_tile_matrix_meta(&matrix_crs, &matrix_ox, &matrix_oy, &matrix_z0)) {
+		out(state, "crs", matrix_crs);
+		out(state, "tile_origin_upper_left_x", std::to_string(matrix_ox));
+		out(state, "tile_origin_upper_left_y", std::to_string(matrix_oy));
+		out(state, "tile_dimension_zoom_0", std::to_string(matrix_z0));
+	}
+
 
 	std::string bounds2 = std::to_string(m.minlon2) + "," + std::to_string(m.minlat2) + "," + std::to_string(m.maxlon2) + "," + std::to_string(m.maxlat2);
 	out(state, "antimeridian_adjusted_bounds", bounds2);

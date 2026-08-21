@@ -1264,14 +1264,14 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 
 		double minlat = 0, minlon = 0, maxlat = 0, maxlon = 0, midlat = 0, midlon = 0;
 		// center from the resume mid-tile (matches normal-path center convention)
-		tile2lonlat(midx, midy, maxzoom, &minlon, &maxlat);
-		tile2lonlat(midx + 1, midy + 1, maxzoom, &maxlon, &minlat);
+		unproject_output_ll(midx, midy, maxzoom, &minlon, &maxlat);
+		unproject_output_ll(midx + 1, midy + 1, maxzoom, &maxlon, &minlat);
 		midlat = (maxlat + minlat) / 2;
 		midlon = (maxlon + minlon) / 2;
 
 		// data bounds from the persisted z=32 pixel bbox
-		tile2lonlat(file_bbox[0], file_bbox[1], 32, &minlon, &maxlat);
-		tile2lonlat(file_bbox[2], file_bbox[3], 32, &maxlon, &minlat);
+		unproject_output_ll(file_bbox[0], file_bbox[1], 32, &minlon, &maxlat);
+		unproject_output_ll(file_bbox[2], file_bbox[3], 32, &maxlon, &minlat);
 
 		if (midlat < minlat) {
 			midlat = minlat;
@@ -1289,11 +1289,11 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 		// antimeridian-aware bounding box
 		double minlat2 = 0, minlon2 = 0, maxlat2 = 0, maxlon2 = 0;
 		if (file_bbox2[2] - file_bbox2[0] < file_bbox1[2] - file_bbox1[0]) {
-			tile2lonlat(file_bbox2[0], file_bbox2[1], 32, &minlon2, &maxlat2);
-			tile2lonlat(file_bbox2[2], file_bbox2[3], 32, &maxlon2, &minlat2);
+			unproject_output_ll(file_bbox2[0], file_bbox2[1], 32, &minlon2, &maxlat2);
+			unproject_output_ll(file_bbox2[2], file_bbox2[3], 32, &maxlon2, &minlat2);
 		} else {
-			tile2lonlat(file_bbox1[0], file_bbox1[1], 32, &minlon2, &maxlat2);
-			tile2lonlat(file_bbox1[2], file_bbox1[3], 32, &maxlon2, &minlat2);
+			unproject_output_ll(file_bbox1[0], file_bbox1[1], 32, &minlon2, &maxlat2);
+			unproject_output_ll(file_bbox1[2], file_bbox1[3], 32, &maxlon2, &minlat2);
 		}
 
 		std::map<std::string, layermap_entry> merged_lm = merge_layermaps(layermaps);
@@ -2133,7 +2133,7 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 
 #if 0
 				double lon, lat;
-				tile2lonlat(x, y, 32, &lon, &lat);
+				unproject_output_ll(x, y, 32, &lon, &lat);
 				printf("{\"type\":\"Feature\", \"properties\":{}, \"geometry\":{\"type\":\"Point\", \"coordinates\":[%f,%f]}}\n", lon, lat);
 #endif
 
@@ -2249,7 +2249,7 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 				unsigned wx, wy;
 				decode_quadkey(here.index, &wx, &wy);
 				double lon, lat;
-				tile2lonlat(wx, wy, 32, &lon, &lat);
+				unproject_output_ll(wx, wy, 32, &lon, &lat);
 				printf("{\"type\":\"Feature\", \"properties\":{}, \"geometry\":{\"type\":\"Point\", \"coordinates\":[%f,%f]}}\n", lon, lat);
 #endif
 			}
@@ -2902,14 +2902,14 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 	// mbtiles-style bounding box and center
 	double minlat = 0, minlon = 0, maxlat = 0, maxlon = 0, midlat = 0, midlon = 0;
 
-	tile2lonlat(midx, midy, maxzoom, &minlon, &maxlat);
-	tile2lonlat(midx + 1, midy + 1, maxzoom, &maxlon, &minlat);
+	unproject_output_ll(midx, midy, maxzoom, &minlon, &maxlat);
+	unproject_output_ll(midx + 1, midy + 1, maxzoom, &maxlon, &minlat);
 
 	midlat = (maxlat + minlat) / 2;
 	midlon = (maxlon + minlon) / 2;
 
-	tile2lonlat(file_bbox[0], file_bbox[1], 32, &minlon, &maxlat);
-	tile2lonlat(file_bbox[2], file_bbox[3], 32, &maxlon, &minlat);
+	unproject_output_ll(file_bbox[0], file_bbox[1], 32, &minlon, &maxlat);
+	unproject_output_ll(file_bbox[2], file_bbox[3], 32, &maxlon, &minlat);
 
 	if (midlat < minlat) {
 		midlat = minlat;
@@ -2928,11 +2928,11 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 	double minlat2 = 0, minlon2 = 0, maxlat2 = 0, maxlon2 = 0;
 	// choose whichever of the two calculated bboxes is narrower
 	if (file_bbox2[2] - file_bbox2[0] < file_bbox1[2] - file_bbox1[0]) {
-		tile2lonlat(file_bbox2[0], file_bbox2[1], 32, &minlon2, &maxlat2);
-		tile2lonlat(file_bbox2[2], file_bbox2[3], 32, &maxlon2, &minlat2);
+		unproject_output_ll(file_bbox2[0], file_bbox2[1], 32, &minlon2, &maxlat2);
+		unproject_output_ll(file_bbox2[2], file_bbox2[3], 32, &maxlon2, &minlat2);
 	} else {
-		tile2lonlat(file_bbox1[0], file_bbox1[1], 32, &minlon2, &maxlat2);
-		tile2lonlat(file_bbox1[2], file_bbox1[3], 32, &maxlon2, &minlat2);
+		unproject_output_ll(file_bbox1[0], file_bbox1[1], 32, &minlon2, &maxlat2);
+		unproject_output_ll(file_bbox1[2], file_bbox1[3], 32, &maxlon2, &minlat2);
 	}
 
 	std::map<std::string, layermap_entry> merged_lm = merge_layermaps(layermaps);
@@ -3168,6 +3168,7 @@ int main(int argc, char **argv) {
 
 		{"Projection of input", 0, 0, 0},
 		{"projection", required_argument, 0, 's'},
+		{"output-projection", required_argument, 0, '~'},
 
 		{"Zoom levels", 0, 0, 0},
 		{"maximum-zoom", required_argument, 0, 'z'},
@@ -3365,7 +3366,9 @@ int main(int argc, char **argv) {
 
 		case '~': {
 			const char *opt = long_options[option_index].name;
-			if (strcmp(opt, "tile-stats-attributes-limit") == 0) {
+			if (strcmp(opt, "output-projection") == 0) {
+				set_output_projection_or_exit(optarg);
+			} else if (strcmp(opt, "tile-stats-attributes-limit") == 0) {
 				max_tilestats_attributes = atoi(optarg);
 			} else if (strcmp(opt, "tile-stats-sample-values-limit") == 0) {
 				max_tilestats_sample_values = atoi(optarg);
@@ -3844,8 +3847,8 @@ int main(int argc, char **argv) {
 	// the same no matter what order the projection and bounding box are
 	// specified in
 	for (auto &c : clipbboxes) {
-		projection->project(c.lon1, c.lat1, 32, &c.minx, &c.maxy);
-		projection->project(c.lon2, c.lat2, 32, &c.maxx, &c.miny);
+		project_input(c.lon1, c.lat1, 32, &c.minx, &c.maxy);
+		project_input(c.lon2, c.lat2, 32, &c.maxx, &c.miny);
 	}
 
 	if (max_tilestats_sample_values < max_tilestats_values) {

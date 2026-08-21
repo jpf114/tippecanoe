@@ -926,7 +926,7 @@ drawvec polygon_to_anchor(const drawvec &geom) {
 
 				if (goodness <= 0) {
 					double lon, lat;
-					tile2lonlat(d.x, d.y, 32, &lon, &lat);
+					unproject_output_ll(d.x, d.y, 32, &lon, &lat);
 
 					static std::atomic<long long> warned(0);
 					if (warned++ < 10) {

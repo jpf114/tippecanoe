@@ -13,6 +13,7 @@
 #include "jsonpull/jsonpull.h"
 #include "mbtiles.hpp"
 #include "dirtiles.hpp"
+#include "projection.hpp"
 #include "errors.hpp"
 #include "write_json.hpp"
 
@@ -326,6 +327,15 @@ void dir_write_metadata(const char *outdir, const metadata &m) {
 		out(state, "format", m.format);
 		out(state, "generator", m.generator);
 		out(state, "generator_options", m.generator_options);
+		const char *matrix_crs = NULL;
+		double matrix_ox = 0, matrix_oy = 0, matrix_z0 = 0;
+		if (output_tile_matrix_meta(&matrix_crs, &matrix_ox, &matrix_oy, &matrix_z0)) {
+			out(state, "crs", matrix_crs);
+			out(state, "tile_origin_upper_left_x", std::to_string(matrix_ox));
+			out(state, "tile_origin_upper_left_y", std::to_string(matrix_oy));
+			out(state, "tile_dimension_zoom_0", std::to_string(matrix_z0));
+		}
+
 
 		if (m.vector_layers_json.size() > 0 || m.tilestats_json.size() > 0) {
 			std::string json = "{";

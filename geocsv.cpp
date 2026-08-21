@@ -86,7 +86,7 @@ void parse_geocsv(std::vector<struct serialization_state> &sst, std::string fnam
 		double lat = atof(line[latcol].c_str());
 
 		long long x, y;
-		projection->project(lon, lat, 32, &x, &y);
+		project_input(lon, lat, 32, &x, &y);
 		drawvec dv;
 		dv.push_back(draw(VT_MOVETO, x, y));
 

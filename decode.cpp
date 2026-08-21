@@ -345,6 +345,11 @@ void decode(char *fname, int z, unsigned x, unsigned y, std::set<std::string> co
 					fprintf(stderr, "Corrupt mbtiles file: null metadata\n");
 					exit(EXIT_SQLITE);
 				}
+				// Recognize the CRS written for equirectangular (EPSG:4490-style) tile sets
+				if (strcmp((char const *) name, "crs") == 0 && projection == &projections[0]) {
+					set_projection_or_exit((char *) value);
+				}
+
 
 				if (exclude_meta.count((char *) name) == 0) {
 					if (within) {

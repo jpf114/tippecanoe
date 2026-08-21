@@ -38,6 +38,7 @@ $ brew install tippecanoe
 .RE
 .PP
 On Ubuntu it will usually be easiest to build from the source repository:
+A fully static build (no runtime dependency on shared libraries) is produced with \fB\fCmake LDFLAGS=\-static\fR\&. Ready\-to\-run variants are kept in \fB\fCbuild/dynamic/\fR (dynamically linked) and \fB\fCbuild/static/\fR (statically linked).
 .PP
 .RS
 .nf
@@ -393,10 +394,12 @@ parallel processing of input will be invoked automatically, splitting at record 
 than at all newlines.
 .PP
 Parallel processing will also be automatic if the input file is in FlatGeobuf format.
-.SS Projection of input
+.SS Input and output projections
 .RS
 .IP \(bu 2
-\fB\fC\-s\fR \fIprojection\fP or \fB\fC\-\-projection=\fR\fIprojection\fP: Specify the projection of the input data. Currently supported are \fB\fCEPSG:4326\fR (WGS84, the default) and \fB\fCEPSG:3857\fR (Web Mercator). In general you should use WGS84 for your input files if at all possible.
+\fB\fC\-s\fR \fIprojection\fP or \fB\fC\-\-projection=\fR\fIprojection\fP: Specify the projection of the input data. Currently supported are \fB\fCEPSG:4326\fR (WGS84, the default), \fB\fCEPSG:4490\fR (CGCS2000), and \fB\fCEPSG:3857\fR (Web Mercator). In general you should use WGS84 for your input files if at all possible.
+.IP \(bu 2
+\fB\fC\-\-output\-projection=\fR\fIprojection\fP: Specify the projection of the output tile grid. Supported are \fB\fCEPSG:3857\fR (Web Mercator, the default) and \fB\fCEPSG:4490\fR (CGCS2000). \fB\fCEPSG:4490\fR output uses an equirectangular tile grid (2^z columns by 2^(z\-1) rows per zoom level, linear in latitude) instead of the Web Mercator grid, and records crs, tile_origin_upper_left_x, tile_origin_upper_left_y, and tile_dimension_zoom_0 metadata rows so consumers can identify the grid. If not specified, the output grid follows \fB\fC\-s\fR: \fB\fC\-s EPSG:4490\fR produces the equirectangular grid; any other \fB\fC\-s\fR keeps Web Mercator. Any input/output combination is supported: geographic input (\fB\fCEPSG:4326\fR/\fB\fCEPSG:4490\fR, degrees) goes straight into the chosen grid, while \fB\fCEPSG:3857\fR input (Web Mercator meters) is first converted back to longitude/latitude when the output grid is \fB\fCEPSG:4490\fR. \fB\fCtippecanoe\-decode\fR recognizes equirectangular tilesets automatically from their crs metadata row.
 .RE
 .SS Zoom levels
 .RS
@@ -1155,7 +1158,7 @@ resolutions.
 .SS Options
 .RS
 .IP \(bu 2
-\fB\fC\-s\fR \fIprojection\fP or \fB\fC\-\-projection=\fR\fIprojection\fP: Specify the projection of the output data. Currently supported are EPSG:4326 (WGS84, the default) and EPSG:3857 (Web Mercator).
+\fB\fC\-s\fR \fIprojection\fP or \fB\fC\-\-projection=\fR\fIprojection\fP: Specify the projection of the tileset grid. Currently supported are EPSG:4326 (WGS84, the default), EPSG:4490 (CGCS2000), and EPSG:3857 (Web Mercator). EPSG:4490 tilesets (equirectangular grid) are also detected automatically from the crs metadata row.
 .IP \(bu 2
 \fB\fC\-z\fR \fImaxzoom\fP or \fB\fC\-\-maximum\-zoom=\fR\fImaxzoom\fP: Specify the highest zoom level to decode from the tileset
 .IP \(bu 2

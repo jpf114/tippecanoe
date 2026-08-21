@@ -101,7 +101,7 @@ drawvec readPoint(std::vector<long long> &coords, size_t dim, double e) {
 	ensureDim(dim);
 
 	long long x, y;
-	projection->project(coords[0] / e, coords[1] / e, 32, &x, &y);
+	project_input(coords[0] / e, coords[1] / e, 32, &x, &y);
 	drawvec dv;
 	dv.push_back(draw(VT_MOVETO, x, y));
 	return dv;
@@ -128,7 +128,7 @@ drawvec readLinePart(std::vector<long long> &coords, size_t dim, double e, size_
 		}
 
 		long long x, y;
-		projection->project(p[0], p[1], 32, &x, &y);
+		project_input(p[0], p[1], 32, &x, &y);
 
 		if (i == start) {
 			dv.push_back(draw(VT_MOVETO, x, y));

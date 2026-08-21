@@ -11,9 +11,10 @@ unsigned long long (*encode_index)(unsigned int wx, unsigned int wy) = NULL;
 void (*decode_index)(unsigned long long index, unsigned *wx, unsigned *wy) = NULL;
 
 struct projection projections[] = {
-	{"EPSG:4326", lonlat2tile, tile2lonlat, "urn:ogc:def:crs:OGC:1.3:CRS84"},
-	{"EPSG:3857", epsg3857totile, tiletoepsg3857, "urn:ogc:def:crs:EPSG::3857"},
-	{NULL, NULL, NULL, NULL},
+	{"EPSG:4326", lonlat2tile, tile2lonlat, "urn:ogc:def:crs:OGC:1.3:CRS84", true, false},
+	{"EPSG:4490", epsg4490totile, tiletoepsg4490, "urn:ogc:def:crs:EPSG::4490", true, true},
+	{"EPSG:3857", epsg3857totile, tiletoepsg3857, "urn:ogc:def:crs:EPSG::3857", false, false},
+	{NULL, NULL, NULL, NULL, false, false},
 };
 
 struct projection *projection = &projections[0];
@@ -101,6 +102,48 @@ void tiletoepsg3857(long long ix, long long iy, int zoom, double *ox, double *oy
 
 	*ox = (ix - (1LL << 31)) * M_PI * 6378137.0 / (1LL << 31);
 	*oy = ((1LL << 32) - 1 - iy - (1LL << 31)) * M_PI * 6378137.0 / (1LL << 31);
+}
+
+// EPSG:4490 (CGCS2000) equirectangular tile grid: linear in both longitude and
+// latitude. Each zoom level has 2^z columns and 2^(z-1) rows. Truncation (not
+// rounding) matches the legacy tiling tool's row/column numbering exactly.
+void epsg4490totile(double lon, double lat, int zoom, long long *x, long long *y) {
+	int lat_class = std::fpclassify(lat);
+	int lon_class = std::fpclassify(lon);
+
+	if (lat_class == FP_INFINITE || lat_class == FP_NAN) {
+		lat = 90;
+	}
+	if (lon_class == FP_INFINITE || lon_class == FP_NAN) {
+		lon = 360;
+	}
+
+	if (lat < -90) {
+		lat = -90;
+	}
+	if (lat > 90) {
+		lat = 90;
+	}
+	if (lon < -360) {
+		lon = -360;
+	}
+	if (lon > 360) {
+		lon = 360;
+	}
+
+	unsigned long long n = 1LL << zoom;
+
+	long long llx = n * ((lon + 180) / 360);
+	long long lly = n * ((90 - lat) / 360);
+
+	*x = llx;
+	*y = lly;
+}
+
+void tiletoepsg4490(long long x, long long y, int zoom, double *lon, double *lat) {
+	unsigned long long n = 1LL << zoom;
+	*lon = 360.0 * x / n - 180.0;
+	*lat = 90.0 - 360.0 * y / n;
 }
 
 // https://en.wikipedia.org/wiki/Hilbert_curve
@@ -200,22 +243,99 @@ void decode_quadkey(unsigned long long index, unsigned *wx, unsigned *wy) {
 	}
 }
 
-void set_projection_or_exit(const char *optarg) {
+struct projection *find_projection(const char *name) {
 	struct projection *p;
 	for (p = projections; p->name != NULL; p++) {
-		if (strcmp(p->name, optarg) == 0) {
-			projection = p;
-			break;
+		if (strcmp(p->name, name) == 0) {
+			return p;
 		}
-		if (strcmp(p->alias, optarg) == 0) {
-			projection = p;
-			break;
+		if (strcmp(p->alias, name) == 0) {
+			return p;
 		}
 	}
-	if (p->name == NULL) {
+	return NULL;
+}
+
+void set_projection_or_exit(const char *optarg) {
+	struct projection *p = find_projection(optarg);
+	if (p == NULL) {
 		fprintf(stderr, "Unknown projection (-s): %s\n", optarg);
 		exit(EXIT_ARGS);
 	}
+	projection = p;
+}
+
+static struct projection *output_projection = NULL;  // NULL: follow -s
+static bool explicit_output = false;
+static bool explicit_output_linear = false;
+
+struct projection *get_output_projection(void) {
+	return output_projection != NULL ? output_projection : projection;
+}
+
+void set_output_projection_or_exit(const char *optarg) {
+	struct projection *p = find_projection(optarg);
+	if (p == NULL) {
+		fprintf(stderr, "Unknown projection (--output-projection): %s\n", optarg);
+		exit(EXIT_ARGS);
+	}
+	output_projection = p;
+	explicit_output = true;
+	// An explicit non-3857 output projection means the equirectangular
+	// (EPSG:4490-style) tile grid, matching common CGCS2000/WGS84 tiling.
+	explicit_output_linear = (strcmp(p->name, "EPSG:3857") != 0);
+}
+
+bool output_grid_is_linear(void) {
+	if (explicit_output) {
+		return explicit_output_linear;
+	}
+	// Default: the output grid follows the input projection. Only EPSG:4490
+	// input defaults to the equirectangular grid; 4326/3857 keep Web Mercator.
+	return projection->linear_grid;
+}
+
+static void epsg3857_to_lonlat(double x, double y, double *lon, double *lat) {
+	*lon = x * 180.0 / (M_PI * 6378137.0);
+	*lat = atan(sinh(y / 6378137.0)) * 180.0 / M_PI;
+}
+
+void project_input(double ix, double iy, int zoom, long long *ox, long long *oy) {
+	if (projection->geographic) {
+		if (output_grid_is_linear()) {
+			epsg4490totile(ix, iy, zoom, ox, oy);
+		} else {
+			lonlat2tile(ix, iy, zoom, ox, oy);
+		}
+	} else {
+		if (output_grid_is_linear()) {
+			double lon, lat;
+			epsg3857_to_lonlat(ix, iy, &lon, &lat);
+			epsg4490totile(lon, lat, zoom, ox, oy);
+		} else {
+			epsg3857totile(ix, iy, zoom, ox, oy);
+		}
+	}
+}
+
+void unproject_output_ll(long long ix, long long iy, int zoom, double *ox, double *oy) {
+	if (output_grid_is_linear()) {
+		tiletoepsg4490(ix, iy, zoom, ox, oy);
+	} else {
+		tile2lonlat(ix, iy, zoom, ox, oy);
+	}
+}
+
+bool output_tile_matrix_meta(const char **crs, double *origin_x, double *origin_y, double *z0_dim) {
+	if (!output_grid_is_linear()) {
+		return false;
+	}
+	struct projection *out = get_output_projection();
+	*crs = out->name;
+	*origin_x = -180.0;
+	*origin_y = 90.0;
+	*z0_dim = 360.0;
+	return true;
 }
 
 unsigned long long encode_vertex(unsigned int wx, unsigned int wy) {

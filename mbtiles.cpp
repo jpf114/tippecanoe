@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include "mvt.hpp"
 #include "mbtiles.hpp"
+#include "projection.hpp"
 #include "text.hpp"
 #include "milo/dtoa_milo.h"
 #include "write_json.hpp"
@@ -586,6 +587,43 @@ void mbtiles_write_metadata(sqlite3 *db, const metadata &m, bool forcetable) {
 		}
 	}
 	sqlite3_free(sql);
+	const char *matrix_crs = NULL;
+	double matrix_ox = 0, matrix_oy = 0, matrix_z0 = 0;
+	if (output_tile_matrix_meta(&matrix_crs, &matrix_ox, &matrix_oy, &matrix_z0)) {
+		sql = sqlite3_mprintf("INSERT OR REPLACE INTO metadata (name, value) VALUES ('crs', %Q);", matrix_crs);
+		if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
+			fprintf(stderr, "set crs: %s\n", err);
+			if (!forcetable) {
+				exit(EXIT_SQLITE);
+			}
+		}
+		sqlite3_free(sql);
+		sql = sqlite3_mprintf("INSERT OR REPLACE INTO metadata (name, value) VALUES ('tile_origin_upper_left_x', '%f');", matrix_ox);
+		if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
+			fprintf(stderr, "set tile_origin_upper_left_x: %s\n", err);
+			if (!forcetable) {
+				exit(EXIT_SQLITE);
+			}
+		}
+		sqlite3_free(sql);
+		sql = sqlite3_mprintf("INSERT OR REPLACE INTO metadata (name, value) VALUES ('tile_origin_upper_left_y', '%f');", matrix_oy);
+		if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
+			fprintf(stderr, "set tile_origin_upper_left_y: %s\n", err);
+			if (!forcetable) {
+				exit(EXIT_SQLITE);
+			}
+		}
+		sqlite3_free(sql);
+		sql = sqlite3_mprintf("INSERT OR REPLACE INTO metadata (name, value) VALUES ('tile_dimension_zoom_0', '%f');", matrix_z0);
+		if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
+			fprintf(stderr, "set tile_dimension_zoom_0: %s\n", err);
+			if (!forcetable) {
+				exit(EXIT_SQLITE);
+			}
+		}
+		sqlite3_free(sql);
+	}
+
 
 	if (m.strategies_json.size() > 0) {
 		sql = sqlite3_mprintf("INSERT OR REPLACE INTO metadata (name, value) VALUES ('strategies', %Q);", m.strategies_json.c_str());

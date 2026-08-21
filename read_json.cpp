@@ -79,7 +79,7 @@ void parse_coordinates(int t, json_object *j, drawvec &out, int op, const char *
 			long long x, y;
 			double lon = j->value.array.array[0]->value.number.number;
 			double lat = j->value.array.array[1]->value.number.number;
-			projection->project(lon, lat, 32, &x, &y);
+			project_input(lon, lat, 32, &x, &y);
 
 			if (j->value.array.length > 2) {
 				static int warned = 0;

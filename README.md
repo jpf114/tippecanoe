@@ -50,6 +50,17 @@ $ make -j
 $ make install
 ```
 
+To produce a fully static build (no runtime dependency on shared libraries):
+
+```sh
+$ make LDFLAGS=-static -j
+```
+
+This repository keeps two ready-to-run build variants:
+
+ * `build/dynamic/`: dynamically linked binaries (default `make` output)
+ * `build/static/`: statically linked binaries (`make LDFLAGS=-static` output)
+
 See [Development](#development) below for how to upgrade your
 C++ compiler or install prerequisite packages if you get
 compiler errors.
@@ -337,9 +348,14 @@ than at all newlines.
 
 Parallel processing will also be automatic if the input file is in FlatGeobuf format.
 
-### Projection of input
+### Input and output projections
 
- * `-s` _projection_ or `--projection=`_projection_: Specify the projection of the input data. Currently supported are `EPSG:4326` (WGS84, the default) and `EPSG:3857` (Web Mercator). In general you should use WGS84 for your input files if at all possible.
+ * `-s` _projection_ or `--projection=`_projection_: Specify the projection of the input data. Currently supported are `EPSG:4326` (WGS84, the default), `EPSG:4490` (CGCS2000), and `EPSG:3857` (Web Mercator). In general you should use WGS84 for your input files if at all possible.
+ * `--output-projection=`_projection_: Specify the projection of the output tile grid. Supported are `EPSG:3857` (Web Mercator, the default) and `EPSG:4490` (CGCS2000). `EPSG:4490` output uses an equirectangular tile grid (2^z columns by 2^(z-1) rows per zoom level, linear in latitude) instead of the Web Mercator grid, and records `crs`, `tile_origin_upper_left_x`, `tile_origin_upper_left_y`, and `tile_dimension_zoom_0` metadata rows so consumers can identify the grid. If not specified, the output grid follows `-s`: `-s EPSG:4490` produces the equirectangular grid; any other `-s` keeps Web Mercator.
+
+Any input/output combination is supported: geographic input (`EPSG:4326`/`EPSG:4490`, degrees) goes straight into the chosen grid, while `EPSG:3857` input (Web Mercator meters) is first converted back to longitude/latitude when the output grid is `EPSG:4490`. Since EPSG:4326 and EPSG:4490 are both longitude/latitude systems and numerically interchangeable for tiling purposes, the only true coordinate conversion happens on the 3857-to-4490 path.
+
+`tippecanoe-decode` recognizes equirectangular tilesets automatically from their `crs` metadata row; it can also be told explicitly with `-s EPSG:4490`.
 
 ### Zoom levels
 
@@ -910,7 +926,7 @@ resolutions.
 
 ### Options
 
- * `-s` _projection_ or `--projection=`*projection*: Specify the projection of the output data. Currently supported are EPSG:4326 (WGS84, the default) and EPSG:3857 (Web Mercator).
+ * `-s` _projection_ or `--projection=`*projection*: Specify the projection of the tileset grid. Currently supported are EPSG:4326 (WGS84, the default), EPSG:4490 (CGCS2000), and EPSG:3857 (Web Mercator). EPSG:4490 tilesets (equirectangular grid) are also detected automatically from the `crs` metadata row.
  * `-z` _maxzoom_ or `--maximum-zoom=`*maxzoom*: Specify the highest zoom level to decode from the tileset
  * `-Z` _minzoom_ or `--minimum-zoom=`*minzoom*: Specify the lowest zoom level to decode from the tileset
  * `-l` _layer_ or `--layer=`*layer*: Decode only layers with the specified names. (Multiple `-l` options can be specified.)
