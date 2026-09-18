@@ -634,6 +634,11 @@ void mbtiles_write_metadata(sqlite3 *db, const metadata &m, bool forcetable) {
 			}
 		}
 		sqlite3_free(sql);
+	} else {
+		// v3.3: metadata 写入必须幂等——resume 时 strategies 为空则删除旧行，
+		// 避免部分完成阶段写入的旧值残留
+		sql = (char *) "DELETE FROM metadata WHERE name = 'strategies';";
+		sqlite3_exec(db, sql, NULL, NULL, &err);
 	}
 
 	if (m.decisions_json.size() > 0) {
@@ -645,6 +650,13 @@ void mbtiles_write_metadata(sqlite3 *db, const metadata &m, bool forcetable) {
 			}
 		}
 		sqlite3_free(sql);
+	} else {
+		// v3.3: metadata 写入必须幂等——SIGTERM 部分完成阶段会以缩小的
+		// maxzoom 写过一次 tippecanoe_decisions（basezoom != maxzoom 触发），
+		// resume 最终写 metadata 时若 decisions 为空而跳过写入，
+		// 旧行会残留，导致与一次完整运行的 metadata 不一致。
+		sql = (char *) "DELETE FROM metadata WHERE name = 'tippecanoe_decisions';";
+		sqlite3_exec(db, sql, NULL, NULL, &err);
 	}
 
 	if (m.vector_layers_json.size() > 0 || m.tilestats_json.size() > 0) {

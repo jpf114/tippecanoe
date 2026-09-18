@@ -4014,6 +4014,21 @@ int main(int argc, char **argv) {
 			attribution = strdup(info.attribution.c_str());
 		}
 
+		// v3.3: 恢复 prevent/additional 选项位图（-p*/-a* 标志）
+		// 自包含 resume：丢弃策略（-as/-ad 等）与限制（-pk/-pf 等）来自
+		// 创建作业时的原始命令，续跑的 zoom 必须使用相同的选项，
+		// 否则低 zoom 的 tile 会因缺少丢弃策略而失败。
+		// 注意：这两个字段参与指纹计算，旧版（v3.3 之前）state.json 没有
+		// 它们时为空字符串，此时保留当前命令行解析出的值。
+		if (!info.prevent.empty()) {
+			memset(prevent, 0, sizeof(prevent));
+			checkpoint::decode_flags(info.prevent, prevent);
+		}
+		if (!info.additional.empty()) {
+			memset(additional, 0, sizeof(additional));
+			checkpoint::decode_flags(info.additional, additional);
+		}
+
 		// Recalculate geometry_scale since maxzoom/minzoom changed from defaults
 		if (extra_detail >= 0 || prevent[P_SIMPLIFY_SHARED_NODES] || additional[A_EXTEND_ZOOMS] || extend_zooms_max > 0) {
 			geometry_scale = 0;

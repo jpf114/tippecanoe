@@ -207,6 +207,43 @@ uint32_t crc32_compute(void const *data, size_t len) {
 	return crc ^ 0xFFFFFFFF;
 }
 
+// v3.3: 流式为文件追加 CRC32（分块读取，避免把整个数 GB 的 staging 文件
+// 一次性读入内存导致内存暴涨甚至 OOM）。失败时打印错误并退出。
+void append_file_crc32(std::string const &path) {
+	init_crc32_table();
+	int rfd = open(path.c_str(), O_RDONLY);
+	if (rfd < 0) {
+		perror(path.c_str());
+		exit(EXIT_READ);
+	}
+	uint32_t crc = 0xFFFFFFFF;
+	std::vector<char> buf(4 * 1024 * 1024);  // 4MB 固定缓冲
+	ssize_t n;
+	while ((n = read(rfd, buf.data(), buf.size())) > 0) {
+		const unsigned char *p = (const unsigned char *) buf.data();
+		for (ssize_t i = 0; i < n; i++) {
+			crc = crc32_table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+		}
+	}
+	close(rfd);
+	if (n < 0) {
+		perror(path.c_str());
+		exit(EXIT_READ);
+	}
+	crc ^= 0xFFFFFFFF;
+
+	FILE *fp = fopen(path.c_str(), "ab");
+	if (fp == NULL) {
+		perror(path.c_str());
+		exit(EXIT_WRITE);
+	}
+	if (fwrite(&crc, sizeof(crc), 1, fp) != 1) {
+		perror(path.c_str());
+		exit(EXIT_WRITE);
+	}
+	fclose(fp);
+}
+
 // 写入 blob 文件（可选追加 CRC32 后缀）
 // v3.1: 加入 fflush + fsync，保证文件内容在 fclose 前已刷盘，
 // 防止突然断电后 blobs/ 中存在空文件或部分写入文件。
@@ -387,6 +424,10 @@ std::string serialize_state(CheckpointState const &s) {
 	jw_str(j, "description", s.description);
 	jw_str(j, "attribution", s.attribution);
 
+	// v3.3: prevent/additional 位图（resume 指纹校验需要）
+	jw_str(j, "prevent", s.prevent_str);
+	jw_str(j, "additional", s.additional_str);
+
 	j += "}";
 	return j;
 }
@@ -528,6 +569,12 @@ bool parse_state(std::string const &json_str, CheckpointState &out) {
 	v = json_hash_get(root, "attribution");
 	if (v && v->type == JSON_STRING) out.attribution = v->value.string.string;
 
+	// v3.3: prevent/additional 位图（向后兼容：旧 state.json 没有这些字段，默认为空）
+	v = json_hash_get(root, "prevent");
+	if (v && v->type == JSON_STRING) out.prevent_str = v->value.string.string;
+	v = json_hash_get(root, "additional");
+	if (v && v->type == JSON_STRING) out.additional_str = v->value.string.string;
+
 	json_free(root);
 	json_end(jp);
 	return true;
@@ -584,6 +631,23 @@ void rmrf_path(std::string const &path) {
 // ===========================================================================
 // 信号处理公开接口
 // ===========================================================================
+
+// v3.3: prevent/additional 位图与字符串互转（与 compute_fingerprint body 中的格式一致）
+std::string encode_flags(int const *flags) {
+	std::string out;
+	for (int i = 0; i < 256; i++) {
+		if (flags[i]) {
+			out.push_back((char) i);
+		}
+	}
+	return out;
+}
+
+void decode_flags(std::string const &s, int *flags) {
+	for (char c : s) {
+		flags[(unsigned char) c] = 1;
+	}
+}
 
 void install_signal_handlers() {
 	struct sigaction sa;
@@ -1457,6 +1521,10 @@ void Session::verify_fingerprint_internal() {
 	fp.temp_files = state_.temp_files;
 	fp.cpus = state_.cpus;
 	fp.inputs = state_.input_files;
+	// v3.3: 恢复 prevent/additional（compute_fingerprint 的 body 包含这两项，
+	// 遗漏会导致带 -p*/-a* 选项（如 -pk）的作业 resume 时误报指纹不匹配）
+	decode_flags(state_.prevent_str, fp.prevent);
+	decode_flags(state_.additional_str, fp.additional);
 
 	std::string expected = compute_fingerprint(fp);
 	if (state_.fingerprint != expected) {
@@ -1551,6 +1619,13 @@ void Session::report_progress(int zoom) const {
 // --- open_new / open_resume ---
 
 std::unique_ptr<Session> Session::open_new(const char *dir, bool force, FingerprintParams const &params) {
+	// v3.3: PMTiles 不支持 resume（无 per-zoom 增量产物），fresh 阶段即拒绝，
+	// 避免用户误以为作业具备断点保护而实际永远无法续做。
+	if (params.output_mode == "pmtiles") {
+		fprintf(stderr, "%s: --checkpoint-dir is not supported for PMTiles output; use -o out.mbtiles or -e directory\n", *av);
+		exit(EXIT_ARGS);
+	}
+
 	auto s = std::unique_ptr<Session>(new Session(dir, false));
 	struct stat st;
 	if (stat(dir, &st) == 0) {
@@ -1601,6 +1676,9 @@ std::unique_ptr<Session> Session::open_new(const char *dir, bool force, Fingerpr
 	s->state_.name = params.name;
 	s->state_.description = params.description;
 	s->state_.attribution = params.attribution;
+	// v3.3: 持久化 prevent/additional 位图，resume 指纹校验时恢复
+	s->state_.prevent_str = encode_flags(params.prevent);
+	s->state_.additional_str = encode_flags(params.additional);
 
 	s->save_state_atomic();
 	return s;
@@ -1615,14 +1693,17 @@ std::unique_ptr<Session> Session::open_resume(const char *dir) {
 
 	auto s = std::unique_ptr<Session>(new Session(dir, true));
 
-	// 清理可能残留的 state.json.tmp
+	// 获取并发锁
+	// v3.3: 必须先取锁再清理 state.json.tmp——若作业正在运行（持有锁），
+	// resume 会在锁检查失败退出前误删运行中作业的临时文件，
+	// 导致其后续 save_state_atomic 的 rename 失败而异常退出。
+	s->acquire_lock();
+
+	// 清理可能残留的 state.json.tmp（残留无害：下次保存会以 "wb" 截断覆盖）
 	std::string tmppath = std::string(dir) + "/state.json.tmp";
 	if (stat(tmppath.c_str(), &st) == 0) {
 		unlink(tmppath.c_str());
 	}
-
-	// 获取并发锁
-	s->acquire_lock();
 
 	// 加载 state.json
 	s->load_state();
@@ -1682,49 +1763,16 @@ void Session::snapshot_tiling_entry(int poolfd, size_t pool_size, long long cons
 
 	if (pool_size > 0) {
 		copy_fd_to_file(poolfd, pool_size, path_staging("stringpool"));
-		// v3: 为 stringpool 追加 CRC32
+		// v3: 为 stringpool 追加 CRC32（v3.3: 流式计算，避免整文件读入内存）
 		if (blob_has_crc()) {
-			FILE *fp = fopen(path_staging("stringpool").c_str(), "ab");
-			if (fp != NULL) {
-				// 重新读取已写入的数据计算 CRC32
-				struct stat pst;
-				if (stat(path_staging("stringpool").c_str(), &pst) == 0 && pst.st_size > 0) {
-					int rfd = open(path_staging("stringpool").c_str(), O_RDONLY);
-					if (rfd >= 0) {
-						std::vector<unsigned char> buf(pst.st_size);
-						ssize_t n = read(rfd, buf.data(), buf.size());
-						close(rfd);
-						if (n > 0) {
-							uint32_t crc = crc32_compute(buf.data(), (size_t) n);
-							fwrite(&crc, sizeof(crc), 1, fp);
-						}
-					}
-				}
-				fclose(fp);
-			}
+			append_file_crc32(path_staging("stringpool"));
 		}
 	}
 	if (geom_size > 0 && geomfd >= 0) {
 		copy_fd_to_file(geomfd, (size_t) geom_size, path_staging("geom.initial"));
-		// v3: 为 geom.initial 追加 CRC32
+		// v3: 为 geom.initial 追加 CRC32（v3.3: 流式计算）
 		if (blob_has_crc()) {
-			FILE *fp = fopen(path_staging("geom.initial").c_str(), "ab");
-			if (fp != NULL) {
-				struct stat pst;
-				if (stat(path_staging("geom.initial").c_str(), &pst) == 0 && pst.st_size > 0) {
-					int rfd = open(path_staging("geom.initial").c_str(), O_RDONLY);
-					if (rfd >= 0) {
-						std::vector<unsigned char> buf(pst.st_size);
-						ssize_t n = read(rfd, buf.data(), buf.size());
-						close(rfd);
-						if (n > 0) {
-							uint32_t crc = crc32_compute(buf.data(), (size_t) n);
-							fwrite(&crc, sizeof(crc), 1, fp);
-						}
-					}
-				}
-				fclose(fp);
-			}
+			append_file_crc32(path_staging("geom.initial"));
 		}
 	}
 	if (nodepos > 0 && shared_nodes_map != nullptr) {
@@ -2074,25 +2122,9 @@ void Session::on_zoom_complete(ZoomCompleteContext const &ctx) {
 			// （此处简化：总是拷贝，因为 traverse_zooms 中 geomfd 已被重写）
 			copy_fd_to_file(ctx.geomfd[j], (size_t) ctx.geom_size[j], path_staging(name));
 
-			// v3: 追加 CRC32
+			// v3: 追加 CRC32（v3.3: 流式计算，避免整文件读入内存）
 			if (blob_has_crc()) {
-				FILE *fp = fopen(path_staging(name).c_str(), "ab");
-				if (fp != NULL) {
-					struct stat pst;
-					if (stat(path_staging(name).c_str(), &pst) == 0 && pst.st_size > 0) {
-						int rfd = open(path_staging(name).c_str(), O_RDONLY);
-						if (rfd >= 0) {
-							std::vector<unsigned char> buf(pst.st_size);
-							ssize_t n = read(rfd, buf.data(), buf.size());
-							close(rfd);
-							if (n > 0) {
-								uint32_t crc = crc32_compute(buf.data(), (size_t) n);
-								fwrite(&crc, sizeof(crc), 1, fp);
-							}
-						}
-					}
-					fclose(fp);
-				}
+				append_file_crc32(path_staging(name));
 			}
 
 			total_geom += ctx.geom_size[j];
@@ -2108,6 +2140,11 @@ void Session::on_zoom_complete(ZoomCompleteContext const &ctx) {
 	if (ctx.strategies != nullptr) {
 		write_strategies_blob(path_staging("strategies.bin"), *ctx.strategies);
 	}
+	// v3.3: 保存累积了本 zoom tilestats 的 layermaps，保证 resume 后
+	// metadata 的 vector_layers / tilestats 与正常路径一致
+	if (ctx.layermaps != nullptr) {
+		write_layermaps_blob(path_staging("layermaps.bin"), *ctx.layermaps);
+	}
 
 	// 原子替换: 先 rename staging → blobs
 	for (size_t j = 0; j < TEMP_FILES; j++) {
@@ -2117,44 +2154,6 @@ void Session::on_zoom_complete(ZoomCompleteContext const &ctx) {
 		struct stat st;
 		if (stat(sp.c_str(), &st) == 0) {
 			rename(sp.c_str(), path_blob(name).c_str());
-		}
-	}
-
-	// v3: 索引化清理旧代数 geom 文件（替代 O(n) 目录扫描）
-	{
-		// 优先使用 current_gen_files 索引（O(1) per file）
-		if (!state_.current_gen_files.empty()) {
-			for (auto const &old_name : state_.current_gen_files) {
-				// 跳过新 generation 的文件（不应该出现，但防御性检查）
-				if (std::find(new_gen_files.begin(), new_gen_files.end(), old_name) != new_gen_files.end()) {
-					continue;
-				}
-				// 跳过 geom.initial（属于初始快照，由 restore_tiling 处理）
-				if (old_name == "geom.initial") {
-					continue;
-				}
-				std::string old = dir_ + "/blobs/" + old_name;
-				unlink(old.c_str());
-			}
-		} else {
-			// 向后兼容：v2 state.json 没有 current_gen_files，回退到目录扫描
-			DIR *d = opendir((dir_ + "/blobs").c_str());
-			if (d != NULL) {
-				struct dirent *dp;
-				while ((dp = readdir(d)) != NULL) {
-					if (strncmp(dp->d_name, "geom.", 5) == 0) {
-						const char *dot = strrchr(dp->d_name, '.');
-						if (dot != NULL && strncmp(dot, ".g", 2) == 0) {
-							uint64_t file_gen = (uint64_t) strtoull(dot + 2, NULL, 10);
-							if (file_gen != gen) {
-								std::string old = dir_ + "/blobs/" + dp->d_name;
-								unlink(old.c_str());
-							}
-						}
-					}
-				}
-				closedir(d);
-			}
 		}
 	}
 	{
@@ -2169,6 +2168,14 @@ void Session::on_zoom_complete(ZoomCompleteContext const &ctx) {
 		struct stat st;
 		if (stat(stg.c_str(), &st) == 0) {
 			rename(stg.c_str(), path_blob("strategies.bin").c_str());
+		}
+	}
+	{
+		// v3.3: layermaps.bin 原子替换（覆盖入口快照版本，restore 时取最新）
+		std::string lm = path_staging("layermaps.bin");
+		struct stat st;
+		if (stat(lm.c_str(), &st) == 0) {
+			rename(lm.c_str(), path_blob("layermaps.bin").c_str());
 		}
 	}
 
@@ -2199,6 +2206,32 @@ void Session::on_zoom_complete(ZoomCompleteContext const &ctx) {
 	state_.zoom_commits[ctx.zoom] = commit;
 
 	save_state_atomic();
+
+	// v3.3: 旧代 blob 清理移到 save_state_atomic 之后（扫盘式清理）。
+	// 原实现先删后存：若在删除与保存之间断电/kill -9，state.json 仍指向
+	// 已删除的文件，resume 时 verify_blobs_consistency 会误判 checkpoint
+	// 损坏并强制全部重跑。先保存后删除则最坏只留下无害孤儿文件（下次
+	// zoom 完成时被同一扫盘逻辑回收）。
+	// 扫盘同时回收 geom.initial（最后一次 zoom 提交后初始快照不再需要，
+	// 避免其在长任务全程滞留占盘）以及历史遗留的孤儿 geom 文件。
+	{
+		std::set<std::string> keep(state_.current_gen_files.begin(), state_.current_gen_files.end());
+		DIR *d = opendir((dir_ + "/blobs").c_str());
+		if (d != NULL) {
+			struct dirent *dp;
+			while ((dp = readdir(d)) != NULL) {
+				if (strncmp(dp->d_name, "geom.", 5) != 0) {
+					continue;
+				}
+				if (keep.count(dp->d_name) != 0) {
+					continue;
+				}
+				std::string old = dir_ + "/blobs/" + dp->d_name;
+				unlink(old.c_str());
+			}
+			closedir(d);
+		}
+	}
 
 	// 创建 zoom 完成标记文件（防御性校验）
 	{
@@ -2330,11 +2363,9 @@ ResumeInfo read_resume_info(const char *dir) {
 		exit(EXIT_ARGS);
 	}
 
-	// 清理残留的 state.json.tmp
-	std::string tmppath = std::string(dir) + "/state.json.tmp";
-	if (stat(tmppath.c_str(), &st) == 0) {
-		unlink(tmppath.c_str());
-	}
+	// v3.3: 不再清理 state.json.tmp——本函数只读且不持有锁，若作业正在运行，
+	// 此处删除会破坏运行中作业的原子保存。残留 tmp 无害（下次保存覆盖），
+	// open_resume 持锁后才会清理。
 
 	std::string jsonpath = std::string(dir) + "/state.json";
 	std::string json_str = read_file_to_string(jsonpath);
@@ -2347,6 +2378,28 @@ ResumeInfo read_resume_info(const char *dir) {
 	if (!parse_state(json_str, state)) {
 		fprintf(stderr, "%s: checkpoint state is corrupt: %s\n", *av, jsonpath.c_str());
 		exit(EXIT_ARGS);
+	}
+
+	// v3.3: 尽早校验指纹。resume 流程中本函数先于输出库打开/清理执行，
+	// 若 state.json 被篡改（如 output_path 被改），必须在触碰任何输出之前拒绝。
+	// （与 verify_fingerprint_internal 相同的重建逻辑。）
+	{
+		FingerprintParams fp;
+		fp.command_line = state.normalized_cmd;
+		fp.output_mode = state.output_mode;
+		fp.output_path = state.output_path;
+		fp.temp_files = state.temp_files;
+		fp.cpus = state.cpus;
+		fp.inputs = state.input_files;
+		decode_flags(state.prevent_str, fp.prevent);
+		decode_flags(state.additional_str, fp.additional);
+		std::string expected = compute_fingerprint(fp);
+		if (state.fingerprint != expected) {
+			fprintf(stderr, "%s: checkpoint fingerprint mismatch (state.json is corrupt or has been tampered with)\n", *av);
+			fprintf(stderr, "  stored:   %s\n", state.fingerprint.c_str());
+			fprintf(stderr, "  expected: %s\n", expected.c_str());
+			exit(EXIT_ARGS);
+		}
 	}
 
 	ResumeInfo info;
@@ -2363,6 +2416,9 @@ ResumeInfo read_resume_info(const char *dir) {
 	info.name = state.name;
 	info.description = state.description;
 	info.attribution = state.attribution;
+	// v3.3: 恢复 prevent/additional 标志（自包含 resume）
+	info.prevent = state.prevent_str;
+	info.additional = state.additional_str;
 
 	for (auto const &f : state.input_files) {
 		info.input_files.push_back(f.path);
@@ -2455,6 +2511,22 @@ int checkpoint_prune(const char *dir) {
 	if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
 		fprintf(stderr, "%s: checkpoint directory %s does not exist\n", *av, dir);
 		return EXIT_ARGS;
+	}
+
+	// v3.3: 若作业正在运行（持有 .lock），拒绝 prune——删除锁文件和 blobs
+	// 会破坏正在运行的任务。
+	{
+		std::string lockpath = std::string(dir) + "/.lock";
+		int fd = open(lockpath.c_str(), O_RDWR);
+		if (fd >= 0) {
+			if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+				fprintf(stderr, "%s: checkpoint directory %s is locked by another process; cannot prune a running job\n", *av, dir);
+				close(fd);
+				return EXIT_ARGS;
+			}
+			flock(fd, LOCK_UN);
+			close(fd);
+		}
 	}
 
 	std::string jsonpath = std::string(dir) + "/state.json";

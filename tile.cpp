@@ -3543,6 +3543,8 @@ int traverse_zooms(int *geomfd, off_t *geom_size, char *global_stringpool, std::
 			ctx.geom_size = geom_size;
 			ctx.skip_children = &skip_children;
 			ctx.strategies = &strategies;
+			// v3.3: 一并保存累积 tilestats 的 layermaps，resume 后 metadata 一致
+			ctx.layermaps = &layermaps;
 			ctx.maxzoom = maxzoom;
 			ctx.midx = midx->load();
 			ctx.midy = midy->load();

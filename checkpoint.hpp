@@ -118,6 +118,15 @@ struct CheckpointState {
 	std::string name;          // -n / tilename
 	std::string description;   // -N
 	std::string attribution;   // -A
+
+	// --- v3.3 新增字段：prevent/additional 选项位图 ---
+	// 指纹计算包含 prevent/additional（-p*/-a* 选项），resume 校验时必须
+	// 使用创建作业时的原始值，否则会误报 fingerprint mismatch。
+	// 序列化为字符串（与 compute_fingerprint 的 body 格式一致）。
+	// 旧版 state.json 无这些字段，解析时默认为空（仅当原作业未使用
+	// -p*/-a* 选项时指纹才能匹配，与旧行为一致）。
+	std::string prevent_str;     // prevent[i] != 0 的字符拼接
+	std::string additional_str;  // additional[i] != 0 的字符拼接
 };
 
 struct TilingRestore {
@@ -162,6 +171,10 @@ struct ZoomCompleteContext {
 	off_t *geom_size = nullptr;
 	std::set<zxy> const *skip_children = nullptr;
 	std::vector<strategy> const *strategies = nullptr;
+	// v3.3: tiling 过程中持续累积的 layermaps（含 tilestats）。
+	// 每次 zoom 提交时一并保存，resume 后 metadata 的 vector_layers /
+	// tilestats 才能与正常路径一致（否则已完成 zoom 的统计信息丢失）。
+	std::vector<std::map<std::string, layermap_entry>> const *layermaps = nullptr;
 	int maxzoom = 0;
 	unsigned midx = 0;
 	unsigned midy = 0;
@@ -183,6 +196,11 @@ struct ResumeInfo {
 	std::string name;
 	std::string description;
 	std::string attribution;
+	// v3.3: prevent/additional 位图（编码字符串，恢复自 -p*/-a* 选项）
+	// resume 时必须恢复这些标志，否则丢弃策略（-as/-ad 等）与限制
+	// （-pk/-pf 等）在续跑的 zoom 中失效
+	std::string prevent;
+	std::string additional;
 };
 
 // ---------------------------------------------------------------------------
@@ -196,6 +214,11 @@ std::string absolute_path_or_die(const char *path);
 
 // 从 state.json 读取续跑元数据（不打开 Session）
 ResumeInfo read_resume_info(const char *dir);
+
+// v3.3: prevent/additional 位图与字符串互转（公开接口，供 resume 恢复选项使用）
+// 与 compute_fingerprint body 中的格式一致：flag[i] != 0 的字符依次拼接
+std::string encode_flags(int const *flags);
+void decode_flags(std::string const &s, int *flags);
 
 // 输出清理辅助函数（操作 mbtiles 输出文件，不是 checkpoint 状态）
 void cleanup_resume_wal(const char *output_path);
