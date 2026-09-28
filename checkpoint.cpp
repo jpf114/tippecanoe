@@ -1596,10 +1596,16 @@ void Session::verify_blobs_consistency() {
 // --- 进度报告 ---
 
 void Session::report_progress(int zoom) const {
-	int completed = zoom - state_.minzoom + 1;
-	int total = state_.maxzoom - state_.minzoom + 1;
+	// 进度按实际遍历起点 iz（choose_first_zoom 选出的初始 zoom）计算，
+	// 而非 minzoom：当 -Z 较大而数据在低 zoom 即可装入单 tile 时（iz << minzoom），
+	// 遍历会从 iz 开始逐级提交 checkpoint，用 minzoom 计算会得到负百分比。
+	int start = state_.iz;
+	int completed = zoom - start + 1;
+	int total = state_.maxzoom - start + 1;
 	if (total <= 0) total = 1;
 	int percent = 100 * completed / total;
+	if (percent < 0) percent = 0;
+	if (percent > 100) percent = 100;
 
 	int64_t elapsed = now_unix() - start_time_;
 	if (elapsed < 0) elapsed = 0;
@@ -2466,10 +2472,13 @@ int checkpoint_status(const char *dir) {
 
 	fprintf(stderr, "  Zoom range: %d-%d", state.minzoom, state.maxzoom);
 	if (state.last_completed_zoom >= 0) {
-		int total = state.maxzoom - state.minzoom + 1;
-		int completed = state.last_completed_zoom - state.minzoom + 1;
+		// 与 report_progress 一致：按实际遍历起点 iz 计算进度
+		int total = state.maxzoom - state.iz + 1;
+		int completed = state.last_completed_zoom - state.iz + 1;
 		if (total <= 0) total = 1;
 		int pct = 100 * completed / total;
+		if (pct < 0) pct = 0;
+		if (pct > 100) pct = 100;
 		fprintf(stderr, ", completed: %d/%d (%d%%)", completed, total, pct);
 	} else {
 		fprintf(stderr, ", no zooms completed yet");
