@@ -1880,6 +1880,14 @@ std::unique_ptr<Session> Session::open_resume(const char *dir) {
 		exit(EXIT_CHECKPOINT);
 	}
 
+	// v3.4 (CK-S7): 校验 TEMP_FILES 一致——它依赖运行时探测的 fd 限制，
+	// 续跑环境不同时 restore_tiling 按当前值装载 blob 会静默丢数据
+	if (s->state_.temp_files != 0 && s->state_.temp_files != TEMP_FILES) {
+		fprintf(stderr, "%s: checkpoint was created with %zu temp files but this run has %zu; resume requires the same TEMP_FILES\n",
+			*av, s->state_.temp_files, TEMP_FILES);
+		exit(EXIT_CHECKPOINT);
+	}
+
 	// v3.1: 校验 blobs/ 文件存在性（防止断电后不一致）
 	s->verify_blobs_consistency();
 
