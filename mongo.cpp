@@ -1,5 +1,6 @@
 #include "mongo.hpp"
 #include <bsoncxx/builder/basic/document.hpp>
+#include <mongocxx/exception/operation_exception.hpp>
 #include <bsoncxx/builder/basic/kvp.hpp>
 #include <iostream>
 #include <cstring>
@@ -27,6 +28,9 @@ static std::atomic<size_t> global_insert_batches{0};
 static std::atomic<size_t> global_upsert_batches{0};
 static std::atomic<size_t> global_insert_discarded_tiles{0};
 static std::atomic<size_t> global_upsert_discarded_tiles{0};
+// v3.4 (DB-S5): E11000 幂等成功计数
+static std::atomic<size_t> global_duplicate_tiles{0};
+static std::atomic<size_t> global_duplicate_batches{0};
 
 static std::unique_ptr<mongocxx::pool> global_pool;
 static std::mutex pool_mutex;
@@ -127,6 +131,15 @@ size_t MongoWriter::get_global_upsert_discarded_tiles() {
     return global_upsert_discarded_tiles.load();
 }
 
+// v3.4 (DB-S5)
+size_t MongoWriter::get_global_duplicate_tiles() {
+    return global_duplicate_tiles.load();
+}
+
+size_t MongoWriter::get_global_duplicate_batches() {
+    return global_duplicate_batches.load();
+}
+
 void MongoWriter::destroy_current_thread_instance() {
     if (tls_mongo_writer) {
         tls_mongo_writer->flush_all();
@@ -189,6 +202,8 @@ void MongoWriter::merge_stats_once() {
     global_upsert_batches += getUpsertBatches();
     global_insert_discarded_tiles += getInsertDiscardedTiles();
     global_upsert_discarded_tiles += getUpsertDiscardedTiles();
+global_duplicate_tiles += getDuplicateTiles();
+global_duplicate_batches += getDuplicateBatches();
     stats_merged_ = true;
 }
 
@@ -215,6 +230,8 @@ void MongoWriter::reset_global_runtime_state() {
     global_upsert_batches.store(0);
     global_insert_discarded_tiles.store(0);
     global_upsert_discarded_tiles.store(0);
+global_duplicate_tiles.store(0);
+global_duplicate_batches.store(0);
     first_connection_reported.store(false, std::memory_order_release);
     std::lock_guard<std::mutex> erased_lock(erased_zooms_mutex);
     erased_zooms.clear();
@@ -549,6 +566,58 @@ void MongoWriter::flush_batch_with_retry(bool upsert_mode,
             return;
 
         } catch (const std::exception &e) {
+            // v3.4 (DB-S5): E11000 duplicate key（合法重跑/部分重试场景）=
+            // 数据已在库，幂等成功：不计错误、不丢弃、不重试。
+            // 全部错误均为 11000 时才整体幂等；混合错误仍走重试。
+            if (!upsert_mode) {
+                const mongocxx::v_noabi::operation_exception *oe =
+                    dynamic_cast<const mongocxx::v_noabi::operation_exception *>(&e);
+                int classify = -1;  // 1=全 11000；0=有其它错误；-1=无法从结构化信息判定
+                if (oe != nullptr && oe->raw_server_error()) {
+                    auto server_err = oe->raw_server_error()->view();
+                    auto write_errors = server_err["writeErrors"];
+                    if (write_errors && write_errors.type() == bsoncxx::type::k_array) {
+                        classify = 1;
+                        for (const auto &item : write_errors.get_array().value) {
+                            auto code = item["code"];
+                            if (!(code && code.type() == bsoncxx::type::k_int32 &&
+                                  code.get_int32().value == 11000)) {
+                                classify = 0;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (classify == -1) {
+                    // 回退：多错误 bulk 的 raw_server_error 可能为空，错误详情
+                    // 拼接在异常消息中（"Multiple write errors: "E11000 ...""）
+                    std::string msg(e.what());
+                    if (msg.find("E11000") != std::string::npos) {
+                        classify = 1;
+                        size_t pos = 0;
+                        while ((pos = msg.find("\"E", pos)) != std::string::npos) {
+                            if (msg.compare(pos + 2, 5, "11000") != 0) {
+                                classify = 0;
+                                break;
+                            }
+                            pos += 2;
+                        }
+                    } else {
+                        classify = 0;
+                    }
+                }
+                if (classify == 1) {
+                    flush_failure_rounds = 0;
+                    total_duplicate_batches++;
+                    total_duplicate_tiles += batch_buf.size();
+                    if (!quiet) {
+                        fprintf(stderr, "MongoDB: %zu tiles already present (duplicate key); treated as idempotent success\n",
+                                batch_buf.size());
+                    }
+                    return;
+                }
+            }
+
             attempts++;
             total_errors++;
 

@@ -98,6 +98,8 @@ GlobalStats get_global_stats() {
     stats.upsert_batches = MongoWriter::get_global_upsert_batches();
     stats.insert_discarded_tiles = MongoWriter::get_global_insert_discarded_tiles();
     stats.upsert_discarded_tiles = MongoWriter::get_global_upsert_discarded_tiles();
+    stats.duplicate_tiles = MongoWriter::get_global_duplicate_tiles();
+    stats.duplicate_batches = MongoWriter::get_global_duplicate_batches();
     return stats;
 }
 
@@ -115,6 +117,8 @@ void print_stats(const GlobalStats& stats, bool quiet) {
         fprintf(stderr, "  Upsert batches written: %zu\n", stats.upsert_batches);
         fprintf(stderr, "  Insert discarded tiles: %zu\n", stats.insert_discarded_tiles);
         fprintf(stderr, "  Upsert discarded tiles: %zu\n", stats.upsert_discarded_tiles);
+    fprintf(stderr, "  Duplicate tiles (idempotent): %zu\n", stats.duplicate_tiles);
+    fprintf(stderr, "  Duplicate batches (idempotent): %zu\n", stats.duplicate_batches);
     }
 }
 

@@ -29,6 +29,9 @@ struct GlobalStats {
     size_t upsert_batches;
     size_t insert_discarded_tiles;
     size_t upsert_discarded_tiles;
+    // v3.4 (DB-S5): E11000 幂等成功
+    size_t duplicate_tiles;
+    size_t duplicate_batches;
 };
 
 GlobalStats get_global_stats();
