@@ -72,6 +72,10 @@ struct FingerprintParams {
 	std::string command_line;
 	std::string output_mode;
 	std::string output_path;
+	// v3.4 (M1): -o/-e 的原样（as-typed）路径，不参与指纹计算。state.json
+	// 此前只持久化绝对路径，resume 时 metadata.name/description 退化为
+	// 绝对路径或基本文件名，无法复现 fresh 的"-o 原样路径"语义
+	std::string output_path_typed;
 	size_t temp_files = 0;
 	size_t cpus = 0;
 	int prevent[256]{};
@@ -152,6 +156,18 @@ struct CheckpointState {
 
 	// --- v3.4 新增字段：切片选项（CK-S4，resume 时恢复） ---
 	TilingOptions tiling_options;
+
+	// --- v3.4 (M5) 新增字段：state.json 自身完整性校验 ---
+	// 对除本字段外的完整序列化文本计算 CRC32。指纹只覆盖身份字段
+	// （命令行/输入/输出/选项位图），last_completed_zoom、zoom_commits、
+	// generation、tiling_options 等运行时字段此前无任何完整性保护。
+	// 旧版 state.json 无此字段（解析为 0），跳过校验（向后兼容）。
+	uint32_t state_crc = 0;
+
+	// --- v3.4 (M1) 新增字段：-o/-e 的原样（as-typed）路径 ---
+	// 仅用于 resume 时恢复 metadata.name/description（fresh 语义 = -o 原样值）。
+	// 不参与指纹计算；旧版 state.json 无此字段（空），回退基本文件名。
+	std::string output_typed;
 };
 
 struct TilingRestore {
@@ -224,6 +240,8 @@ struct ResumeInfo {
 	std::string name;
 	std::string description;
 	std::string attribution;
+	// v3.4 (M1): as-typed 输出路径（旧 state 无此字段为空，回退基本文件名）
+	std::string output_typed;
 	// v3.3: prevent/additional 位图（编码字符串，恢复自 -p*/-a* 选项）
 	// resume 时必须恢复这些标志，否则丢弃策略（-as/-ad 等）与限制
 	// （-pk/-pf 等）在续跑的 zoom 中失效
@@ -325,7 +343,9 @@ class Session {
 	bool aux_blobs_have_crc() const { return state_.format_version >= 4; }
 	void write_blob_with_crc(std::string const &path, void const *data, size_t len);
 	// 读取整个 blob 文件（含 CRC 校验，返回 data 部分）
-	std::vector<unsigned char> read_blob_with_crc(std::string const &path);
+	// v3.4 (M7): missing 出参区分"文件不存在"与"存在但为空"——此前两者都
+	// 返回空向量，调用方无法区分合法缺失与损坏
+	std::vector<unsigned char> read_blob_with_crc(std::string const &path, bool *missing = nullptr);
 	// 校验已 mmap 的 blob（data 位于 mmap 区域末尾的 4 字节为 CRC32）
 	bool verify_mmap_crc(void const *mapped, size_t mapped_size, std::string const &path);
 
@@ -333,7 +353,9 @@ class Session {
 	bool check_disk_space(int64_t required_bytes) const;
 
 	// v3 新增：世代清理索引化
-	void cleanup_old_gen_files_indexed();
+	// v3.4 (M16): 原索引化清理函数无调用方（死代码）；其扫盘逻辑与
+	// on_zoom_complete / restore_tiling 的内联副本收敛为共享辅助
+	void scan_blobs_unlink_except(std::set<std::string> const &keep);
 
 	// v3 新增：异步 fsync（后台线程）
 	// v3.1: 改用 std::future + 析构时 wait，保证进程退出前 fsync 完成
@@ -359,6 +381,10 @@ class Session {
 	unsigned tiling_midy_ = 0;
 	uint64_t generation_ = 0;
 	int64_t start_time_ = 0;  // 用于进度报告
+	// v3.4 (M2): resume 前已完成 zoom 的耗时基线（首提交→末提交差值，秒）。
+	// resume 时 start_time_ 只是本进程启动时刻，而进度百分比是全作业口径，
+	// 不计入基线会使 est_remaining 严重失真。
+	int64_t work_elapsed_base_ = 0;
 	std::future<void> pending_fsync_;  // v3.1: 异步 fsync 的 future，析构时 wait
 };
 

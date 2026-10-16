@@ -3,6 +3,7 @@
 #include <sstream>
 #include <string>
 #include <algorithm>
+#include <atomic>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -47,6 +48,13 @@ void dir_write_tile(const char *outdir, int z, int tx, int ty, std::string const
 		// File already exists — during resume with --force/-F, overwrite it.
 		// In normal operation, check_dir() already prevents writing to an
 		// existing tileset, so this path is only reached during resume.
+		// v3.4 (M11): 覆盖路径此前完全静默，削弱了非 resume 场景 -F 的
+		// 保护可见性；首次覆盖时提示一次（逐瓦片打印会在大作业刷屏）
+		static std::atomic<bool> overwrite_logged(false);
+		bool expected = false;
+		if (overwrite_logged.compare_exchange_strong(expected, true)) {
+			fprintf(stderr, "note: replacing existing tile files (resume/overwrite mode), first: %s\n", newdir.c_str());
+		}
 		unlink(newdir.c_str());
 	}
 

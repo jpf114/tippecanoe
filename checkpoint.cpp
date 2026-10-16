@@ -24,6 +24,7 @@
 #endif
 
 #include "errors.hpp"
+#include "geojson-loop.hpp"  // set_json_read_shutdown_hook（M13 读入阶段优雅退出）
 #include "jsonpull/jsonpull.h"
 #include "serial.hpp"
 
@@ -132,6 +133,13 @@ void json_escape(std::string const &s, std::string &out) {
 			char buf[8];
 			snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char) c);
 			out += buf;
+		} else if (c == '\x7f') {
+			// v3.4 (M8): DEL 是此前唯一未转义的 ASCII 控制符。\u007f 在
+			// jsonpull 解析侧按原字节还原（ch <= 0x7F 走单字节分支），
+			// 往返精确。注意高位字节（>= 0x80）必须保持原样：jsonpull 对
+			// 它们字节透明，原样往返无损；若按 \u00XX 逐字节转义反而会被
+			// 解析成 UTF-8 重编码（\u00e4 → C3 A4）破坏往返。
+			out += "\\u007f";
 		} else {
 			out.push_back(c);
 		}
@@ -160,22 +168,6 @@ bool mkdir_p(std::string const &path) {
 		return false;
 	}
 	return true;
-}
-
-void write_blob_file(std::string const &path, void const *data, size_t len) {
-	FILE *fp = fopen(path.c_str(), "wb");
-	if (fp == NULL) {
-		perror(path.c_str());
-		exit(EXIT_WRITE);
-	}
-	if (len > 0 && fwrite(data, len, 1, fp) != 1) {
-		perror(path.c_str());
-		exit(EXIT_WRITE);
-	}
-	if (fclose(fp) != 0) {
-		perror(path.c_str());
-		exit(EXIT_CLOSE);
-	}
 }
 
 // --- CRC32 实现（IEEE 802.3 多项式，与 zlib crc32 兼容）---
@@ -403,8 +395,11 @@ void jw_dbl(std::string &out, const char *key, double val, bool first = false) {
 	out += buf;
 }
 
-// 序列化 CheckpointState 为 JSON 字符串
-std::string serialize_state(CheckpointState const &s) {
+// 序列化 CheckpointState 为 JSON 字符串（不含 state_crc 字段）。
+// v3.4 (M5): 本函数的输出同时作为完整性校验的规范化文本——parse → 再序列化
+// 必须逐字节复现（全部字段无条件写出、map 按 key 序、%.17g 双精度可往返），
+// 修改序列化逻辑时必须保持该性质。
+static std::string serialize_state_body(CheckpointState const &s) {
 	std::string j;
 	j += "{";
 	jw_int(j, "format_version", s.format_version, true);
@@ -413,6 +408,8 @@ std::string serialize_state(CheckpointState const &s) {
 	jw_str(j, "normalized_cmd", s.normalized_cmd);
 	jw_str(j, "output_mode", s.output_mode);
 	jw_str(j, "output_path", s.output_path);
+	// v3.4 (M1): as-typed 输出路径（resume 恢复 metadata.name 用）
+	jw_str(j, "output_typed", s.output_typed);
 	jw_int(j, "temp_files", (long long) s.temp_files);
 	jw_int(j, "cpus", (long long) s.cpus);
 	jw_int(j, "created_at", s.created_at);
@@ -516,6 +513,36 @@ std::string serialize_state(CheckpointState const &s) {
 	return j;
 }
 
+// v3.4 (M5): 序列化并注入 state_crc（对 body 的 CRC32）。旧版本二进制读取
+// 含 state_crc 的 state.json 时会忽略未知字段（向前兼容）。
+std::string serialize_state(CheckpointState const &s) {
+	std::string body = serialize_state_body(s);
+	uint32_t crc = crc32_compute(body.data(), body.size());
+	// body 恒以外层对象的 "}" 结尾，在该位置前注入字段
+	if (body.size() < 2) {
+		return body;
+	}
+	body.insert(body.size() - 1, ",\"state_crc\":" + std::to_string((unsigned long long) crc));
+	return body;
+}
+
+// v3.4 (M5): 校验 state.json 自身完整性。旧版 state.json 无 state_crc 字段
+// （解析为 0）→ 跳过；字段存在但不匹配 → 损坏或被手工修改。
+static void verify_state_crc(CheckpointState const &s) {
+	if (s.state_crc == 0) {
+		return;
+	}
+	std::string body = serialize_state_body(s);
+	uint32_t crc = crc32_compute(body.data(), body.size());
+	if (crc != s.state_crc) {
+		fprintf(stderr, "%s: checkpoint state.json integrity check failed (state_crc mismatch)\n", *av);
+		fprintf(stderr, "  stored:  %08x\n", s.state_crc);
+		fprintf(stderr, "  current: %08x\n", crc);
+		fprintf(stderr, "  The state file is corrupt or has been hand-edited; re-run with --checkpoint-force or discard this checkpoint.\n");
+		exit(EXIT_CHECKPOINT);
+	}
+}
+
 // 从 JSON 字符串解析 CheckpointState（使用 jsonpull）
 bool parse_state(std::string const &json_str, CheckpointState &out) {
 	json_pull *jp = json_begin_string(json_str.c_str());
@@ -537,6 +564,10 @@ bool parse_state(std::string const &json_str, CheckpointState &out) {
 	v = json_hash_get(root, "fingerprint");
 	if (v && v->type == JSON_STRING) out.fingerprint = v->value.string.string;
 
+	// v3.4 (M5): state.json 自身完整性校验值（旧版无此字段，默认 0 → 跳过校验）
+	v = json_hash_get(root, "state_crc");
+	if (v && v->type == JSON_NUMBER) out.state_crc = (uint32_t) v->value.number.number;
+
 	v = json_hash_get(root, "command_line");
 	if (v && v->type == JSON_STRING) out.command_line = v->value.string.string;
 
@@ -548,6 +579,10 @@ bool parse_state(std::string const &json_str, CheckpointState &out) {
 
 	v = json_hash_get(root, "output_path");
 	if (v && v->type == JSON_STRING) out.output_path = v->value.string.string;
+
+	// v3.4 (M1): as-typed 输出路径（旧版无此字段，默认空 → basename 回退）
+	v = json_hash_get(root, "output_typed");
+	if (v && v->type == JSON_STRING) out.output_typed = v->value.string.string;
 
 	v = json_hash_get(root, "temp_files");
 	if (v && v->type == JSON_NUMBER) out.temp_files = (size_t) v->value.number.number;
@@ -771,6 +806,24 @@ void decode_flags(std::string const &s, int *flags) {
 	}
 }
 
+// v3.4 (M16): 从 state 重建指纹参数并计算期望指纹——
+// Session::verify_fingerprint_internal 与 read_resume_info 共用同一逻辑，
+// 修改指纹 body 字段时只需改这一处（此前两处内联，曾有遗漏 prevent/additional 的前科）
+static std::string expected_fingerprint_from_state(CheckpointState const &state) {
+	FingerprintParams fp;
+	fp.command_line = state.normalized_cmd;  // 已规范化
+	fp.output_mode = state.output_mode;
+	fp.output_path = state.output_path;
+	fp.temp_files = state.temp_files;
+	fp.cpus = state.cpus;
+	fp.inputs = state.input_files;
+	// v3.3: 恢复 prevent/additional（compute_fingerprint 的 body 包含这两项，
+	// 遗漏会导致带 -p*/-a* 选项（如 -pk）的作业 resume 时误报指纹不匹配）
+	decode_flags(state.prevent_str, fp.prevent);
+	decode_flags(state.additional_str, fp.additional);
+	return compute_fingerprint(fp);
+}
+
 void install_signal_handlers() {
 	struct sigaction sa;
 	sa.sa_handler = signal_handler;
@@ -778,6 +831,10 @@ void install_signal_handlers() {
 	sa.sa_flags = 0;
 	sigaction(SIGTERM, &sa, NULL);
 	sigaction(SIGINT, &sa, NULL);
+
+	// v3.4 (M13): 注册读入阶段的优雅退出钩子——SIGTERM/SIGINT 在大文件
+	// 读入期间也能及时生效（此前仅在 zoom 边界检查）
+	set_json_read_shutdown_hook(shutdown_requested);
 }
 
 bool shutdown_requested() {
@@ -1354,16 +1411,37 @@ void Session::copy_fd_to_file(int fd, size_t nbytes, std::string const &dest) {
 	// 使用 sendfile 零拷贝（Linux 专有），不修改 fd 偏移量
 	{
 		off_t offset = 0;
+		bool fallback = false;
 		while (remaining > 0) {
 			ssize_t n = sendfile(outfd, fd, &offset, remaining);
 			if (n > 0) {
 				remaining -= (size_t) n;
 				continue;
 			}
-			if (n == 0) break;
-			if (errno == EINVAL || errno == ENOSYS) break;  // 回退到 read+write
+			if (n == 0) {
+				// v3.4 (M4): 源数据提前耗尽（文件短于 nbytes）——回退重拷会
+				// 造成头部重复，且截断的 geom 会让 resume 静默产出错误瓦片，
+				// 必须立即报错暴露状态不一致
+				fprintf(stderr, "checkpoint copy: source exhausted early (%zu of %zu bytes copied) in %s\n",
+					nbytes - remaining, nbytes, dest.c_str());
+				exit(EXIT_WRITE);
+			}
+			if (errno == EINVAL || errno == ENOSYS) {
+				fallback = true;  // 回退到 read+write
+				break;
+			}
 			perror("sendfile checkpoint copy");
 			exit(EXIT_WRITE);
+		}
+		if (fallback) {
+			// v3.4 (M4): sendfile 可能已部分写入 outfd；回退前必须截断已写
+			// 部分，否则输出 = sendfile 头部 + 回退从源头部重拷的前缀 →
+			// 数据重复且尾部截断
+			if (ftruncate(outfd, 0) != 0) {
+				perror("ftruncate checkpoint copy");
+				exit(EXIT_WRITE);
+			}
+			remaining = nbytes;
 		}
 	}
 #endif
@@ -1423,10 +1501,30 @@ void Session::write_blob_with_crc(std::string const &path, void const *data, siz
 // 读取 blob 文件并校验 CRC32（如果启用）
 // 返回值：data 部分（不含 CRC32 后缀）
 // 若 CRC 校验失败，打印错误并 exit
-std::vector<unsigned char> Session::read_blob_with_crc(std::string const &path) {
+// v3.4 (M7): missing 出参区分"不存在"（合法，调用方按可选 blob 处理）与
+// "存在但为空"——CRC 时代的 blob 即便数据为空也含 4 字节 CRC 尾，
+// 0 字节文件必然是损坏，直接报错而不是与缺失混为一谈
+std::vector<unsigned char> Session::read_blob_with_crc(std::string const &path, bool *missing) {
+	if (missing != nullptr) {
+		*missing = false;
+	}
+
+	struct stat st;
+	if (stat(path.c_str(), &st) != 0) {
+		if (missing != nullptr) {
+			*missing = true;
+		}
+		return std::vector<unsigned char>();
+	}
+
 	std::vector<unsigned char> raw = read_file_bytes(path);
 	if (raw.empty()) {
-		return raw;  // 文件不存在或为空，由调用方处理
+		if (blob_has_crc()) {
+			// 文件存在但 0 字节：CRC 时代不可能是合法状态（空数据也写 CRC 尾）
+			fprintf(stderr, "%s: checkpoint blob %s exists but is empty (0 bytes) — corrupted\n", *av, path.c_str());
+			exit(EXIT_CHECKPOINT);
+		}
+		return raw;  // v2 兼容：空文件可能是合法写入
 	}
 
 	if (!blob_has_crc()) {
@@ -1497,17 +1595,11 @@ bool Session::check_disk_space(int64_t required_bytes) const {
 	return true;
 }
 
-// 世代清理索引化：根据 state_.current_gen_files 列表直接 unlink 旧文件
-// 避免每次 O(n) 扫描 blobs/ 目录
-void Session::cleanup_old_gen_files_indexed() {
-	if (state_.current_gen_files.empty()) {
-		return;  // 没有记录，无操作（向后兼容 v2）
-	}
-
-	// 收集当前 generation 的文件集合
-	std::set<std::string> keep_set(state_.current_gen_files.begin(), state_.current_gen_files.end());
-
-	// 遍历 blobs/ 目录，删除不在 keep_set 中的 geom.* 文件
+// v3.4 (M16): 扫描 blobs/ 目录，删除不在 keep 集合中的 geom.* 文件。
+// 此前该逻辑在 on_zoom_complete 与 restore_tiling 各内联一份，且
+// cleanup_old_gen_files_indexed 是无调用方的死代码，三者收敛到这里。
+// geom.initial 不在 keep 集合中时同样被回收（调用方按需保留）。
+void Session::scan_blobs_unlink_except(std::set<std::string> const &keep) {
 	DIR *d = opendir((dir_ + "/blobs").c_str());
 	if (d == NULL) {
 		return;
@@ -1516,11 +1608,12 @@ void Session::cleanup_old_gen_files_indexed() {
 	while ((dp = readdir(d)) != NULL) {
 		if (dp->d_name[0] == '.') continue;
 		std::string name = dp->d_name;
-		// 仅处理 geom.* 文件（geom.initial 和 geom.{slot}.g{gen}）
+		// 仅处理 geom.* 文件（geom.initial 和 geom.{slot}.g{gen}），
+		// 共享节点/bloom 等其它 blob 不在世代清理范围
 		if (name.rfind("geom.", 0) != 0) {
 			continue;
 		}
-		if (keep_set.count(name) == 0) {
+		if (keep.count(name) == 0) {
 			std::string full = dir_ + "/blobs/" + name;
 			unlink(full.c_str());
 		}
@@ -1596,6 +1689,8 @@ void Session::load_state() {
 		fprintf(stderr, "%s: checkpoint state is corrupt: %s\n", *av, jsonpath.c_str());
 		exit(EXIT_ARGS);
 	}
+	// v3.4 (M5): state.json 自身完整性
+	verify_state_crc(state_);
 }
 
 void Session::save_state_atomic() {
@@ -1666,20 +1761,8 @@ void Session::verify_fingerprint_internal() {
 		exit(EXIT_ARGS);
 	}
 
-	// 从 state_ 重建 FingerprintParams，重新计算指纹，与存储的指纹比较
-	FingerprintParams fp;
-	fp.command_line = state_.normalized_cmd;  // 已规范化
-	fp.output_mode = state_.output_mode;
-	fp.output_path = state_.output_path;
-	fp.temp_files = state_.temp_files;
-	fp.cpus = state_.cpus;
-	fp.inputs = state_.input_files;
-	// v3.3: 恢复 prevent/additional（compute_fingerprint 的 body 包含这两项，
-	// 遗漏会导致带 -p*/-a* 选项（如 -pk）的作业 resume 时误报指纹不匹配）
-	decode_flags(state_.prevent_str, fp.prevent);
-	decode_flags(state_.additional_str, fp.additional);
-
-	std::string expected = compute_fingerprint(fp);
+	// 从 state_ 重建指纹（M16: 重建逻辑收敛到 expected_fingerprint_from_state）
+	std::string expected = expected_fingerprint_from_state(state_);
 	if (state_.fingerprint != expected) {
 		fprintf(stderr, "%s: checkpoint fingerprint mismatch (state.json is corrupt or has been tampered with)\n", *av);
 		fprintf(stderr, "  stored:   %s\n", state_.fingerprint.c_str());
@@ -1714,6 +1797,29 @@ void Session::verify_blobs_consistency() {
 		struct stat st;
 		if (stat(full.c_str(), &st) != 0) {
 			missing.push_back(name);
+			continue;
+		}
+		// v3.4 (M6): 存在性之外再查最小尺寸——0 字节/截断文件此前能通过
+		// 校验，resume 后 pool_off 全 0 会静默产出错误瓦片。各 blob 的
+		// 内容尺寸下限是确定性的；CRC 启用（format_version >= 3）时文件
+		// 还要容纳 4 字节 CRC 尾。
+		size_t min_size = 0;
+		if (strcmp(name, "pool_off.bin") == 0) {
+			min_size = sizeof(long long) * CPUS;
+		} else if (strcmp(name, "initial_x.bin") == 0 || strcmp(name, "initial_y.bin") == 0) {
+			min_size = sizeof(unsigned) * CPUS;
+		} else if (strcmp(name, "file_bbox.bin") == 0) {
+			min_size = sizeof(long long) * 4;
+		} else if (strcmp(name, "layermaps.bin") == 0) {
+			min_size = 1;  // layermap 总是有内容
+		}
+		if (blob_has_crc()) {
+			min_size += sizeof(uint32_t);
+		}
+		if (min_size > 0 && (size_t) st.st_size < min_size) {
+			fprintf(stderr, "%s: checkpoint blob blobs/%s is truncated (%lld bytes, expected at least %zu)\n",
+				*av, name, (long long) st.st_size, min_size);
+			exit(EXIT_CHECKPOINT);
 		}
 	}
 
@@ -1760,7 +1866,9 @@ void Session::report_progress(int zoom) const {
 	if (percent < 0) percent = 0;
 	if (percent > 100) percent = 100;
 
-	int64_t elapsed = now_unix() - start_time_;
+	// v3.4 (M2): resume 时把先前 zoom 的耗时基线计入 elapsed，使估算
+	// 与全作业进度口径一致（start_time_ 只是本进程启动时刻）
+	int64_t elapsed = now_unix() - start_time_ + work_elapsed_base_;
 	if (elapsed < 0) elapsed = 0;
 
 	if (elapsed > 0 && completed > 1) {
@@ -1823,6 +1931,8 @@ std::unique_ptr<Session> Session::open_new(const char *dir, bool force, Fingerpr
 	s->state_.normalized_cmd = normalize_command_line_for_fingerprint(params.command_line);
 	s->state_.output_mode = params.output_mode;
 	s->state_.output_path = params.output_path;
+	// v3.4 (M1): as-typed 输出路径，resume 恢复 metadata.name/description
+	s->state_.output_typed = params.output_path_typed;
 	s->state_.temp_files = params.temp_files;
 	s->state_.cpus = params.cpus;
 	s->state_.created_at = now_unix();
@@ -1901,6 +2011,25 @@ std::unique_ptr<Session> Session::open_resume(const char *dir) {
 	s->tiling_midx_ = s->state_.midx;
 	s->tiling_midy_ = s->state_.midy;
 	s->generation_ = s->state_.generation;
+
+	// v3.4 (M2): 进度估算基线——先前 zoom 的耗时取"首个提交→末个提交"的
+	// 差值（zoom 串行提交，该差值覆盖除首 zoom 自身外的全部历史工作；
+	// 首 zoom 通常最轻，且不含 created_at 之前的读输入时间，失真最小）
+	{
+		int64_t first_commit = 0, last_commit = 0;
+		for (std::map<int, ZoomCommit>::const_iterator it = s->state_.zoom_commits.begin();
+		     it != s->state_.zoom_commits.end(); ++it) {
+			if (first_commit == 0 || it->second.committed_at < first_commit) {
+				first_commit = it->second.committed_at;
+			}
+			if (it->second.committed_at > last_commit) {
+				last_commit = it->second.committed_at;
+			}
+		}
+		if (first_commit > 0 && last_commit > first_commit) {
+			s->work_elapsed_base_ = last_commit - first_commit;
+		}
+	}
 
 	if (s->last_completed_zoom_ >= 0) {
 		s->resume_iz_ = s->last_completed_zoom_ + 1;
@@ -2071,8 +2200,8 @@ bool Session::restore_tiling(TilingRestore &out) {
 		}
 	}
 
-	out.geomfd.resize(TEMP_FILES, -1);
-	out.geom_size.resize(TEMP_FILES, 0);
+	// geomfd/geom_size 已由 TilingRestore 构造函数按 TEMP_FILES 初始化
+	//（M16: 移除冗余 resize）
 	int geom_loaded = 0;
 	off_t geom_total = 0;
 
@@ -2160,27 +2289,14 @@ bool Session::restore_tiling(TilingRestore &out) {
 			std::string geom_init = dir_ + "/blobs/geom.initial";
 			unlink(geom_init.c_str());
 		} else {
-			// 向后兼容：v2 回退到目录扫描
-			DIR *d = opendir((dir_ + "/blobs").c_str());
-			if (d != NULL) {
-				struct dirent *dp;
-				while ((dp = readdir(d)) != NULL) {
-					if (strncmp(dp->d_name, "geom.", 5) == 0) {
-						const char *dot = strrchr(dp->d_name, '.');
-						if (dot != NULL && strncmp(dot, ".g", 2) == 0) {
-							uint64_t file_gen = (uint64_t) strtoull(dot + 2, NULL, 10);
-							if (file_gen != latest_gen) {
-								std::string old = dir_ + "/blobs/" + dp->d_name;
-								unlink(old.c_str());
-							}
-						} else if (strcmp(dp->d_name, "geom.initial") == 0) {
-							std::string old = dir_ + "/blobs/" + dp->d_name;
-							unlink(old.c_str());
-						}
-					}
-				}
-				closedir(d);
+			// 向后兼容：v2 回退到按代数识别（M16: 收敛到共享扫盘辅助）
+			std::set<std::string> keep;
+			for (size_t j = 0; j < TEMP_FILES; j++) {
+				char name[64];
+				snprintf(name, sizeof(name), "geom.%zu.g%llu", j, (unsigned long long) latest_gen);
+				keep.insert(name);
 			}
+			scan_blobs_unlink_except(keep);
 		}
 	}
 	fprintf(stderr, "  [checkpoint restore_tiling] loaded %d geom files, total=%lld bytes, iz=%d maxzoom=%d\n",
@@ -2274,14 +2390,46 @@ void Session::on_zoom_complete(ZoomCompleteContext const &ctx) {
 	}
 
 	// v3: 磁盘空间预算检查
+	// v3.4 (M14): 估算口径修正。本窗口的新增可用空间需求 = staging 写入的
+	// 新 gen + CRC 尾 + 缓冲（旧 gen 占用的空间早已从 available 扣除，cleanup
+	// 在 save_state_atomic 之后才执行，但不构成"新增需求"；staging 残留被
+	// O_TRUNC 截断复用，也不新增）。另设警告级峰值检查：新 gen + 旧 gen
+	// 同时在盘的占用若超过可用空间，说明磁盘已极度紧张，提前告警。
 	int64_t estimated_needed = 0;
 	for (size_t j = 0; j < TEMP_FILES; j++) {
 		estimated_needed += (int64_t) ctx.geom_size[j];
 	}
+	estimated_needed += 4LL * TEMP_FILES;  // geom CRC 尾（此前漏计）
+	estimated_needed += 4LL * 3;           // 辅助 blob CRC 尾
 	estimated_needed += 32 * 1024 * 1024;  // 32MB 缓冲（skip_children + strategies + state）
 	if (!check_disk_space(estimated_needed)) {
 		fprintf(stderr, "%s: aborting on_zoom_complete due to insufficient disk space\n", *av);
 		exit(EXIT_CHECKPOINT);
+	}
+
+	// v3.4 (M14): 警告级峰值检查——旧 gen 在本窗口内仍未删除
+	{
+		int64_t old_gen_bytes = 0;
+		struct stat st;
+		for (std::vector<std::string>::const_iterator it = state_.current_gen_files.begin();
+		     it != state_.current_gen_files.end(); ++it) {
+			std::string full = dir_ + "/blobs/" + *it;
+			if (stat(full.c_str(), &st) == 0) {
+				old_gen_bytes += (int64_t) st.st_size;
+			}
+		}
+		if (old_gen_bytes > 0) {
+			int64_t peak = estimated_needed + old_gen_bytes;
+			struct statfs fsst;
+			if (statfs(dir_.c_str(), &fsst) == 0) {
+				int64_t avail = (int64_t) fsst.f_bsize * (int64_t) fsst.f_bavail;
+				if (avail < peak) {
+					fprintf(stderr, "%s: warning: checkpoint peak occupancy (new %lld + old gen %lld bytes) approaches/exceeds available %lld bytes;\n"
+							"%s: if other processes fill the disk during this zoom commit, the job may die before cleanup frees the old generation\n",
+						*av, (long long) estimated_needed, (long long) old_gen_bytes, (long long) avail, *av);
+				}
+			}
+		}
 	}
 
 	state_.generation++;
@@ -2395,23 +2543,10 @@ void Session::on_zoom_complete(ZoomCompleteContext const &ctx) {
 	// zoom 完成时被同一扫盘逻辑回收）。
 	// 扫盘同时回收 geom.initial（最后一次 zoom 提交后初始快照不再需要，
 	// 避免其在长任务全程滞留占盘）以及历史遗留的孤儿 geom 文件。
+	// （M16: 收敛到共享扫盘辅助）
 	{
 		std::set<std::string> keep(state_.current_gen_files.begin(), state_.current_gen_files.end());
-		DIR *d = opendir((dir_ + "/blobs").c_str());
-		if (d != NULL) {
-			struct dirent *dp;
-			while ((dp = readdir(d)) != NULL) {
-				if (strncmp(dp->d_name, "geom.", 5) != 0) {
-					continue;
-				}
-				if (keep.count(dp->d_name) != 0) {
-					continue;
-				}
-				std::string old = dir_ + "/blobs/" + dp->d_name;
-				unlink(old.c_str());
-			}
-			closedir(d);
-		}
+		scan_blobs_unlink_except(keep);
 	}
 
 	// 创建 zoom 完成标记文件（防御性校验）
@@ -2502,6 +2637,14 @@ void cleanup_resume_dirs(const char *output_path, int last_completed_zoom, int m
 			rmrf_path(zdir);
 		}
 	}
+
+	// v3.4 (M11): 中断阶段写出的 metadata.json 携带缩小后的 maxzoom/错误的
+	// center，resume 期间一直是对客户端的误导（CK-S1 修复了完成时的强制覆盖，
+	// 但覆盖前的窗口内旧文件仍在）；直接删除，resume 完成时会重写
+	if (last_completed_zoom < maxzoom) {
+		std::string meta = std::string(output_path) + "/metadata.json";
+		unlink(meta.c_str());
+	}
 }
 
 void cleanup_resume_tiles(sqlite3 *outdb, int last_completed_zoom) {
@@ -2565,21 +2708,14 @@ ResumeInfo read_resume_info(const char *dir) {
 		fprintf(stderr, "%s: checkpoint state is corrupt: %s\n", *av, jsonpath.c_str());
 		exit(EXIT_ARGS);
 	}
+	// v3.4 (M5): state.json 自身完整性（先于指纹校验——损坏即拒绝）
+	verify_state_crc(state);
 
 	// v3.3: 尽早校验指纹。resume 流程中本函数先于输出库打开/清理执行，
 	// 若 state.json 被篡改（如 output_path 被改），必须在触碰任何输出之前拒绝。
-	// （与 verify_fingerprint_internal 相同的重建逻辑。）
+	// （M16: 重建逻辑收敛到 expected_fingerprint_from_state）
 	{
-		FingerprintParams fp;
-		fp.command_line = state.normalized_cmd;
-		fp.output_mode = state.output_mode;
-		fp.output_path = state.output_path;
-		fp.temp_files = state.temp_files;
-		fp.cpus = state.cpus;
-		fp.inputs = state.input_files;
-		decode_flags(state.prevent_str, fp.prevent);
-		decode_flags(state.additional_str, fp.additional);
-		std::string expected = compute_fingerprint(fp);
+		std::string expected = expected_fingerprint_from_state(state);
 		if (state.fingerprint != expected) {
 			fprintf(stderr, "%s: checkpoint fingerprint mismatch (state.json is corrupt or has been tampered with)\n", *av);
 			fprintf(stderr, "  stored:   %s\n", state.fingerprint.c_str());
@@ -2602,6 +2738,8 @@ ResumeInfo read_resume_info(const char *dir) {
 	info.name = state.name;
 	info.description = state.description;
 	info.attribution = state.attribution;
+	// v3.4 (M1): as-typed 输出路径
+	info.output_typed = state.output_typed;
 	// v3.3: 恢复 prevent/additional 标志（自包含 resume）
 	info.prevent = state.prevent_str;
 	info.additional = state.additional_str;
@@ -2635,6 +2773,16 @@ int checkpoint_status(const char *dir) {
 	if (!parse_state(json_str, state)) {
 		fprintf(stderr, "%s: checkpoint state is corrupt\n", *av);
 		return EXIT_ARGS;
+	}
+	// v3.4 (M5): 状态只读展示，完整性问题告警但不硬退（诊断命令保持可用）
+	{
+		if (state.state_crc != 0) {
+			std::string body = serialize_state_body(state);
+			uint32_t crc = crc32_compute(body.data(), body.size());
+			if (crc != state.state_crc) {
+				fprintf(stderr, "%s: warning: state.json integrity check failed (state_crc mismatch) — values below may be unreliable\n", *av);
+			}
+		}
 	}
 
 	fprintf(stderr, "=== Checkpoint: %s ===\n", dir);

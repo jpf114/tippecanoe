@@ -12,6 +12,7 @@
 #include <errno.h>
 #include "geojson-loop.hpp"
 #include "jsonpull/jsonpull.h"
+#include "errors.hpp"  // EXIT_NODATA（M13 读入阶段优雅退出）
 
 // XXX duplicated
 #define GEOM_TYPES 6
@@ -36,12 +37,28 @@ static void json_context(json_object *j) {
 	free(s);  // stringify
 }
 
+// v3.4 (M13): 读入阶段优雅退出钩子（由 checkpoint 模块注册，未注册时零开销直通）
+static bool (*json_read_shutdown_hook)() = NULL;
+
+void set_json_read_shutdown_hook(bool (*f)()) {
+	json_read_shutdown_hook = f;
+}
+
 void parse_json(json_feature_action *jfa, json_pull *jp) {
 	long long found_hashes = 0;
 	long long found_features = 0;
 	long long found_geometries = 0;
 
 	while (1) {
+		// v3.4 (M13): 读入阶段周期检查退出信号——大文件读入可达数十分钟，
+		// 此前信号只在 zoom 边界生效，读入期间 SIGTERM 被静默吞掉
+		if (json_read_shutdown_hook != NULL && json_read_shutdown_hook()) {
+			fprintf(stderr, "%s: shutdown signal received during input reading; stopping (no tiles were written)\n", jfa->fname.c_str());
+			json_free(jp->root);
+			jp->root = NULL;
+			exit(EXIT_NODATA);
+		}
+
 		json_object *j = json_read(jp);
 		if (j == NULL) {
 			if (jp->error != NULL) {
