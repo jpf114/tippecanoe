@@ -1306,7 +1306,9 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 		if (outdb != NULL) {
 			mbtiles_write_metadata(outdb, m, forcetable);
 		} else {
-			dir_write_metadata(outdir, m);
+			// v3.4 (CK-S1): 强制覆盖——中断阶段已写出 maxzoom 缩小的部分完成
+			// metadata，resume 完成后必须修复，否则客户端按旧 maxzoom 取瓦片
+			dir_write_metadata(outdir, m, true);
 		}
 		return std::make_pair(ret, m);
 	}

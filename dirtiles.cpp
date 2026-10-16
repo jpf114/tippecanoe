@@ -288,11 +288,11 @@ static void out(json_writer &state, std::string k, std::string v) {
 	state.json_write_string(v);
 }
 
-void dir_write_metadata(const char *outdir, const metadata &m) {
+void dir_write_metadata(const char *outdir, const metadata &m, bool overwrite_existing) {
 	std::string metadata = std::string(outdir) + "/metadata.json";
 
 	struct stat st;
-	if (stat(metadata.c_str(), &st) == 0) {
+	if (!overwrite_existing && stat(metadata.c_str(), &st) == 0) {
 		// Leave existing metadata in place with --allow-existing
 	} else {
 		FILE *fp = fopen(metadata.c_str(), "w");

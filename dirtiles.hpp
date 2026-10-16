@@ -8,7 +8,9 @@
 
 void dir_write_tile(const char *outdir, int z, int tx, int ty, std::string const &pbf);
 void dir_erase_zoom(const char *outdir, int z);
-void dir_write_metadata(const char *outdir, const metadata &m);
+// overwrite_existing: 强制覆盖已存在的 metadata.json（CK-S1：resume 完成后必须
+// 修复中断阶段写出的部分完成 metadata；默认 false 保留上游 --allow-existing 语义）
+void dir_write_metadata(const char *outdir, const metadata &m, bool overwrite_existing = false);
 
 void check_dir(const char *d, char **argv, bool force, bool forcetable);
 
