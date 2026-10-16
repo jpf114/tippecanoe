@@ -37,13 +37,18 @@ constexpr int WKB_MAX_RECURSION_DEPTH = 16;
 extern const int mb_geometry[GEOM_TYPES];
 
 struct WKBResult {
-    int geometry_type;
+    int geometry_type = -1;
     drawvec coordinates;
     bool valid;
     std::string error;
     int srid;
     bool has_z;
     bool has_m;
+    // v3.4 (DB-S4): GEOMETRYCOLLECTION 的子几何（嵌套 collection 已递归摊平）。
+    // 非 collection 类型该字段为空；collection 自身的 coordinates 为空，
+    // 每个子几何一个 WKBResult，由调用方逐个产出 feature（对齐原版
+    // GeoJSON 路径把 collection 拆成多个 feature 的语义）。
+    std::vector<WKBResult> parts;
 };
 
 WKBResult parse_wkb(const uint8_t* data, size_t len);

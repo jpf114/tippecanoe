@@ -1103,7 +1103,11 @@ void PostGISReader::process_feature(PGresult *res, int row, int nfields, int wkb
         return;
     }
 
+    // v3.4 (DB-S4): 内存记账包含 collection 的 parts 坐标
     size_t coord_memory = result.coordinates.capacity() * sizeof(draw);
+    for (const auto &p : result.parts) {
+        coord_memory += p.coordinates.capacity() * sizeof(draw);
+    }
     current_memory_usage.fetch_add(coord_memory);
 
     if (result.geometry_type < 0 || result.geometry_type > GEOM_GEOMETRYCOLLECTION)
@@ -1115,21 +1119,28 @@ void PostGISReader::process_feature(PGresult *res, int row, int nfields, int wkb
         return;
     }
 
-    serial_feature sf;
-    sf.layer = layer;
-    sf.segment = thread_id % sst.size();
-    int geom_idx = result.geometry_type;
-    if (geom_idx == GEOM_GEOMETRYCOLLECTION) {
-        geom_idx = GEOM_MULTIPOLYGON;
+    // v3.4 (DB-S4): GEOMETRYCOLLECTION 拆分为多个 feature（每个子几何一个，
+    // 嵌套 collection 已在解析时递归摊平），对齐原版 GeoJSON 路径语义——
+    // 此前摊平为单个 MULTIPOLYGON 且 mb_geometry[6] 数组越界，实测
+    // collection feature 完全静默丢失。空 collection 不产出 feature。
+    std::vector<std::pair<int, drawvec>> emitted;
+    if (result.geometry_type == GEOM_GEOMETRYCOLLECTION) {
+        for (auto &part : result.parts) {
+            if (part.geometry_type < 0 || part.geometry_type >= GEOM_TYPES) {
+                parse_errors_.fetch_add(1);
+                ErrorLogger::instance().log_parse_error(row + 1, "UNSUPPORTED",
+                    "Unsupported geometry type in collection: " + std::to_string(part.geometry_type), "");
+                continue;
+            }
+            emitted.emplace_back(part.geometry_type, std::move(part.coordinates));
+        }
+        if (emitted.empty()) {
+            current_memory_usage.fetch_sub(coord_memory);
+            return;
+        }
+    } else {
+        emitted.emplace_back(result.geometry_type, std::move(result.coordinates));
     }
-    sf.t = mb_geometry[geom_idx];
-    sf.geometry = result.coordinates;
-    sf.has_id = false;
-    sf.id = 0;
-    sf.tippecanoe_minzoom = -1;
-    sf.tippecanoe_maxzoom = -1;
-    sf.feature_minzoom = 0;
-    sf.seq = *(sst[thread_id % sst.size()].layer_seq);
 
     struct AttrKV {
         std::string key;
@@ -1216,16 +1227,31 @@ void PostGISReader::process_feature(PGresult *res, int row, int nfields, int wkb
         values.push_back(kv.value);
     }
 
-    sf.full_keys = std::move(full_keys);
-    sf.full_values = std::move(values);
-
     current_memory_usage.fetch_add(attr_memory);
 
-    struct serialization_state temp_sst = sst[thread_id % sst.size()];
-    temp_sst.fname = "PostGIS";
-    temp_sst.line = row + 1;
+    // v3.4 (DB-S4): 每个（子）几何产出独立 feature；属性共享同一组
+    // full_keys/full_values（shared_ptr 引用计数，拷贝开销小）
+    for (auto &e : emitted) {
+        serial_feature sf;
+        sf.layer = layer;
+        sf.segment = thread_id % sst.size();
+        sf.t = mb_geometry[e.first];
+        sf.geometry = std::move(e.second);
+        sf.has_id = false;
+        sf.id = 0;
+        sf.tippecanoe_minzoom = -1;
+        sf.tippecanoe_maxzoom = -1;
+        sf.feature_minzoom = 0;
+        sf.seq = *(sst[thread_id % sst.size()].layer_seq);
+        sf.full_keys = full_keys;
+        sf.full_values = values;
 
-    serialize_feature(&temp_sst, sf, layername);
+        struct serialization_state temp_sst = sst[thread_id % sst.size()];
+        temp_sst.fname = "PostGIS";
+        temp_sst.line = row + 1;
+
+        serialize_feature(&temp_sst, sf, layername);
+    }
 
     current_memory_usage.fetch_sub(coord_memory + attr_memory);
 

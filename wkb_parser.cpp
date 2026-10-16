@@ -126,7 +126,16 @@ class WKBReader {
         }
     }
 
-    int parse_geometry(drawvec& out, int depth = 0) {
+    // v3.4 (DB-S4): MULTI* 的子几何合并回父 drawvec（multi 仍是单个 feature）；
+    // 容忍畸形的嵌套 collection 子几何，把其 parts 坐标一并摊平。
+    static void append_child_coords(drawvec& out, const WKBResult& child) {
+        out.insert(out.end(), child.coordinates.begin(), child.coordinates.end());
+        for (const WKBResult& p : child.parts) {
+            append_child_coords(out, p);
+        }
+    }
+
+    int parse_geometry(WKBResult& out, int depth = 0) {
         if (depth > WKB_MAX_RECURSION_DEPTH) {
             throw std::runtime_error("WKB recursion depth exceeded (max " +
                                      std::to_string(WKB_MAX_RECURSION_DEPTH) + ")");
@@ -155,17 +164,17 @@ class WKBReader {
         switch (base_type) {
             case WKB_POINT:
                 geom_type = GEOM_POINT;
-                parse_point(out, has_z, has_m);
+                parse_point(out.coordinates, has_z, has_m);
                 break;
 
             case WKB_LINESTRING:
                 geom_type = GEOM_LINESTRING;
-                parse_linestring(out, has_z, has_m);
+                parse_linestring(out.coordinates, has_z, has_m);
                 break;
 
             case WKB_POLYGON:
                 geom_type = GEOM_POLYGON;
-                parse_polygon(out, has_z, has_m);
+                parse_polygon(out.coordinates, has_z, has_m);
                 break;
 
             case WKB_MULTIPOINT: {
@@ -176,7 +185,9 @@ class WKBReader {
                                              " (max " + std::to_string(WKB_MAX_SUBGEOMETRIES) + ")");
                 }
                 for (uint32_t i = 0; i < ngeoms; i++) {
-                    parse_geometry(out, depth + 1);
+                    WKBResult child;
+                    parse_geometry(child, depth + 1);
+                    append_child_coords(out.coordinates, child);
                 }
                 break;
             }
@@ -189,7 +200,9 @@ class WKBReader {
                                              " (max " + std::to_string(WKB_MAX_SUBGEOMETRIES) + ")");
                 }
                 for (uint32_t i = 0; i < ngeoms; i++) {
-                    parse_geometry(out, depth + 1);
+                    WKBResult child;
+                    parse_geometry(child, depth + 1);
+                    append_child_coords(out.coordinates, child);
                 }
                 break;
             }
@@ -202,12 +215,18 @@ class WKBReader {
                                              " (max " + std::to_string(WKB_MAX_SUBGEOMETRIES) + ")");
                 }
                 for (uint32_t i = 0; i < ngeoms; i++) {
-                    parse_geometry(out, depth + 1);
+                    WKBResult child;
+                    parse_geometry(child, depth + 1);
+                    append_child_coords(out.coordinates, child);
                 }
                 break;
             }
 
             case WKB_GEOMETRYCOLLECTION: {
+                // v3.4 (DB-S4): collection 不再摊平进单个 drawvec——每个子几何
+                // 解析为独立 WKBResult（嵌套 collection 递归摊平到本层 parts），
+                // 由调用方逐个产出 feature。此前摊平后标为 GEOM_TYPES 并映射为
+                // MULTIPOLYGON（mb_geometry[6] 数组越界），实测 feature 静默丢失。
                 geom_type = GEOM_TYPES;
                 uint32_t ngeoms = read_uint32();
                 if (ngeoms > WKB_MAX_SUBGEOMETRIES) {
@@ -215,7 +234,15 @@ class WKBReader {
                                              " (max " + std::to_string(WKB_MAX_SUBGEOMETRIES) + ")");
                 }
                 for (uint32_t i = 0; i < ngeoms; i++) {
-                    parse_geometry(out, depth + 1);
+                    WKBResult child;
+                    parse_geometry(child, depth + 1);
+                    if (child.geometry_type == GEOM_TYPES) {
+                        for (WKBResult& p : child.parts) {
+                            out.parts.push_back(std::move(p));
+                        }
+                    } else {
+                        out.parts.push_back(std::move(child));
+                    }
                 }
                 break;
             }
@@ -224,6 +251,9 @@ class WKBReader {
                 throw std::runtime_error("Unknown WKB geometry type: " + std::to_string(base_type));
         }
 
+        // v3.4 (DB-S4): 必须写回结果对象——COLLECTION/MULTI 分支以 WKBResult&
+        // 递归调用本函数且不使用返回值，子几何类型只能靠这里写入
+        out.geometry_type = geom_type;
         return geom_type;
     }
 
@@ -248,7 +278,7 @@ public:
                 return result;
             }
 
-            result.geometry_type = parse_geometry(result.coordinates);
+            result.geometry_type = parse_geometry(result);
             result.valid = true;
 
         } catch (const std::exception& e) {
