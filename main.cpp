@@ -1349,7 +1349,9 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 
 		metadata m = make_metadata(fname, minzoom, maxzoom, minlat, minlon, maxlat, maxlon, minlat2, minlon2, maxlat2, maxlon2, midlat, midlon, attribution, merged_lm, true, description, !prevent[P_TILE_STATS], attribute_descriptions, "tippecanoe", commandline, strategies, basezoom, droprate, retain_points_multiplier);
 		if (outdb != NULL) {
-			mbtiles_write_metadata(outdb, m, forcetable);
+			// v3.4 合流: resume 恒定覆盖修复部分完成 metadata（与 CK-S1 的
+			// dir 模式强制覆盖对齐）
+			mbtiles_write_metadata(outdb, m, forcetable, true);
 		} else {
 			// v3.4 (CK-S1): 强制覆盖——中断阶段已写出 maxzoom 缩小的部分完成
 			// metadata，resume 完成后必须修复，否则客户端按旧 maxzoom 取瓦片

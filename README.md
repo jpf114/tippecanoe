@@ -1,7 +1,7 @@
 tippecanoe
 ==========
 
-Builds [vector tilesets](https://github.com/mapbox/vector-tile-spec/) from large (or small) collections of [GeoJSON](http://geojson.org/), [FlatGeobuf](https://github.com/flatgeobuf/flatgeobuf), or [CSV](https://en.wikipedia.org/wiki/Comma-separated_values) features,
+Builds [vector tilesets](https://github.com/mapbox/vector-tile-spec/) from large (or small) collections of [GeoJSON](http://geojson.org/), [FlatGeobuf](https://github.com/flatgeobuf/flatgeobuf), [CSV](https://en.wikipedia.org/wiki/Comma-separated_values) features, or directly from [PostGIS](https://postgis.net/) databases,
 [like these](MADE_WITH.md).
 
 This is the official home of Tippecanoe, developed and actively maintained by [Erica Fischer](https://github.com/e-n-f) at [Felt](https://felt.com). 
@@ -322,6 +322,7 @@ If your input is formatted as newline-delimited GeoJSON, use `-P` to make input 
  * _name_`.json.gz` or _name_`.geojson.gz`: Read the named gzipped GeoJSON input file into a layer called _name_.
  * _name_`.fgb`: Read the named FlatGeobuf input file into a layer called _name_.
  * _name_`.csv`: Read the named CSV input file into a layer called _name_.
+ * **PostGIS database**: Read spatial data directly from a PostGIS database using the `--postgis` option or related parameters. See [PostGIS support](#postgis-support) below for details.
  * `-l` _name_ or `--layer=`_name_: Use the specified layer name instead of deriving a name from the input filename or output tileset. If there are multiple input files
    specified, the files are all merged into the single named layer, even if they try to specify individual names with `-L`.
  * `-L` _name_`:`_file.json_ or `--named-layer=`_name_`:`_file.json_: Specify layer names for individual files. If your shell supports it, you can use a subshell redirect like `-L` _name_`:<(cat dir/*.json)` to specify a layer name for the output of streamed input.
@@ -710,30 +711,106 @@ have their probability diffused, so that some of them will be drawn as a square 
 this minimum size and others will not be drawn at all, preserving the total area that
 all of them should have had together.
 
-Features in the same tile that share the same type and attributes are coalesced
-together into a single geometry if you use `--coalesce`. You are strongly encouraged to use `-x` to exclude
-any unnecessary attributes to reduce wasted file size.
+## PostGIS Support
 
-If a tile is larger than 500K, it will try encoding that tile at progressively
-lower resolutions before failing if it still doesn't fit.
+This repository includes a customized `tippecanoe-db` workflow for reading directly from PostGIS and optionally writing MongoDB business output alongside MBTiles verification output.
+
+### tippecanoe-db Quick Start
+
+```bash
+tippecanoe-db \
+  --postgis "gis:postgres:password:localhost:5432" \
+  --postgis-table roads \
+  --postgis-geometry-field geom \
+  --mongo "tiles:roads:admin:password:localhost:27017:admin" \
+  -o roads.mbtiles \
+  -Z5 -z10
+```
+
+Notes:
+
+- Recommended PostGIS short form: `dbname[:user[:password[:host[:port]]]]`
+- Recommended Mongo short form: `dbname:collection[:username[:password[:host[:port[:auth_source]]]]]`
+- The legacy host-first connection format is still accepted for compatibility, but new examples use the short form above.
+- `--mongo` is business output; `-o` is MBTiles verification output
+- The default PostGIS attribute strategy now preserves source field order so MBTiles verification output matches native `tippecanoe` more closely by default
+
+### More Detail
+
+Use these commands to inspect the current CLI surface:
+
+```bash
+tippecanoe-db --help
+tippecanoe-db --help-advanced
+```
+
+The maintained database workflow guide is [docs/user_guide.md](docs/user_guide.md). Historical design and test notes live under [docs](docs).
 
 Development
 -----------
 
-Requires sqlite3 and zlib (should already be installed on MacOS). Rebuilding the manpage
-uses md2man (`gem install md2man`).
+Tippecanoe now builds against dependencies provided by vcpkg.
+Rebuilding the manpage uses md2man (`gem install md2man`).
 
-Linux:
+Install build tools (Linux):
 
-    sudo apt-get install gcc g++ make libsqlite3-dev zlib1g-dev
+    sudo apt-get install gcc g++ make git curl zip unzip tar pkg-config
 
-Then build:
+Install vcpkg and required libraries:
 
-    make
+```sh
+git clone https://github.com/microsoft/vcpkg.git "$HOME/vcpkg"
+"$HOME/vcpkg/bootstrap-vcpkg.sh"
+"$HOME/vcpkg/vcpkg" install sqlite3 zlib libpq mongo-cxx-driver
+```
 
-and perhaps
+Then build from this repository:
 
-    make install
+```sh
+make VCPKG_ROOT="$HOME/vcpkg"
+```
+
+To install binaries:
+
+```sh
+make VCPKG_ROOT="$HOME/vcpkg" install
+```
+
+If you need a non-default triplet, pass `VCPKG_TRIPLET`, for example:
+
+```sh
+make VCPKG_ROOT="$HOME/vcpkg" VCPKG_TRIPLET=x64-linux
+```
+
+On Linux, `x64-linux-dynamic` can be simpler for runtime linkage of `tippecanoe-db`
+dependencies (`libpq`, `mongocxx`, `bsoncxx`, OpenSSL):
+
+```sh
+make VCPKG_ROOT="$HOME/vcpkg" VCPKG_TRIPLET=x64-linux-dynamic -j tippecanoe-db
+```
+
+Run `tippecanoe-db` with the matching vcpkg runtime library path:
+
+```sh
+LD_LIBRARY_PATH="$HOME/vcpkg/installed/x64-linux-dynamic/lib:$HOME/vcpkg/installed/x64-linux-dynamic/debug/lib:${LD_LIBRARY_PATH}" \
+./tippecanoe-db [options]
+```
+
+Example (PostGIS input + MongoDB output):
+
+```sh
+LD_LIBRARY_PATH="$HOME/vcpkg/installed/x64-linux-dynamic/lib:$HOME/vcpkg/installed/x64-linux-dynamic/debug/lib:${LD_LIBRARY_PATH}" \
+./tippecanoe-db \
+  --postgis "TippTest:postgres:pg:localhost:5432" \
+  --postgis-table china \
+  --postgis-geometry-field geom \
+  --mongo "test:china:admin:admin:localhost:27017:admin" \
+  -o china.mbtiles \
+  -z12 -Z5
+```
+
+The build now resolves third-party headers and libraries from vcpkg instead of
+system paths such as `/usr/include/postgresql` or `/usr/local/include`.
 
 Tippecanoe now requires features from the 2011 C++ standard. If your compiler is older than
 that, you will need to install a newer one. On MacOS, updating to the latest XCode should

@@ -31,11 +31,13 @@
 *.out
 *.app
 tippecanoe
+tippecanoe-db
 tile-join
 tippecanoe-decode
 tippecanoe-enumerate
 tippecanoe-json-tool
 tippecanoe-overzoom
+tile_errors.db
 unit
 
 # Tests
@@ -53,3 +55,5 @@ tests/**/*.geobuf
 node_modules
 .vscode/
 test-data/
+/bin
+

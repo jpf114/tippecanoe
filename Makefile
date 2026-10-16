@@ -32,7 +32,13 @@ endif
 
 all: tippecanoe tippecanoe-enumerate tippecanoe-decode tile-join unit tippecanoe-json-tool tippecanoe-overzoom
 
+all-db: all tippecanoe-db
+
 docs: man/tippecanoe.1
+
+install-db: all-db
+	mkdir -p $(PREFIX)/bin
+	cp tippecanoe-db $(PREFIX)/bin/tippecanoe-db
 
 install: tippecanoe tippecanoe-enumerate tippecanoe-decode tile-join tippecanoe-json-tool tippecanoe-overzoom
 	mkdir -p $(PREFIX)/bin
@@ -45,7 +51,7 @@ install: tippecanoe tippecanoe-enumerate tippecanoe-decode tile-join tippecanoe-
 	cp tile-join $(PREFIX)/bin/tile-join
 	cp man/tippecanoe.1 $(MANDIR)/tippecanoe.1
 
-uninstall:
+uninstall: $(PREFIX)/bin/tippecanoe-db
 	rm $(PREFIX)/bin/tippecanoe $(PREFIX)/bin/tippecanoe-enumerate $(PREFIX)/bin/tippecanoe-decode $(PREFIX)/bin/tile-join $(MANDIR)/tippecanoe.1 $(PREFIX)/bin/tippecanoe-json-tool
 
 man/tippecanoe.1: README.md
@@ -56,11 +62,26 @@ PG=
 H = $(wildcard *.h) $(wildcard *.hpp)
 C = $(wildcard *.c) $(wildcard *.cpp)
 
-INCLUDES = -I/usr/local/include -I. -Iclipper2/include
-LIBS = -L/usr/local/lib
+# v3.4 合流: vcpkg 供 tippecanoe-db/unit 的 PostgreSQL/MongoDB 依赖；tippecanoe 仍为系统库
+VCPKG_ROOT ?= $(HOME)/vcpkg
+VCPKG_TRIPLET ?= x64-linux
+VCPKG_INSTALLED := $(VCPKG_ROOT)/installed/$(VCPKG_TRIPLET)
+VCPKG_INCLUDE = -I$(VCPKG_INSTALLED)/include
+VCPKG_LIB = -L$(VCPKG_INSTALLED)/lib
+MONGO_CXX_INCLUDE = -I$(VCPKG_INSTALLED)/include/libmongoc-1.0 -I$(VCPKG_INSTALLED)/include/bson-1.0 -I$(VCPKG_INSTALLED)/include/bsoncxx/v_noabi -I$(VCPKG_INSTALLED)/include/mongocxx/v_noabi
+PGIS_INCLUDE = $(VCPKG_INCLUDE) -I$(VCPKG_INSTALLED)/include/postgresql
+PGIS_LIB = $(VCPKG_LIB)
+COMMON_LIBS = -lm -lz -lsqlite3 -lpthread
+DB_EXTRA_LIBS = -lpq -lpgcommon -lpgport $(VCPKG_INSTALLED)/lib/libmongocxx-static.a $(VCPKG_INSTALLED)/lib/libbsoncxx-static.a $(VCPKG_INSTALLED)/lib/libmongoc2.a $(VCPKG_INSTALLED)/lib/libbson2.a $(VCPKG_INSTALLED)/lib/libutf8proc.a -lssl -lcrypto -lresolv -lz
+INCLUDES = $(VCPKG_INCLUDE) -I. -Iclipper2/include
+LIBS = -L/usr/local/lib $(VCPKG_LIB)
 
 tippecanoe: geojson.o jsonpull/jsonpull.o tile.o pool.o mbtiles.o geometry.o projection.o memfile.o mvt.o serial.o main.o platform.o text.o dirtiles.o pmtiles_file.o plugin.o read_json.o write_json.o geobuf.o flatgeobuf.o evaluator.o geocsv.o csv.o geojson-loop.o json_logger.o visvalingam.o compression.o clip.o sort.o attribute.o thread.o shared_borders.o checkpoint.o clipper2/src/clipper.engine.o
 	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lm -lz -lsqlite3 -lpthread
+
+tippecanoe-db: geojson.o jsonpull/jsonpull.o tile-db.o pool.o mbtiles.o geometry.o projection.o memfile.o mvt.o serial.o maindb.o common_main.o platform.o text.o dirtiles.o plugin.o read_json.o write_json.o evaluator.o geojson-loop.o json_logger.o visvalingam.o compression.o clip.o sort.o attribute.o thread.o shared_borders.o postgis.o wkb_parser.o error_logger.o mongo.o postgis_manager.o mongo_manager.o clipper2/src/clipper.engine.o
+	$(CXX) $(PG) $(LIBS) $(PGIS_LIB) $(MONGO_CXX_INCLUDE) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(COMMON_LIBS) $(DB_EXTRA_LIBS)
+
 
 tippecanoe-enumerate: enumerate.o
 	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lsqlite3 -lpthread
@@ -74,13 +95,47 @@ tile-join: tile-join.o platform.o projection.o mbtiles.o mvt.o memfile.o dirtile
 tippecanoe-json-tool: jsontool.o jsonpull/jsonpull.o csv.o text.o geojson-loop.o
 	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lm -lz -lsqlite3 -lpthread
 
-unit: unit.o text.o sort.o mvt.o projection.o clip.o attribute.o jsonpull/jsonpull.o evaluator.o read_json.o clipper2/src/clipper.engine.o
-	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lm -lz -lsqlite3 -lpthread
+unit: unit.o text.o sort.o mvt.o projection.o clip.o attribute.o jsonpull/jsonpull.o evaluator.o read_json.o postgis.o wkb_parser.o error_logger.o serial.o geometry.o visvalingam.o clipper2/src/clipper.engine.o
+	$(CXX) $(PG) $(LIBS) $(PGIS_LIB) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(COMMON_LIBS) -lpq -lpgcommon -lpgport -lssl -lcrypto -lresolv -lsqlite3
 
 tippecanoe-overzoom: overzoom.o mvt.o clip.o evaluator.o jsonpull/jsonpull.o text.o attribute.o read_json.o projection.o read_json.o clipper2/src/clipper.engine.o
 	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lm -lz -lsqlite3 -lpthread
 
 -include $(wildcard *.d)
+
+# Special rules must come before generic rules
+# Special rule for flatgeobuf.o: vcpkg flatbuffers (25) conflicts with the bundled generated headers (22)
+flatgeobuf.o: flatgeobuf.cpp
+	$(CXX) -MMD -I/usr/local/include -I. -Iclipper2/include $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
+
+# Special rule for postgis.o with PostgreSQL headers
+postgis.o: postgis.cpp
+	$(CXX) -MMD $(PG) $(PGIS_INCLUDE) $(INCLUDES) $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
+
+# Special rule for postgis_manager.o with PostgreSQL headers
+postgis_manager.o: postgis_manager.cpp
+	$(CXX) -MMD $(PG) $(PGIS_INCLUDE) $(INCLUDES) $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
+
+# Special rule for mongo.o with MongoDB headers
+mongo.o: mongo.cpp
+	$(CXX) -MMD $(PG) $(PGIS_INCLUDE) $(INCLUDES) $(MONGO_CXX_INCLUDE) $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
+
+# Special rule for mongo_manager.o with MongoDB headers
+mongo_manager.o: mongo_manager.cpp
+	$(CXX) -MMD $(PG) $(PGIS_INCLUDE) $(INCLUDES) $(MONGO_CXX_INCLUDE) $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
+
+# Special rule for tile-db.o with MongoDB headers (includes mongo.hpp) - for tippecanoe-db only
+tile-db.o: tile-db.cpp
+	$(CXX) -MMD $(PG) $(PGIS_INCLUDE) $(INCLUDES) $(MONGO_CXX_INCLUDE) $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
+
+# Special rule for maindb.o with MongoDB headers (includes mongo.hpp)
+maindb.o: maindb.cpp
+	$(CXX) -MMD $(PG) $(PGIS_INCLUDE) $(INCLUDES) $(MONGO_CXX_INCLUDE) $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
+
+# Special rule for unit.o with MongoDB headers (tests include mongo.hpp helpers)
+unit.o: unit.cpp
+	$(CXX) -MMD $(PG) $(INCLUDES) $(MONGO_CXX_INCLUDE) $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
+
 
 %.o: %.c
 	$(CC) -MMD $(PG) $(INCLUDES) $(FINAL_FLAGS) $(CFLAGS) -c -o $@ $<

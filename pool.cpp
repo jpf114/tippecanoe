@@ -87,7 +87,8 @@ long long addpool(struct memfile *poolfile, struct memfile *treefile, const char
 	// Size of memory divided by 10 from observation of OOM errors (when supposedly
 	// 20% of memory is full) and onset of thrashing (when supposedly 15% of memory
 	// is full) on ECS.
-	if ((size_t) (poolfile->off + treefile->off) > memsize / CPUS / 10) {
+	// Enhanced with dynamic flush threshold based on CPU count
+	if ((size_t) (poolfile->off + treefile->off) > std::max(memsize / CPUS / 10, (size_t) get_flush_threshold())) {
 		// If the pool and search tree get to be larger than physical memory,
 		// then searching will start thrashing. Switch to appending strings
 		// to the file instead of keeping them in memory.

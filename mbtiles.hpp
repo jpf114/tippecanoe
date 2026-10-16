@@ -69,7 +69,9 @@ void mbtiles_write_tile(sqlite3 *outdb, int z, int tx, int ty, const char *data,
 void mbtiles_erase_zoom(sqlite3 *outdb, int z);
 
 metadata make_metadata(const char *fname, int minzoom, int maxzoom, double minlat, double minlon, double maxlat, double maxlon, double minlat2, double minlon2, double maxlat2, double maxlon2, double midlat, double midlon, const char *attribution, std::map<std::string, layermap_entry> const &layermap, bool vector, const char *description, bool do_tilestats, std::map<std::string, std::string> const &attribute_descriptions, std::string const &program, std::string const &commandline, std::vector<strategy> const &strategies, int basezoom, double droprate, int retain_points_multiplier);
-void mbtiles_write_metadata(sqlite3 *db, const metadata &m, bool forcetable);
+// force_replace: resume 等场景恒定覆盖 metadata 并清理空值旧行（v3.4 合流）；
+// 其余场景保持上游 allow-existing 语义（forcetable -> INSERT OR IGNORE）
+void mbtiles_write_metadata(sqlite3 *db, const metadata &m, bool forcetable, bool force_replace = false);
 
 void mbtiles_close(sqlite3 *outdb, const char *pgm);
 

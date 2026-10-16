@@ -20,5 +20,6 @@
 #define EXIT_UTF8 119
 #define EXIT_WRITE 120
 #define EXIT_CHECKPOINT 121  // checkpoint 数据校验失败或磁盘空间不足
+#define EXIT_MONGO 122
 
 // avoid 124, 125, 126, 127, 137, which are used by GNU timeout
