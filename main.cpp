@@ -1263,14 +1263,24 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 			fprintf(stderr, "%s: checkpoint: restored tiling options from checkpoint (self-contained resume)\n", *av);
 		}
 
-		if (restored.pool_off.size() < CPUS) {
-			restored.pool_off.resize(CPUS, 0);
-		}
-		if (restored.initial_x.size() < CPUS) {
-			restored.initial_x.resize(CPUS, 0);
-		}
-		if (restored.initial_y.size() < CPUS) {
-			restored.initial_y.resize(CPUS, 0);
+		// v3.4 (CK-S3): 扩容到 segment 数上界——恢复的 layermaps 已含原作业
+		// 累积的段（每轮 zoom 增长 CPUS），加上本机每轮的 CPUS 个 tiling 段；
+		// prefilter/postfilter 输出 feature 的 segment = tiling_seg。从未写入
+		// 的槽位为 0，与写入侧读取到的值一致，消除越界读。
+		{
+			size_t need = restored.layermaps.size() + (size_t) CPUS * (maxzoom - restored.iz + 2);
+			if (need < 2 * (size_t) CPUS) {
+				need = 2 * (size_t) CPUS;
+			}
+			if (restored.pool_off.size() < need) {
+				restored.pool_off.resize(need, 0);
+			}
+			if (restored.initial_x.size() < need) {
+				restored.initial_x.resize(need, 0);
+			}
+			if (restored.initial_y.size() < need) {
+				restored.initial_y.resize(need, 0);
+			}
 		}
 
 		std::atomic<unsigned> midx(restored.midx.load());
@@ -1462,12 +1472,15 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 
 	std::atomic<long long> progress_seq(0);
 
-	// 2 * CPUS: One per reader thread, one per tiling thread
-	int initialized[2 * CPUS];
-	unsigned initial_x[2 * CPUS], initial_y[2 * CPUS];
-	for (size_t i = 0; i < 2 * CPUS; i++) {
-		initialized[i] = initial_x[i] = initial_y[i] = 0;
-	}
+	// v3.4 (CK-S3): segment 每轮 zoom 增长 CPUS 个（tiling_seg = thread +
+	// layermaps.size()），固定 2*CPUS 数组在多轮 zoom 的 rewrite/next_feature
+	// 路径（initial_x[segment] / pool_off[segment]）会越界读。按 zoom 轮数
+	// 上界分配；从未写入的槽位为 0，与写入侧读取到的值一致。
+	size_t seg_capacity = (size_t) CPUS * (MAX_ZOOM + 3);
+	std::vector<int> initialized_vec(seg_capacity, 0);
+	std::vector<unsigned> initial_x_vec(seg_capacity, 0), initial_y_vec(seg_capacity, 0);
+	int *initialized = initialized_vec.data();
+	unsigned *initial_x = initial_x_vec.data(), *initial_y = initial_y_vec.data();
 
 	size_t nlayers = sources.size();
 	for (size_t l = 0; l < nlayers; l++) {
@@ -2041,10 +2054,10 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 	// segment+offset to find the data.
 
 	// 2 * CPUS: One per input thread, one per tiling thread
-	long long pool_off[2 * CPUS];
-	for (size_t i = 0; i < 2 * CPUS; i++) {
-		pool_off[i] = 0;
-	}
+	// v3.4 (CK-S3): 按 segment 数上界分配（每轮 zoom 增长 CPUS），消除
+	// 多轮 zoom 后 pool_off[segment] 越界读；未写槽位为 0
+	std::vector<long long> pool_off_vec(seg_capacity, 0);
+	long long *pool_off = pool_off_vec.data();
 
 	char poolname[strlen(tmpdir) + strlen("/pool.XXXXXXXX") + 1];
 	snprintf(poolname, sizeof(poolname), "%s%s", tmpdir, "/pool.XXXXXXXX");

@@ -1791,6 +1791,14 @@ std::unique_ptr<Session> Session::open_resume(const char *dir) {
 	// 校验指纹（内部一致性）
 	s->verify_fingerprint_internal();
 
+	// v3.4 (CK-S3): 校验 CPU 数一致——segment 槽位布局（读入段/各轮 tiling 段）
+	// 与原作业 CPUS 绑定，续跑机器核数不同会导致旧 geom 的 segment 越界
+	if (s->state_.cpus != 0 && s->state_.cpus != (size_t) CPUS) {
+		fprintf(stderr, "%s: checkpoint was created with %zu CPUs but this machine has %zu; resume requires the same CPU count\n",
+			*av, s->state_.cpus, (size_t) CPUS);
+		exit(EXIT_CHECKPOINT);
+	}
+
 	// v3.1: 校验 blobs/ 文件存在性（防止断电后不一致）
 	s->verify_blobs_consistency();
 
