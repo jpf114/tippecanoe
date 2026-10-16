@@ -2330,9 +2330,14 @@ void cleanup_resume_dirs(const char *output_path, int last_completed_zoom, int m
 }
 
 void cleanup_resume_tiles(sqlite3 *outdb, int last_completed_zoom) {
-	if (outdb == NULL || last_completed_zoom < 0) {
+	if (outdb == NULL) {
 		return;
 	}
+
+	// v3.4 (CK-S2): last_completed_zoom < 0（尚无 zoom 完成）时同样必须清理——
+	// entry 快照完成后、首个 zoom 提交前被 kill -9/断电时，map 表已有部分写入
+	// 的 z=iz 瓦片；若跳过清理，resume 重写 z=iz 会撞 map_index 唯一索引导致
+	// exit(EXIT_SQLITE)。zoom_level > -1 恰好删除全部未提交瓦片。
 
 	char *err = NULL;
 	if (sqlite3_exec(outdb, "PRAGMA journal_mode=DELETE;", NULL, NULL, &err) != SQLITE_OK) {
