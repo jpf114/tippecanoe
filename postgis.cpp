@@ -1346,7 +1346,11 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
             if (thread_id == 0 && should_emit_postgis_runtime_logs(config)) {
                 fprintf(stderr, "Thread %zu: sharding not available in mode '%s', falling back to sequential read\n", thread_id, shard_mode.c_str());
                 if (shard_mode == "auto") {
-                    fprintf(stderr, "  Diagnostic: auto mode failed because ctid is not available in subquery results\n");
+                    if (config.has_sql_input()) {
+                        fprintf(stderr, "  Diagnostic: ctid sharding is not applicable to --postgis-sql input (the subquery has no ctid)\n");
+                    } else {
+                        fprintf(stderr, "  Diagnostic: auto ctid sharding probe failed; see PostgreSQL errors above\n");
+                    }
                     fprintf(stderr, "  Solution: Use --postgis-shard-key=<column> --postgis-shard-mode=key\n");
                     fprintf(stderr, "  Example: --postgis-shard-key=ogc_fid --postgis-shard-mode=key\n");
                 }
@@ -1539,5 +1543,11 @@ std::string PostGISReader::build_sharded_query(const std::string &base_query, co
         return base_query;
     }
 
-    return "SELECT * FROM (" + base_query + ") AS _shard_src WHERE " + shard_condition;
+    // v3.4 (DB-S1): 分片条件直接追加到内层查询的 WHERE，而不是包一层外层
+    // 子查询再过滤——ctid 等系统列在外层子查询的结果集中不可见，导致
+    // ctid 分片 probe 必然失败、auto 模式永远退化为单线程。
+    // base_query 由 build_select_query 构造，恒以 "FROM <table|subquery>"
+    // 结尾且不含 WHERE 子句，直接追加安全。SQL 输入模式（FROM (user_sql)
+    // AS _subq）本身没有 ctid，该模式下 ctid 分片仍不可用（诊断信息已说明）。
+    return base_query + " WHERE " + shard_condition;
 }
