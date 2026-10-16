@@ -172,7 +172,8 @@ tippecanoe-db \
 **方式一：连接字符串（推荐）**
 
 ```bash
---postgis "dbname[:user[:password[:host[:port]]]]"
+--postgis "postgresql://user:password@host:port/dbname"
+
 ```
 
 | 部分 | 说明 | 示例 |
@@ -183,7 +184,7 @@ tippecanoe-db \
 | host | 数据库主机 | localhost |
 | port | 数据库端口 | 5432 |
 
-> 兼容说明：当前实现仍兼容旧的 host-first 连接串，但推荐统一使用上面的 dbname-first 短格式，并把表名、几何列名通过 `--postgis-table`、`--postgis-geometry-field` 单独传入。
+> 格式说明：仅支持标准 `postgresql://` URI 格式（不再支持 dbname-first 短格式与 host-first 旧格式）。表名、几何列名通过 `--postgis-table`、`--postgis-geometry-field` 单独传入；`--postgis-sql` 自定义查询时几何列由查询结果集自动推断（多候选时需 `--postgis-geometry-field` 显式指定）。
 
 **方式二：独立参数**
 
@@ -877,7 +878,7 @@ tippecanoe-db 运行异常
 
 | 参数 | 短选项 | 必选 | 默认值 | 约束/说明 |
 |------|--------|------|--------|-----------|
-| `--postgis` | — | 条件必选 | — | 推荐。连接串：`dbname[:user[:password[:host[:port]]]]` |
+| `--postgis` | — | 条件必选 | — | 推荐。连接串：`postgresql://user:password@host:port/dbname` |
 | `--postgis-host` | — | 条件必选 | localhost | 分字段模式下必填之一 |
 | `--postgis-port` | — | 条件必选 | 5432 | 分字段模式下必填之一 |
 | `--postgis-dbname` | — | 条件必选 | — | 分字段模式下必填之一 |
@@ -899,7 +900,7 @@ tippecanoe-db 运行异常
 
 | 参数 | 短选项 | 必选 | 默认值 | 约束/说明 |
 |------|--------|------|--------|-----------|
-| `--mongo` | — | 条件必选 | — | 推荐。连接串：`dbname:collection[:username[:password[:host[:port[:auth_source]]]]]` |
+| `--mongo` | — | 条件必选 | — | 推荐。连接串：`mongodb://user:password@host:port/dbname?collection=name[&authSource=src]`，Atlas 等场景支持 `mongodb+srv://` |
 | `--mongo-host` | — | 条件必选 | — | 分字段模式下必填之一 |
 | `--mongo-port` | — | 条件必选 | 27017 | 分字段模式下必填之一 |
 | `--mongo-dbname` | — | 条件必选 | — | 分字段模式下必填之一 |
