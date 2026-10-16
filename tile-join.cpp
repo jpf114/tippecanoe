@@ -66,6 +66,74 @@ bool progress_time() {
 	return false;
 }
 
+// v3.4 (M15): 感知等经纬线性网格瓦片集。tippecanoe 仅在线性网格（-s EPSG:4490
+// 或 --output-projection 指定地理坐标系）输出时写入 crs 元数据，Web Mercator
+// 输出没有 crs 行。据此在读入输入瓦片集时切换输出投影：边界统计
+// （unproject_output_ll）与输出元数据（output_tile_matrix_meta）随之跟随输入
+// 网格，crs 行也传递到输出。
+static bool input_grid_seen = false;
+static bool input_grid_linear = false;
+static std::string input_crs;
+
+static void handle_input_crs(char const *crs, char const *name) {
+	bool have_crs = (crs != NULL);
+	if (have_crs && find_projection(crs) == NULL) {
+		fprintf(stderr, "Warning: %s: unknown crs \"%s\", assuming Web Mercator grid\n", name, crs);
+		have_crs = false;
+	}
+
+	// 本库约定：crs 行存在即线性网格（EPSG:3857 Mercator 输出从不写 crs）
+	bool linear = have_crs;
+
+	if (input_grid_seen) {
+		if (input_grid_linear != linear || (linear && input_crs != crs)) {
+			fprintf(stderr, "%s: mismatched tile grids: %s vs previous %s; joining would produce misaligned output\n", name, linear ? crs : "Web Mercator", input_grid_linear ? input_crs.c_str() : "Web Mercator");
+			exit(EXIT_ARGS);
+		}
+		return;
+	}
+
+	input_grid_seen = true;
+	if (linear) {
+		input_grid_linear = true;
+		input_crs = crs;
+		set_output_projection_or_exit(crs);
+	}
+}
+
+static void read_dir_input_crs(char const *dirbase) {
+	std::string meta = std::string(dirbase) + "/metadata.json";
+	FILE *f = fopen(meta.c_str(), "re");
+	if (f == NULL) {
+		return;  // 无 metadata.json 的目录不参与网格一致性检查
+	}
+
+	json_pull *jp = json_begin_file(f);
+	json_object *o = json_read_tree(jp);
+	bool found_crs = false;
+	if (o != NULL) {
+		if (o->type == JSON_HASH) {
+			for (size_t i = 0; i < o->value.object.length; i++) {
+				json_object *k = o->value.object.keys[i];
+				json_object *v = o->value.object.values[i];
+				if (k != NULL && k->type == JSON_STRING && v != NULL && v->type == JSON_STRING &&
+				    strcmp(k->value.string.string, "crs") == 0) {
+					handle_input_crs(v->value.string.string, dirbase);
+					found_crs = true;
+				}
+			}
+		}
+		json_free(o);
+	}
+	if (!found_crs) {
+		// metadata.json 不存在 crs 行（或损坏/非哈希）：按 Web Mercator 网格
+		// 参与网格一致性检查
+		handle_input_crs(NULL, dirbase);
+	}
+	json_end(jp);
+	fclose(f);
+}
+
 struct stats {
 	int minzoom = 0;
 	int maxzoom = 0;
@@ -391,16 +459,18 @@ void append_tile(std::string message, int z, unsigned x, unsigned y, std::map<st
 		if (features_added_to_layer) {
 			double lat1, lon1;
 			double lat2, lon2;
-			tile2lonlat(minx, maxy, 32, &lon1, &lat1);
-			tile2lonlat(maxx, miny, 32, &lon2, &lat2);
+			// v3.4 (M15): 跟随输入网格反投影（线性网格下 tile2lonlat 的
+			// Mercator 纬度公式会给出错误边界）
+			unproject_output_ll(minx, maxy, 32, &lon1, &lat1);
+			unproject_output_ll(maxx, miny, 32, &lon2, &lat2);
 
 			a->minlat = std::min(a->minlat, std::min(lat1, lat2));
 			a->minlon = std::min(a->minlon, std::min(lon1, lon2));
 			a->maxlat = std::max(a->maxlat, std::max(lat1, lat2));
 			a->maxlon = std::max(a->maxlon, std::max(lon1, lon2));
 
-			tile2lonlat(minx2, maxy, 32, &lon1, &lat1);
-			tile2lonlat(maxx2, miny, 32, &lon2, &lat2);
+			unproject_output_ll(minx2, maxy, 32, &lon1, &lat1);
+			unproject_output_ll(maxx2, miny, 32, &lon2, &lat2);
 
 			a->minlon2 = std::min(a->minlon2, std::min(lon1, lon2));
 			a->maxlon2 = std::max(a->maxlon2, std::max(lon1, lon2));
@@ -500,6 +570,7 @@ struct tileset_reader {
 
 			dirtiles = enumerate_dirtiles(fname, minzoom, maxzoom);
 			dirbase = fname;
+			read_dir_input_crs(fname);
 		} else if (pmtiles_has_suffix(fname)) {
 			int pmtiles_fd = open(fname, O_RDONLY | O_CLOEXEC);
 			pmtiles_map = (char *) mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, pmtiles_fd, 0);
@@ -525,6 +596,22 @@ struct tileset_reader {
 			if (sqlite3_exec(db, "PRAGMA integrity_check;", NULL, NULL, &err) != SQLITE_OK) {
 				fprintf(stderr, "%s: integrity_check: %s\n", fname, err);
 				exit(EXIT_SQLITE);
+			}
+
+			// v3.4 (M15): 读取输入瓦片集的网格类型（有无 crs 元数据行）
+			{
+				sqlite3_stmt *crs_stmt;
+				if (sqlite3_prepare_v2(db, "SELECT value from metadata where name = 'crs'", -1, &crs_stmt, NULL) == SQLITE_OK) {
+					char const *crs = NULL;
+					if (sqlite3_step(crs_stmt) == SQLITE_ROW) {
+						const unsigned char *s = sqlite3_column_text(crs_stmt, 0);
+						if (s != NULL) {
+							crs = (char const *) s;
+						}
+					}
+					handle_input_crs(crs, fname);
+					sqlite3_finalize(crs_stmt);
+				}
 			}
 
 			const char *sql = "SELECT zoom_level, tile_column, tile_row, tile_data from tiles order by zoom_level, tile_column, tile_row;";

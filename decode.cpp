@@ -317,6 +317,46 @@ void decode(char *fname, int z, unsigned x, unsigned y, std::set<std::string> co
 		}
 	}
 
+	// v3.4 (M15): 单瓦片路径（zoom x y）不经过全集 metadata 输出，需单独
+	// 识别 crs，才能对线性网格瓦片集使用正确反投影。与 z<0 全集路径的
+	// 识别规则一致：用户显式 -s 时以用户为准。
+	if (is_pmtiles) {
+		// pmtiles 元数据中的 JSON 头暂不解析 crs
+	} else if (isdir) {
+		std::string meta = std::string(fname) + "/metadata.json";
+		FILE *f = fopen(meta.c_str(), "re");
+		if (f != NULL) {
+			json_pull *jp = json_begin_file(f);
+			json_object *o = json_read_tree(jp);
+			if (o != NULL) {
+				if (o->type == JSON_HASH) {
+					for (size_t i = 0; i < o->value.object.length; i++) {
+						json_object *k = o->value.object.keys[i];
+						json_object *v = o->value.object.values[i];
+						if (k != NULL && k->type == JSON_STRING && v != NULL && v->type == JSON_STRING &&
+						    strcmp(k->value.string.string, "crs") == 0 && projection == &projections[0]) {
+							set_projection_or_exit(v->value.string.string);
+						}
+					}
+				}
+				json_free(o);
+			}
+			json_end(jp);
+			fclose(f);
+		}
+	} else {
+		sqlite3_stmt *crs_stmt;
+		if (sqlite3_prepare_v2(db, "SELECT value from metadata where name = 'crs'", -1, &crs_stmt, NULL) == SQLITE_OK) {
+			if (sqlite3_step(crs_stmt) == SQLITE_ROW) {
+				const unsigned char *value = sqlite3_column_text(crs_stmt, 0);
+				if (value != NULL && projection == &projections[0]) {
+					set_projection_or_exit((char *) value);
+				}
+			}
+			sqlite3_finalize(crs_stmt);
+		}
+	}
+
 	if (z < 0) {
 		int within = 0;
 

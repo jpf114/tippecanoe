@@ -398,7 +398,14 @@ void layer_to_geojson(mvt_layer const &layer, unsigned z, unsigned x, unsigned y
 				long long wy = wscale * y + (wscale / layer.extent) * py;
 
 				double lat, lon;
-				projection->unproject(wx, wy, 32, &lon, &lat);
+				// v3.4 (M15): 反投影必须跟随输出网格（output_grid_is_linear），
+				// 而非输入投影。-s 与 --output-projection 交叉组合（如
+				// -s EPSG:3857 --output-projection EPSG:4490）时，瓦片坐标
+				// 位于等经纬线性网格上，用 projection->unproject（输入投影）
+				// 会得到错误的经纬度，殃及 prefilter/postfilter（tile.cpp）与
+				// 属性过滤（plugin.cpp）。decode 路径不受影响：它按 crs 元数据
+				// 设置投影后，两者等价。
+				unproject_output_ll(wx, wy, 32, &lon, &lat);
 
 				ops.push_back(lonlat(op, lon, lat, px, py));
 			} else {
