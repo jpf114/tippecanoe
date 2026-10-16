@@ -249,6 +249,15 @@ static void validate_mongo_config() {
 
 static void validate_runtime_config() {
 	if (use_postgis) {
+		// v3.4 (DB-S3): PostGIS 读取链路恒定 ST_Transform(geom,4326) 后按
+		// WGS84 经纬度投影（wkb_parser 用全局 projection->project），输入
+		// 投影被硬编码为 4326；用户显式指定其它 -s/--projection 时会静默
+		// 产出错误坐标，必须显式拒绝。
+		if (projection != &projections[0]) {
+			fprintf(stderr, "Error: -s/--projection is not supported with PostGIS input (geometry is always transformed to EPSG:4326 internally). Remove -s or use EPSG:4326.\n");
+			exit(EXIT_ARGS);
+		}
+
 		if (postgis_cfg.has_table_input() && postgis_cfg.has_sql_input() && !quiet) {
 			fprintf(stderr, "Warning: both --postgis-table and --postgis-sql were provided; --postgis-sql will take precedence.\n");
 		}
