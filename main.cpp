@@ -4012,10 +4012,24 @@ int main(int argc, char **argv) {
 	// Track resume state for auto-cleanup (used after output is opened)
 	int resume_last_completed_zoom = -1;
 	bool resume_is_directory = false;
+	// v3.4 (M12): resume 参数复用——state.json 在此只解析一次，后续
+	// （sources 回退等）直接使用，不再重复读取与验指纹
+	checkpoint::ResumeInfo resume_info;
+	bool has_resume_info = false;
+
+	// v3.4 (M10): --checkpoint-dir 与 --resume 互斥检查前移——原位置在
+	// mbtiles_open（建库文件）/check_dir（建目录）之后，报错时已产生输出
+	// 侧副作用；且 read_resume_info 会在冲突场景下先输出误导性的 resume 摘要
+	if (checkpoint_dir != NULL && resume_dir != NULL) {
+		fprintf(stderr, "%s: --checkpoint-dir and --resume cannot be used together\n", argv[0]);
+		exit(EXIT_ARGS);
+	}
 
 	if (resume_dir != NULL) {
 		// Read all parameters from checkpoint — no need to pass them on command line
 		auto info = checkpoint::read_resume_info(resume_dir);
+		resume_info = info;
+		has_resume_info = true;
 
 		// Check if the checkpoint has a valid tiling snapshot
 		if (!info.entry_snapshot_done) {
@@ -4023,7 +4037,10 @@ int main(int argc, char **argv) {
 					"%s: The process was probably interrupted before the tiling phase began.\n"
 					"%s: Please re-run from scratch without --resume.\n",
 					argv[0], resume_dir, argv[0], argv[0]);
-			exit(EXIT_ARGS);
+			// v3.4 (M9): checkpoint 完整性校验失败统一用 EXIT_CHECKPOINT(121)，
+			// 与指纹不匹配/blobs 不一致等其它 checkpoint 校验失败语义一致
+			//（此前误用 EXIT_ARGS(101)，那是指纹不匹配的专用码）
+			exit(EXIT_CHECKPOINT);
 		}
 
 		resume_last_completed_zoom = info.last_completed_zoom;
@@ -4067,6 +4084,19 @@ int main(int argc, char **argv) {
 		// （持久化为空字符串表示用户原本就未指定 -n/-N/-A，与本地变量 NULL 一致）
 		if (!info.name.empty()) {
 			name = strdup(info.name.c_str());
+		} else {
+			// v3.4 (M1): 原作业未指定 -n 时，metadata.name 回填原作业的
+			// -o/-e 原样路径（fresh 语义即该值）。v3.4 起 state 持久化
+			// output_typed 实现精确恢复；旧版 state.json 无此字段，
+			// 回退为绝对输出路径的基本文件名（避免把恢复的绝对路径写进 name）。
+			std::string base = info.output_typed;
+			if (base.empty()) {
+				size_t slash = info.output_path.find_last_of('/');
+				base = (slash == std::string::npos) ? info.output_path : info.output_path.substr(slash + 1);
+			}
+			if (!base.empty()) {
+				name = strdup(base.c_str());
+			}
 		}
 		if (!info.description.empty()) {
 			description = strdup(info.description.c_str());
@@ -4146,11 +4176,6 @@ int main(int argc, char **argv) {
 		exit(EXIT_ARGS);
 	}
 
-	if (checkpoint_dir != NULL && resume_dir != NULL) {
-		fprintf(stderr, "%s: --checkpoint-dir and --resume cannot be used together\n", argv[0]);
-		exit(EXIT_ARGS);
-	}
-
 	// Auto-cleanup mbtiles: remove uncommitted tiles from killed session
 	if (resume_dir != NULL && outdb != NULL) {
 		checkpoint::cleanup_resume_tiles(outdb, resume_last_completed_zoom);
@@ -4167,9 +4192,9 @@ int main(int argc, char **argv) {
 
 	if (sources.size() == 0) {
 		// If resuming, read input file list from checkpoint (no args needed on command line)
-		if (resume_dir != NULL) {
-			auto info = checkpoint::read_resume_info(resume_dir);
-			for (auto const &f : info.input_files) {
+		// v3.4 (M12): 复用 resume 阶段已解析的 info，不再第三次读 state.json
+		if (resume_dir != NULL && has_resume_info) {
+			for (auto const &f : resume_info.input_files) {
 				struct source src;
 				src.layer = "";
 				src.file = f;
@@ -4196,50 +4221,59 @@ int main(int argc, char **argv) {
 	long long file_bbox1[4] = {0xFFFFFFFF, 0xFFFFFFFF, 0, 0};	      // standard -180 to 180 world plane
 	long long file_bbox2[4] = {0x1FFFFFFFF, 0xFFFFFFFF, 0x100000000, 0};  // 0 to 360 world plane
 
-	checkpoint::FingerprintParams fingerprint;
-	fingerprint.command_line = checkpoint::normalize_command_line_for_fingerprint(commandline);
-	fingerprint.temp_files = TEMP_FILES;
-	fingerprint.cpus = CPUS;
-	memcpy(fingerprint.prevent, prevent, sizeof(prevent));
-	memcpy(fingerprint.additional, additional, sizeof(additional));
-	// v3.2: 持久化 tileset metadata（-n / -N / -A），resume 时恢复
-	if (name != NULL) fingerprint.name = name;
-	if (description != NULL) fingerprint.description = description;
-	if (attribution != NULL) fingerprint.attribution = attribution;
-	// v3.4 (CK-S4): 持久化切片选项（此处为选项解析与 detail 调整后的生效值），
-	// bare resume 时恢复，保证续跑 zoom 与原作业切片行为一致
-	fingerprint.tiling_options.buffer = buffer;
-	fingerprint.tiling_options.gamma = gamma;
-	fingerprint.tiling_options.droprate = droprate;
-	fingerprint.tiling_options.full_detail = full_detail;
-	fingerprint.tiling_options.low_detail = low_detail;
-	fingerprint.tiling_options.min_detail = min_detail;
-	fingerprint.tiling_options.simplification = simplification;
-	fingerprint.tiling_options.maxzoom_simplification = maxzoom_simplification;
-	fingerprint.tiling_options.prefilter = prefilter != NULL ? prefilter : "";
-	fingerprint.tiling_options.postfilter = postfilter != NULL ? postfilter : "";
-	fingerprint.tiling_options.filter_json = filter_raw != NULL ? filter_raw : "";
-	fingerprint.tiling_options.filter_expression_mode = filter_expression_mode;
-	fingerprint.tiling_options.accumulate_attributes = accumulate_args;
-	std::vector<std::string> input_paths;
-	for (size_t a = 0; a < sources.size(); a++) {
-		if (!sources[a].file.empty()) {
-			input_paths.push_back(sources[a].file);
-		}
-	}
-	fingerprint.inputs = checkpoint::stat_input_paths(input_paths);
-	if (out_mbtiles != NULL) {
-		fingerprint.output_mode = pmtiles_has_suffix(out_mbtiles) ? "pmtiles" : "mbtiles";
-		fingerprint.output_path = checkpoint::absolute_path_or_die(out_mbtiles);
-	} else {
-		fingerprint.output_mode = "directory";
-		fingerprint.output_path = checkpoint::absolute_path_or_die(out_dir);
-	}
-
 	std::unique_ptr<checkpoint::Session> checkpoint_session;
 	if (resume_dir != NULL) {
+		// v3.4 (M12): resume 的指纹/输入统计/切片选项全部来自 state.json，
+		// 不再构建本进程的 fingerprint（此前构建后丢弃，白做 normalize
+		// 与全部输入文件的 stat）
 		checkpoint_session = checkpoint::Session::open_resume(resume_dir);
 	} else if (checkpoint_dir != NULL) {
+		checkpoint::FingerprintParams fingerprint;
+		fingerprint.command_line = checkpoint::normalize_command_line_for_fingerprint(commandline);
+		fingerprint.temp_files = TEMP_FILES;
+		fingerprint.cpus = CPUS;
+		memcpy(fingerprint.prevent, prevent, sizeof(prevent));
+		memcpy(fingerprint.additional, additional, sizeof(additional));
+		// v3.2: 持久化 tileset metadata（-n / -N / -A），resume 时恢复
+		if (name != NULL) fingerprint.name = name;
+		if (description != NULL) fingerprint.description = description;
+		if (attribution != NULL) fingerprint.attribution = attribution;
+		// v3.4 (CK-S4): 持久化切片选项（此处为选项解析与 detail 调整后的生效值），
+		// bare resume 时恢复，保证续跑 zoom 与原作业切片行为一致
+		fingerprint.tiling_options.buffer = buffer;
+		fingerprint.tiling_options.gamma = gamma;
+		fingerprint.tiling_options.droprate = droprate;
+		fingerprint.tiling_options.full_detail = full_detail;
+		fingerprint.tiling_options.low_detail = low_detail;
+		fingerprint.tiling_options.min_detail = min_detail;
+		fingerprint.tiling_options.simplification = simplification;
+		fingerprint.tiling_options.maxzoom_simplification = maxzoom_simplification;
+		fingerprint.tiling_options.prefilter = prefilter != NULL ? prefilter : "";
+		fingerprint.tiling_options.postfilter = postfilter != NULL ? postfilter : "";
+		fingerprint.tiling_options.filter_json = filter_raw != NULL ? filter_raw : "";
+		fingerprint.tiling_options.filter_expression_mode = filter_expression_mode;
+		fingerprint.tiling_options.accumulate_attributes = accumulate_args;
+		std::vector<std::string> input_paths;
+		for (size_t a = 0; a < sources.size(); a++) {
+			if (!sources[a].file.empty()) {
+				input_paths.push_back(sources[a].file);
+			}
+		}
+		fingerprint.inputs = checkpoint::stat_input_paths(input_paths);
+		// v3.4 (M1): 持久化 as-typed 输出路径（resume 恢复 metadata.name）
+		if (out_mbtiles != NULL) {
+			fingerprint.output_path_typed = out_mbtiles;
+		} else {
+			fingerprint.output_path_typed = out_dir;
+		}
+		if (out_mbtiles != NULL) {
+			fingerprint.output_mode = pmtiles_has_suffix(out_mbtiles) ? "pmtiles" : "mbtiles";
+			fingerprint.output_path = checkpoint::absolute_path_or_die(out_mbtiles);
+		} else {
+			fingerprint.output_mode = "directory";
+			fingerprint.output_path = checkpoint::absolute_path_or_die(out_dir);
+		}
+
 		checkpoint_session = checkpoint::Session::open_new(checkpoint_dir, checkpoint_force != 0, fingerprint);
 	}
 
