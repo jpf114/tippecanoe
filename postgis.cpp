@@ -527,12 +527,15 @@ static bool validate_selected_columns(PGconn *pgconn, const postgis_config &cfg,
 static std::string build_json_projection(PGconn *pgconn,
                                          const postgis_config &cfg,
                                          const std::vector<std::string> &source_cols,
-                                         const std::unordered_map<std::string, bool> &existing_cols) {
+                                         const std::unordered_map<std::string, bool> &existing_cols,
+                                         const std::string &resolved_geom_field) {
     std::string projected;
     if (!cfg.selected_columns_csv.empty()) {
         std::vector<std::string> cols = split_csv_list(cfg.selected_columns_csv);
         for (const std::string &col : cols) {
-            if (col == "wkb" || col == cfg.geometry_field) {
+            // v3.4 (DB-M1): 同时排除 resolve 后的实际几何列——SQL 模式下自动推断的
+            // 几何列与 config.geometry_field 可能不同，不排除会作为属性泄漏进瓦片
+            if (col == "wkb" || col == cfg.geometry_field || col == resolved_geom_field) {
                 continue;
             }
             if (!is_safe_identifier_token(col)) {
@@ -560,7 +563,7 @@ static std::string build_json_projection(PGconn *pgconn,
     }
 
     for (const std::string &col : source_cols) {
-        if (col == "wkb" || col == cfg.geometry_field) {
+        if (col == "wkb" || col == cfg.geometry_field || col == resolved_geom_field) {
             continue;
         }
         std::string esc_col = escape_identifier(pgconn, col);
@@ -903,7 +906,17 @@ std::string PostGISReader::build_select_query(const postgis_config &cfg, int sri
         }
     }
 
-    std::string projection = build_json_projection(pgconn, cfg, source_cols, existing_cols);
+    // v3.4 (DB-M1): 先 resolve 实际几何列再构建投影，使投影阶段就能排除它
+    std::string resolved_geom_field = cfg.geometry_field;
+    if (cfg.has_sql_input()) {
+        resolved_geom_field = resolve_sql_geometry_field(pgconn, cfg);
+        if (resolved_geom_field.empty()) {
+            fprintf(stderr, "Error: cannot resolve geometry field from --postgis-sql result set. Use --postgis-geometry-field.\n");
+            return "";
+        }
+    }
+
+    std::string projection = build_json_projection(pgconn, cfg, source_cols, existing_cols, resolved_geom_field);
     if (projection.empty() && !cfg.selected_columns_csv.empty() && !cfg.selected_columns_best_effort) {
         return "";
     }
@@ -913,11 +926,7 @@ std::string PostGISReader::build_select_query(const postgis_config &cfg, int sri
 
     if (cfg.has_sql_input())
     {
-        std::string sql_geom_field = resolve_sql_geometry_field(pgconn, cfg);
-        if (sql_geom_field.empty()) {
-            fprintf(stderr, "Error: cannot resolve geometry field from --postgis-sql result set. Use --postgis-geometry-field.\n");
-            return "";
-        }
+        std::string sql_geom_field = resolved_geom_field;
         std::string esc_geom = escape_identifier(pgconn, sql_geom_field);
         if (esc_geom.empty()) {
             return "";
