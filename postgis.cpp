@@ -14,6 +14,7 @@
 #include "geojson.hpp"
 #include "wkb_parser.hpp"
 #include "error_logger.hpp"
+#include "jsonpull/jsonpull.h"
 
 extern int quiet;
 
@@ -27,6 +28,8 @@ static std::unordered_map<std::string, std::vector<std::string>> table_columns_c
 static std::mutex table_columns_cache_mutex;
 static std::unordered_map<std::string, std::vector<std::string>> sql_columns_cache;
 static std::mutex sql_columns_cache_mutex;
+static std::unordered_map<std::string, std::unordered_map<std::string, bool>> json_text_columns_cache;
+static std::mutex json_text_columns_cache_mutex;
 
 static bool should_emit_postgis_runtime_logs(const postgis_config &config) {
     return config.enable_progress_report && !quiet;
@@ -52,6 +55,10 @@ void PostGISReader::reset_runtime_caches() {
     {
         std::lock_guard<std::mutex> lock(sql_columns_cache_mutex);
         sql_columns_cache.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(json_text_columns_cache_mutex);
+        json_text_columns_cache.clear();
     }
 }
 
@@ -132,6 +139,29 @@ static std::string minify_json_like(const std::string &s) {
     return out;
 }
 
+// v3.4 (DB-M2): 用 jsonpull 解析再序列化，与原版 GeoJSON 路径
+// （read_json.cpp 的 json_stringify）走完全相同的规范化路径：
+// 紧凑输出（无结构性空格）、保留解析序键序、数字经 milo dtoa 规范化
+// （1.50→1.5、1e2→100）、控制符 \u 转义、UTF-8 原样。PG jsonb::text /
+// to_jsonb::text 的结构性空格与数字形态差异均在此消除。
+// 解析失败（非法 JSON）返回空串，由调用方回退到仅去空白。
+static std::string canonicalize_json_doc_via_jsonpull(const std::string &s) {
+    json_pull *p = json_begin_string(s.c_str());
+    json_object *tree = json_read_tree(p);
+    if (tree == NULL) {
+        json_end(p);  // 释放 parser 与残缺树
+        return "";
+    }
+    char *v = json_stringify(tree);
+    std::string out = (v != NULL) ? v : "";
+    if (v != NULL) {
+        free(v);
+    }
+    json_free(tree);  // 先释放树：json_free 内部会将 parser->root 置空
+    json_end(p);
+    return out;
+}
+
 static std::string canonicalize_complex_text_attr(const char *value) {
     std::string s = trim_copy(value ? value : "");
     if (s.empty()) {
@@ -142,11 +172,14 @@ static std::string canonicalize_complex_text_attr(const char *value) {
     if (looks_like_pg_array_literal(s)) {
         s.front() = '[';
         s.back() = ']';
-        return minify_json_like(s);
     }
 
     // Match compact JSON object/array string style.
     if ((s.front() == '{' && s.back() == '}') || (s.front() == '[' && s.back() == ']')) {
+        std::string canon = canonicalize_json_doc_via_jsonpull(s);
+        if (!canon.empty()) {
+            return canon;
+        }
         return minify_json_like(s);
     }
 
@@ -414,6 +447,63 @@ static bool fetch_table_columns(PGconn *pgconn, const postgis_config &cfg, const
     return true;
 }
 
+// v3.4 (DB-M2): 探测结果集中 json 类型（pg_type OID 114）的列。json 列的投影
+// 不能用 to_jsonb 包裹——那会按 PG jsonb 规则（键长+字典序）重排键序并规范化
+// 数字文本，破坏与原版 GeoJSON 路径（保留文档插入序）的等价性；json 列需用
+// col::text 保留原文。jsonb 列本身经 PG 有损存储已无原始键序，投影维持 to_jsonb。
+static bool fetch_json_text_columns(PGconn *pgconn, const postgis_config &cfg,
+                                    bool sql_mode,
+                                    std::unordered_map<std::string, bool> &json_cols) {
+    std::string cache_key = cfg.host + "|" + cfg.port + "|" + cfg.dbname + "|" +
+                            (sql_mode ? cfg.sql : cfg.table);
+    {
+        std::lock_guard<std::mutex> lock(json_text_columns_cache_mutex);
+        auto it = json_text_columns_cache.find(cache_key);
+        if (it != json_text_columns_cache.end()) {
+            json_cols = it->second;
+            return true;
+        }
+    }
+
+    const int PG_TYPE_JSON_OID = 114;
+    if (sql_mode) {
+        std::string probe_query = "SELECT * FROM (" + cfg.sql + ") AS _subq LIMIT 0";
+        PGresult *res = PQexec(pgconn, probe_query.c_str());
+        if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+            PQclear(res);
+            return false;
+        }
+        for (int i = 0; i < PQnfields(res); i++) {
+            if (PQftype(res, i) == PG_TYPE_JSON_OID) {
+                json_cols[PQfname(res, i)] = true;
+            }
+        }
+        PQclear(res);
+    } else {
+        std::string esc_table_literal = escape_literal(pgconn, cfg.table);
+        if (esc_table_literal.empty()) {
+            return false;
+        }
+        std::string query =
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = " + esc_table_literal +
+            " AND udt_name = 'json'";
+        PGresult *res = PQexec(pgconn, query.c_str());
+        if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+            PQclear(res);
+            return false;
+        }
+        for (int i = 0; i < PQntuples(res); i++) {
+            json_cols[PQgetvalue(res, i, 0)] = true;
+        }
+        PQclear(res);
+    }
+
+    std::lock_guard<std::mutex> lock(json_text_columns_cache_mutex);
+    json_text_columns_cache[cache_key] = json_cols;
+    return true;
+}
+
 static std::string resolve_sql_geometry_field(PGconn *pgconn, const postgis_config &cfg) {
     std::unordered_map<std::string, bool> existing;
     if (!fetch_sql_subquery_columns(pgconn, cfg, existing)) {
@@ -528,7 +618,8 @@ static std::string build_json_projection(PGconn *pgconn,
                                          const postgis_config &cfg,
                                          const std::vector<std::string> &source_cols,
                                          const std::unordered_map<std::string, bool> &existing_cols,
-                                         const std::string &resolved_geom_field) {
+                                         const std::string &resolved_geom_field,
+                                         const std::unordered_map<std::string, bool> &json_text_cols) {
     std::string projected;
     if (!cfg.selected_columns_csv.empty()) {
         std::vector<std::string> cols = split_csv_list(cfg.selected_columns_csv);
@@ -557,7 +648,13 @@ static std::string build_json_projection(PGconn *pgconn,
             if (!projected.empty()) {
                 projected += ", ";
             }
-            projected += "to_jsonb(" + esc_col + ")::text AS " + esc_col;
+            // v3.4 (DB-M2): json 类型列用 col::text 保留原始键序（to_jsonb 会重排），
+            // 其余列维持 to_jsonb 包裹转成 JSON 文本
+            if (json_text_cols.find(col) != json_text_cols.end()) {
+                projected += esc_col + "::text AS " + esc_col;
+            } else {
+                projected += "to_jsonb(" + esc_col + ")::text AS " + esc_col;
+            }
         }
         return projected;
     }
@@ -573,7 +670,12 @@ static std::string build_json_projection(PGconn *pgconn,
         if (!projected.empty()) {
             projected += ", ";
         }
-        projected += "to_jsonb(" + esc_col + ")::text AS " + esc_col;
+        // v3.4 (DB-M2): 同 selected_columns 分支——json 列保序
+        if (json_text_cols.find(col) != json_text_cols.end()) {
+            projected += esc_col + "::text AS " + esc_col;
+        } else {
+            projected += "to_jsonb(" + esc_col + ")::text AS " + esc_col;
+        }
     }
     return projected;
 }
@@ -916,7 +1018,13 @@ std::string PostGISReader::build_select_query(const postgis_config &cfg, int sri
         }
     }
 
-    std::string projection = build_json_projection(pgconn, cfg, source_cols, existing_cols, resolved_geom_field);
+    // v3.4 (DB-M2): 探测 json 类型列用于保序投影。探测失败不阻断，
+    // 回退为全部 to_jsonb 的旧行为（仅丢失 json 列键序保真）。
+    std::unordered_map<std::string, bool> json_text_cols;
+    if (!fetch_json_text_columns(pgconn, cfg, cfg.has_sql_input(), json_text_cols)) {
+        json_text_cols.clear();
+    }
+    std::string projection = build_json_projection(pgconn, cfg, source_cols, existing_cols, resolved_geom_field, json_text_cols);
     if (projection.empty() && !cfg.selected_columns_csv.empty() && !cfg.selected_columns_best_effort) {
         return "";
     }
