@@ -820,7 +820,9 @@ int PostGISReader::get_cached_srid(const postgis_config &cfg, void *conn_ptr)
         if (esc_geom.empty()) {
             return resolved_srid;
         }
-        srid_query = "SELECT ST_SRID(" + esc_geom + ") FROM (" + cfg.sql + ") AS _subq LIMIT 1";
+        // v3.4 (DB-S8): DISTINCT 采样——LIMIT 1 只看首行，混合 SRID 表
+        // 静默跳过变换产出错误坐标；采样到两个不同 SRID 时明确报错
+        srid_query = "SELECT DISTINCT ST_SRID(" + esc_geom + ") FROM (" + cfg.sql + ") AS _subq LIMIT 2";
     }
     else if (cfg.has_table_input() && !cfg.geometry_field.empty())
     {
@@ -835,7 +837,8 @@ int PostGISReader::get_cached_srid(const postgis_config &cfg, void *conn_ptr)
             return resolved_srid;
         }
 
-        srid_query = "SELECT ST_SRID(" + std::string(esc_geom) + ") FROM " + std::string(esc_table) + " LIMIT 1";
+        // v3.4 (DB-S8): 同上，DISTINCT 采样
+        srid_query = "SELECT DISTINCT ST_SRID(" + std::string(esc_geom) + ") FROM " + std::string(esc_table) + " LIMIT 2";
         PQfreemem(esc_geom);
         PQfreemem(esc_table);
     }
@@ -847,6 +850,13 @@ int PostGISReader::get_cached_srid(const postgis_config &cfg, void *conn_ptr)
     PGresult *res = PQexec(pgconn, srid_query.c_str());
     if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0 && !PQgetisnull(res, 0, 0))
     {
+        // v3.4 (DB-S8): 两行结果 = 混合 SRID，明确报错而非静默按首行处理
+        if (PQntuples(res) > 1) {
+            fprintf(stderr, "Error: geometry column has mixed SRIDs (%s, %s, ...); a single SRID is required for PostGIS input\n",
+                    PQgetvalue(res, 0, 0), PQgetvalue(res, 1, 0));
+            PQclear(res);
+            exit(EXIT_READ);
+        }
         const char *srid_str = PQgetvalue(res, 0, 0);
         char *end_ptr = nullptr;
         long srid_val = strtol(srid_str, &end_ptr, 10);
@@ -855,6 +865,11 @@ int PostGISReader::get_cached_srid(const postgis_config &cfg, void *conn_ptr)
         } else {
             fprintf(stderr, "Warning: Invalid SRID value '%s', defaulting to 0\n", srid_str);
         }
+    }
+    else if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 0)
+    {
+        // v3.4 (DB-S8): 空表/全 NULL 几何时不再得到隐式 srid=0
+        fprintf(stderr, "Warning: no geometry rows to sample SRID from (empty table or all-NULL geometry)\n");
     }
     PQclear(res);
 
