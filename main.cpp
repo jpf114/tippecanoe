@@ -4241,6 +4241,17 @@ int main(int argc, char **argv) {
 		checkpoint_session = checkpoint::Session::open_new(checkpoint_dir, checkpoint_force != 0, fingerprint);
 	}
 
+	// v3.4 (CK-S6): checkpoint 模式下提高 mbtiles 持久化强度——上游默认
+	// synchronous=OFF 基于"整体失败就整体重跑"假设，checkpoint 场景断电
+	// 会造成 state.json 已提交 zoom 而输出库缺瓦片的状态脱节
+	if (checkpoint_session != nullptr && outdb != NULL) {
+		char *sync_err = NULL;
+		if (sqlite3_exec(outdb, "PRAGMA synchronous=NORMAL;", NULL, NULL, &sync_err) != SQLITE_OK) {
+			fprintf(stderr, "%s: warning: could not set synchronous mode: %s\n", argv[0], sync_err ? sync_err : "unknown error");
+			sqlite3_free(sync_err);
+		}
+	}
+
 	auto input_ret = read_input(sources, name ? name : out_mbtiles ? out_mbtiles
 								       : out_dir,
 				    maxzoom, minzoom, basezoom, basezoom_marker_width, outdb, out_dir, &exclude, &include, exclude_all, filter, droprate, buffer, tmpdir, gamma, read_parallel, forcetable, attribution, gamma != 0, file_bbox, file_bbox1, file_bbox2, prefilter, postfilter, description, guess_maxzoom, guess_cluster_maxzoom, &attribute_types, argv[0], &attribute_accum, attribute_descriptions, commandline, minimum_maxzoom, checkpoint_session.get());
