@@ -1467,7 +1467,34 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
         return -1;
     };
 
+    // v3.4 (DB-S7): 行数探测——total_count 未知（精确计数未开启）时先跑
+    // COUNT(*)，供一次性物化前的安全检查使用
+    auto probe_count_if_unknown = [&]() -> long long {
+        if (total_count > 0) {
+            return (long long) total_count;
+        }
+        std::string count_query = "SELECT COUNT(*) FROM (" + base_query + ") AS _safe_cnt";
+        PGresult *cres = PQexec((PGconn *)conn, count_query.c_str());
+        long long n = -1;
+        if (PQresultStatus(cres) == PGRES_TUPLES_OK && PQntuples(cres) > 0) {
+            n = strtoll(PQgetvalue(cres, 0, 0), NULL, 10);
+        } else {
+            fprintf(stderr, "Thread %zu: COUNT(*) probe failed: %s\n", thread_id, PQerrorMessage((PGconn *)conn));
+        }
+        PQclear(cres);
+        return n;
+    };
+
     auto run_standard_query_mode = [&]() -> bool {
+        // v3.4 (DB-S7): 一次性物化仅在行数受控（<= batch_size）时安全；
+        // 大表静默物化会 OOM，明确报错并给出替代方案
+        long long known = probe_count_if_unknown();
+        if (known < 0 || (size_t) known > config.batch_size) {
+            fprintf(stderr, "Thread %zu: non-cursor mode would materialize %s rows at once (batch_size %zu) and risks OOM; refused.\n"
+                            "  Options: keep cursor mode (default), or use --postgis-shard-key to split the read\n",
+                    thread_id, known < 0 ? "an unknown number of" : std::to_string(known).c_str(), config.batch_size);
+            return false;
+        }
         if (should_emit_postgis_runtime_logs(config)) {
             fprintf(stderr, "Thread %zu: Using standard query mode\n", thread_id);
         }
@@ -1508,25 +1535,33 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
         std::string declare_query = "DECLARE " + cursor_name + " SCROLL CURSOR FOR " + base_query;
 
         bool cursor_ok = false;
-        if (execute_query(begin_query))
+        // v3.4 (DB-S7): BEGIN/DECLARE 失败（事务残留/连接态问题）时重连后
+        // 重试一次，仍失败才走非 cursor 路径
+        for (int setup_attempt = 0; setup_attempt < 2 && !cursor_ok; setup_attempt++)
         {
-            if (execute_query(declare_query))
+            if (setup_attempt > 0) {
+                fprintf(stderr, "Thread %zu: retrying cursor setup after reconnect\n", thread_id);
+                PQreset((PGconn *)conn);
+            }
+            if (execute_query(begin_query))
             {
-                cursor_ok = true;
+                if (execute_query(declare_query))
+                {
+                    cursor_ok = true;
+                }
+                else
+                {
+                    fprintf(stderr, "Thread %zu: Failed to declare cursor\n", thread_id);
+                    execute_query("ROLLBACK");
+                }
             }
             else
             {
-                if (should_emit_postgis_runtime_logs(config)) {
-                    fprintf(stderr, "Thread %zu: Failed to declare cursor, falling back to non-cursor mode\n", thread_id);
-                }
-                execute_query("ROLLBACK");
+                fprintf(stderr, "Thread %zu: Failed to begin transaction\n", thread_id);
             }
         }
-        else
-        {
-            if (should_emit_postgis_runtime_logs(config)) {
-                fprintf(stderr, "Thread %zu: Failed to begin transaction, falling back to non-cursor mode\n", thread_id);
-            }
+        if (!cursor_ok && should_emit_postgis_runtime_logs(config)) {
+            fprintf(stderr, "Thread %zu: cursor setup unavailable, evaluating non-cursor fallback\n", thread_id);
         }
 
         if (cursor_ok)
@@ -1577,6 +1612,14 @@ bool PostGISReader::read_features(std::vector<struct serialization_state> &sst, 
         }
         else
         {
+            // v3.4 (DB-S7): cursor 建立失败后不再静默全量物化——大表直接拒绝
+            long long known = probe_count_if_unknown();
+            if (known < 0 || (size_t) known > config.batch_size) {
+                fprintf(stderr, "Thread %zu: cursor setup failed and non-cursor fallback would materialize %s rows (batch_size %zu); refused to avoid OOM.\n"
+                                "  Fix the cursor failure cause (see errors above), or use --postgis-shard-key to split the read\n",
+                        thread_id, known < 0 ? "an unknown number of" : std::to_string(known).c_str(), config.batch_size);
+                return false;
+            }
             if (!run_standard_query_mode()) {
                 return false;
             }
