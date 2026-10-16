@@ -38,6 +38,11 @@ struct mongo_config {
     std::string password;
     std::string auth_source;
 
+    // v3.4 (DB-M4): 连接串 query 中除 collection/authSource 外的用户选项
+    // 原文保留（replicaSet/tls/ssl/readPreference 等），uri() 重建时回填，
+    // 避免静默丢弃导致 Atlas TLS / 副本集场景连接失败
+    std::vector<std::pair<std::string, std::string>> extra_query_options;
+
     size_t batch_size;
     size_t connection_pool_size;
     int timeout_ms;
@@ -117,10 +122,29 @@ struct mongo_config {
                 char hex[3] = {s[i + 1], s[i + 2], '\0'};
                 out += static_cast<char>(strtol(hex, nullptr, 16));
                 i += 2;
-            } else if (s[i] == '+') {
-                out += ' ';
             } else {
+                // v3.4 (DB-M5): MongoDB 连接串遵循 URI 规范而非表单编码，
+                // '+' 是字面字符不解码为空格（密码含 + 时此前会被破坏）
                 out += s[i];
+            }
+        }
+        return out;
+    }
+
+    // v3.4 (DB-M5): userinfo 重建用的百分号编码，仅保留 RFC 3986 unreserved
+    static std::string url_encode(const std::string &s) {
+        static const char *hex = "0123456789ABCDEF";
+        std::string out;
+        out.reserve(s.size() * 3);
+        for (size_t i = 0; i < s.size(); i++) {
+            unsigned char c = static_cast<unsigned char>(s[i]);
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                c == '-' || c == '.' || c == '_' || c == '~') {
+                out += static_cast<char>(c);
+            } else {
+                out += '%';
+                out += hex[c >> 4];
+                out += hex[c & 0x0F];
             }
         }
         return out;
@@ -235,6 +259,9 @@ struct mongo_config {
                     collection = val;
                 } else if (key == "authSource") {
                     auth_source = val;
+                } else {
+                    // v3.4 (DB-M4): 其余用户选项原文保留（不解码，重建时按原文回填）
+                    extra_query_options.push_back({key, param.substr(eq_pos + 1)});
                 }
             }
         }
@@ -264,10 +291,17 @@ struct mongo_config {
         std::string uri_str = is_srv ? "mongodb+srv://" : "mongodb://";
 
         if (!username.empty() && !password.empty()) {
-            uri_str += username + ":" + password + "@";
+            // v3.4 (DB-M5): userinfo 百分号编码——密码含 @:/?# 等特殊字符时
+            // 直接拼接会产生截断/错位的损坏 URI
+            uri_str += url_encode(username) + ":" + url_encode(password) + "@";
         }
 
-        uri_str += host;
+        // v3.4 (DB-M5): IPv6 字面量主机必须加方括号（parse 时已去除）
+        std::string host_part = host;
+        if (!is_srv && !host_part.empty() && host_part.find(':') != std::string::npos && host_part[0] != '[') {
+            host_part = "[" + host_part + "]";
+        }
+        uri_str += host_part;
         if (!is_srv) {
             uri_str += ":" + std::to_string(port);
         }
@@ -279,40 +313,68 @@ struct mongo_config {
 
         std::vector<std::string> opts;
 
+        // v3.4 (DB-M4): 用户显式给出的 query 选项原样回填（优先于内置默认）
+        for (const auto &kv : extra_query_options) {
+            opts.push_back(kv.first + "=" + kv.second);
+        }
+
+        auto has_option = [&](const std::string &key) {
+            for (const auto &kv : extra_query_options) {
+                if (kv.first == key) return true;
+            }
+            return false;
+        };
+
         if (!auth_source.empty()) {
             opts.push_back("authSource=" + auth_source);
         }
 
         size_t actual_pool_size = std::min(connection_pool_size, MAX_MONGO_CONNECTION_POOL_SIZE);
-        opts.push_back("maxPoolSize=" + std::to_string(actual_pool_size));
-        opts.push_back("minPoolSize=1");
-
-        opts.push_back("serverSelectionTimeoutMS=" + std::to_string(timeout_ms));
-        opts.push_back("connectTimeoutMS=" + std::to_string(timeout_ms));
-        opts.push_back("socketTimeoutMS=" + std::to_string(timeout_ms));
-
-        switch (write_concern_level) {
-            case WriteConcernLevel::NONE:
-                opts.push_back("w=0");
-                break;
-            case WriteConcernLevel::PRIMARY:
-                opts.push_back("w=1");
-                break;
-            case WriteConcernLevel::MAJORITY:
-                opts.push_back("w=majority");
-                break;
+        if (!has_option("maxPoolSize")) {
+            opts.push_back("maxPoolSize=" + std::to_string(actual_pool_size));
+        }
+        if (!has_option("minPoolSize")) {
+            opts.push_back("minPoolSize=1");
         }
 
-        if (journal) {
+        if (!has_option("serverSelectionTimeoutMS")) {
+            opts.push_back("serverSelectionTimeoutMS=" + std::to_string(timeout_ms));
+        }
+        if (!has_option("connectTimeoutMS")) {
+            opts.push_back("connectTimeoutMS=" + std::to_string(timeout_ms));
+        }
+        if (!has_option("socketTimeoutMS")) {
+            opts.push_back("socketTimeoutMS=" + std::to_string(timeout_ms));
+        }
+
+        if (!has_option("w")) {
+            switch (write_concern_level) {
+                case WriteConcernLevel::NONE:
+                    opts.push_back("w=0");
+                    break;
+                case WriteConcernLevel::PRIMARY:
+                    opts.push_back("w=1");
+                    break;
+                case WriteConcernLevel::MAJORITY:
+                    opts.push_back("w=majority");
+                    break;
+            }
+        }
+
+        if (journal && !has_option("journal")) {
             opts.push_back("journal=true");
         }
 
-        if (wtimeout_ms > 0) {
+        if (wtimeout_ms > 0 && !has_option("wtimeoutMS")) {
             opts.push_back("wtimeoutMS=" + std::to_string(wtimeout_ms));
         }
 
-        opts.push_back("retryReads=true");
-        opts.push_back("retryWrites=true");
+        if (!has_option("retryReads")) {
+            opts.push_back("retryReads=true");
+        }
+        if (!has_option("retryWrites")) {
+            opts.push_back("retryWrites=true");
+        }
 
         if (!opts.empty()) {
             uri_str += "?";
@@ -332,7 +394,12 @@ struct mongo_config {
             uri_str += username + ":****@";
         }
 
-        uri_str += host;
+        // v3.4 (DB-M5): IPv6 字面量主机补方括号（与 uri() 一致）
+        std::string host_part = host;
+        if (!is_srv && !host_part.empty() && host_part.find(':') != std::string::npos && host_part[0] != '[') {
+            host_part = "[" + host_part + "]";
+        }
+        uri_str += host_part;
         if (!is_srv) {
             uri_str += ":" + std::to_string(port);
         }
@@ -392,6 +459,11 @@ public:
     static size_t get_global_duplicate_batches();
 
     void initialize_thread();
+
+    // v3.4 (DB-M10): 在主线程、写线程启动之前统一执行 drop，消除"drop 与
+    // 首批写入竞态"（此前 drop 由首个写线程懒执行，drop 进行中其它线程
+    // 可能已开始 insert，其数据会被随后的 drop 删除）
+    static void drop_collection_now(const mongo_config &cfg);
 
     void write_tile(int z, int x, int y, const char *data, size_t len);
 

@@ -880,6 +880,16 @@ bool PostGISReader::connect()
         return false;
     }
 
+    // v3.4 (DB-M12): 会话级固定 bytea 输出格式。旧服务器默认 bytea_output=escape
+    // 时 ST_AsBinary 的 bytea 会被文本化为 \252 八进制转义，此前的纯 hex 解码
+    // 全表解析失败。SET 失败不阻断（decode_bytea 亦支持 escape 格式兜底）。
+    {
+        PGresult *r = PQexec((PGconn *) conn, "SET bytea_output = hex");
+        if (r != NULL) {
+            PQclear(r);
+        }
+    }
+
     DEBUG_LOG("Connected to PostGIS successfully.");
     return true;
 }
@@ -1157,14 +1167,65 @@ std::string PostGISReader::escape_json_string(const char *value)
     return result;
 }
 
+// v3.4 (DB-M12): 支持 bytea 两种文本格式——hex（\x 前缀）与旧式 escape
+// （\nnn 八进制三元组 + \\ 反斜杠，PG < 9.0 默认）。非法输入返回空，
+// 由调用方按 parse error 处理。
 std::vector<uint8_t> PostGISReader::decode_bytea(const char *hex_data, size_t hex_len)
 {
     std::vector<uint8_t> result;
 
+    bool escape_format = false;
     if (hex_len >= 2 && hex_data[0] == '\\' && hex_data[1] == 'x')
     {
         hex_data += 2;
         hex_len -= 2;
+    }
+    else if (hex_len > 0 && hex_data[0] == '\\')
+    {
+        escape_format = true;
+    }
+
+    if (escape_format)
+    {
+        size_t i = 0;
+        while (i < hex_len)
+        {
+            char ch = hex_data[i];
+            if (ch != '\\')
+            {
+                // escape 格式中可打印字符原样表示自身
+                result.push_back(static_cast<uint8_t>(ch));
+                i++;
+                continue;
+            }
+            if (i + 1 >= hex_len)
+            {
+                return std::vector<uint8_t>();
+            }
+            char next = hex_data[i + 1];
+            if (next == '\\')
+            {
+                result.push_back(static_cast<uint8_t>('\\'));
+                i += 2;
+                continue;
+            }
+            // \nnn 八进制：1 到 3 位（PG escape 输出总是 3 位，解析从宽）
+            int value = 0;
+            size_t digits = 0;
+            while (digits < 3 && i + 1 + digits < hex_len &&
+                   hex_data[i + 1 + digits] >= '0' && hex_data[i + 1 + digits] <= '7')
+            {
+                value = value * 8 + (hex_data[i + 1 + digits] - '0');
+                digits++;
+            }
+            if (digits == 0)
+            {
+                return std::vector<uint8_t>();
+            }
+            result.push_back(static_cast<uint8_t>(value));
+            i += 1 + digits;
+        }
+        return result;
     }
 
     if (hex_len % 2 != 0)

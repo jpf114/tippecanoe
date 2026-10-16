@@ -300,11 +300,13 @@ WKBResult parse_wkb(const uint8_t* data, size_t len) {
     return reader.parse(data, len);
 }
 
-static uint8_t hex_char_val(char c) {
+static int hex_char_val(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
     if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return 0;
+    // v3.4 (DB-M12): 非法 hex 字符报错而非静默置 0——静默会产出随机字节
+    // 的错误几何，难以排查
+    return -1;
 }
 
 WKBResult parse_wkb_hex(const std::string& hex) {
@@ -328,8 +330,15 @@ WKBResult parse_wkb_hex(const std::string& hex) {
     bytes.reserve(hex.size() / 2);
 
     for (size_t i = 0; i < hex.size(); i += 2) {
-        uint8_t hi = hex_char_val(hex[i]);
-        uint8_t lo = hex_char_val(hex[i + 1]);
+        int hi = hex_char_val(hex[i]);
+        int lo = hex_char_val(hex[i + 1]);
+        if (hi < 0 || lo < 0) {
+            WKBResult result;
+            result.geometry_type = -1;
+            result.valid = false;
+            result.error = "Invalid hex character at offset " + std::to_string(i) + " in: " + hex.substr(0, 60);
+            return result;
+        }
         bytes.push_back(static_cast<uint8_t>((hi << 4) | lo));
     }
 

@@ -549,7 +549,10 @@ static void read_postgis_data(std::string &layername, const char *fname,
 	}
 
 	layermap_entry e = layermap_entry(0);
-	e.description = "PostGIS layer";
+	// v3.4 (DB-M13): layer description 去硬编码——上游 GeoJSON 路径的
+	// vector_layers description 为空串，PostGIS 路径保持一致（layer id
+	// 本就是表名/别名，无需处理）
+	e.description = "";
 	std::map<std::string, layermap_entry> layermap;
 	layermap.insert(std::pair<std::string, layermap_entry>(layername, e));
 	layermaps.clear();
@@ -2692,6 +2695,11 @@ int maindb(int argc, char **argv) {
 	print_effective_output_summary(output_mode, out_mbtiles, out_dir);
 
 	DEBUG_LOG("Starting data ingestion pipeline (read_input)...");
+	// v3.4 (DB-M10): drop 前移——必须在 read_input 启动写线程之前完成，
+	// 否则首个写线程懒 drop 时其它写线程可能已在写入，其数据被误删
+	if (use_mongo && mongo_cfg.drop_collection_before_write) {
+		MongoWriter::drop_collection_now(mongo_cfg);
+	}
 	// 2. 调用 read_input() 读取 PostGIS 数据并写入瓦片
 	// read_input 内部会调用 traverse_zooms 进行瓦片写入
 	std::string postgis_layer = postgis_cfg.effective_layer_name();
@@ -2703,6 +2711,7 @@ int maindb(int argc, char **argv) {
 	ret = std::get<0>(input_ret);
 
 	// Write metadata to MongoDB if requested
+	bool metadata_write_failed = false;
 	if (use_mongo && mongo_cfg.write_metadata) {
 		struct metadata meta = std::get<1>(input_ret);
 
@@ -2712,7 +2721,10 @@ int maindb(int argc, char **argv) {
 				meta_writer->write_metadata_bson(meta);
 			}
 		} catch (const std::exception &e) {
-			fprintf(stderr, "Warning: failed to write MongoDB metadata: %s\n", e.what());
+			// v3.4 (DB-M8): metadata 写失败计入退出码语义（内部 catch 已计
+			// total_errors，此处覆盖 writer 构造等更早的异常）
+			metadata_write_failed = true;
+			fprintf(stderr, "Error: failed to write MongoDB metadata: %s\n", e.what());
 		}
 	}
 
@@ -2736,10 +2748,11 @@ int maindb(int argc, char **argv) {
 		auto stats = MongoDB::get_global_stats();
 		MongoDB::print_stats(stats, quiet);
 
-		if (stats.total_errors > 0) {
-			fprintf(stderr, "%s: MongoDB had %zu errors during write operations\n",
+		if (stats.total_errors > 0 || metadata_write_failed) {
+			fprintf(stderr, "%s: MongoDB had %zu errors during write operations%s\n",
 				mongo_cfg.fail_on_discard ? "Error" : "Warning",
-				stats.total_errors);
+				stats.total_errors,
+				metadata_write_failed ? " (including metadata write failure)" : "");
 			if (mongo_cfg.fail_on_discard && ret == 0) {
 				ret = EXIT_MONGO;
 			}

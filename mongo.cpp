@@ -237,6 +237,34 @@ global_duplicate_batches.store(0);
     erased_zooms.clear();
 }
 
+// v3.4 (DB-M10): 主线程预 drop——严格先于所有写线程启动，消除 drop 与
+// 首批写入的竞态窗口
+void MongoWriter::drop_collection_now(const mongo_config &cfg)
+{
+    auto pool = get_or_create_pool(cfg);
+    if (!pool) {
+        // 连接失败交给写入路径按既有错误处理报告，此处不重复计错
+        return;
+    }
+
+    try {
+        auto client = pool->acquire();
+        auto collection = (*client)[cfg.dbname][cfg.collection];
+        collection.drop();
+        {
+            std::lock_guard<std::mutex> lock(global_state_mutex);
+            collection_dropped = true;
+        }
+        if (!quiet) {
+            fprintf(stderr, "MongoDB: dropped collection %s.%s\n",
+                    cfg.dbname.c_str(), cfg.collection.c_str());
+        }
+    } catch (const std::exception &e) {
+        fprintf(stderr, "Warning: failed to drop MongoDB collection %s.%s: %s\n",
+                cfg.dbname.c_str(), cfg.collection.c_str(), e.what());
+    }
+}
+
 void MongoWriter::initialize_thread()
 {
     auto pool = get_or_create_pool(config);
@@ -244,32 +272,8 @@ void MongoWriter::initialize_thread()
         throw std::runtime_error("Failed to create MongoDB connection pool");
     }
 
-    if (config.drop_collection_before_write) {
-        bool should_drop = false;
-        {
-            std::lock_guard<std::mutex> lock(global_state_mutex);
-            if (!collection_dropped) {
-                collection_dropped = true;
-                should_drop = true;
-            }
-        }
-        if (should_drop) {
-            try {
-                auto inner_pool = get_or_create_pool(config);
-                if (!inner_pool) return;
-                auto client = inner_pool->acquire();
-                auto collection = (*client)[config.dbname][config.collection];
-                collection.drop();
-                if (!quiet) {
-                    fprintf(stderr, "MongoDB: dropped collection %s.%s\n",
-                            config.dbname.c_str(), config.collection.c_str());
-                }
-            } catch (const std::exception &e) {
-                fprintf(stderr, "Warning: failed to drop MongoDB collection %s.%s: %s\n",
-                        config.dbname.c_str(), config.collection.c_str(), e.what());
-            }
-        }
-    }
+    // v3.4 (DB-M10): drop 已前移至 maindb 在启动写线程前调用
+    // drop_collection_now()，此处不再懒执行（详见 DB-M10 注释）
 
     if (config.create_indexes) {
         bool should_create_indexes = false;
@@ -459,11 +463,40 @@ void MongoWriter::flush_batch()
         }
     }
 
+    // v3.4 (DB-M6): 按字节上限切分批次。insert_many/bulk_write 受 MongoDB
+    // wire 协议 48MB 消息上限约束，此前只按文档数（batch_size ≤1000）分批，
+    // 单个大瓦片（binary 瓦片图可达数 MB）即可让整批超限失败。32MB 上限留出
+    // 余量；单文档超限时至少独立成块（16MB 文档上限由服务端另行裁决）。
+    const size_t MAX_BATCH_BYTES = 32 * 1024 * 1024;
+    auto flush_chunked = [&](bool upsert, std::vector<bsoncxx::document::value> &buf, std::vector<tile_coords> &coord) {
+        size_t start = 0;
+        while (start < buf.size()) {
+            size_t bytes = 0;
+            size_t end = start;
+            while (end < buf.size()) {
+                size_t doc_len = buf[end].view().length();
+                if (end > start && bytes + doc_len > MAX_BATCH_BYTES) {
+                    break;
+                }
+                bytes += doc_len;
+                end++;
+            }
+            std::vector<bsoncxx::document::value> chunk_buf(
+                std::make_move_iterator(buf.begin() + static_cast<long>(start)),
+                std::make_move_iterator(buf.begin() + static_cast<long>(end)));
+            std::vector<tile_coords> chunk_coord(
+                std::make_move_iterator(coord.begin() + static_cast<long>(start)),
+                std::make_move_iterator(coord.begin() + static_cast<long>(end)));
+            flush_batch_with_retry(upsert, std::move(chunk_buf), std::move(chunk_coord));
+            start = end;
+        }
+    };
+
     if (!insert_buf.empty()) {
-        flush_batch_with_retry(false, std::move(insert_buf), std::move(insert_coord));
+        flush_chunked(false, insert_buf, insert_coord);
     }
     if (!upsert_buf.empty()) {
-        flush_batch_with_retry(true, std::move(upsert_buf), std::move(upsert_coord));
+        flush_chunked(true, upsert_buf, upsert_coord);
     }
 }
 
@@ -874,6 +907,9 @@ void MongoWriter::write_metadata_bson(const struct metadata &meta)
                     config.dbname.c_str(), meta_collection_name.c_str());
         }
     } catch (const std::exception &e) {
+        // v3.4 (DB-M8): metadata 写失败计入错误统计——maindb 依据 total_errors
+        // 决定 fail_on_discard 下的退出码，与瓦片丢弃的失败哲学一致
+        global_total_errors++;
         fprintf(stderr, "Warning: failed to write MongoDB metadata (bson): %s\n", e.what());
     }
 }

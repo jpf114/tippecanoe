@@ -69,6 +69,10 @@ size_t estimate_tile_count(size_t feature_count, int min_zoom, int max_zoom) {
 void initialize_global() {
     DEBUG_LOG("Initializing MongoDB global instance...");
     MongoWriter::initialize_global();
+    // v3.4 (DB-M7): exit() 错误路径不经过 cleanup_global，主线程 thread_local
+    // 缓冲会随进程终止丢失；atexit 兜底 flush（无实例时为 no-op）。工作线程
+    // 正常结束由 thread_local 析构（~MongoWriter → close → flush_all）覆盖。
+    std::atexit([]() { MongoWriter::flush_current_thread_instance(); });
     DEBUG_LOG("MongoDB global initialization done.");
 }
 
