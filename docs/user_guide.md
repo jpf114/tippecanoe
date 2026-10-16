@@ -235,18 +235,15 @@ tippecanoe-db \
 **方式一：连接字符串（推荐）**
 
 ```bash
---mongo "dbname:collection[:username[:password[:host[:port[:auth_source]]]]]"
+--mongo "mongodb://[username:password@]host[:port]/dbname?collection=china[&authSource=admin][&其他驱动选项]"
 ```
 
-| 部分 | 说明 | 示例 |
-|------|------|------|
-| dbname | 数据库名 | test |
-| collection | 集合名 | china |
-| user | 用户名 | admin |
-| password | 密码 | admin |
-| host | MongoDB 主机 | localhost |
-| port | MongoDB 端口 | 27017 |
-| auth_source | 认证数据库 | admin |
+> 连接串仅支持标准 URI 格式（含 `mongodb+srv://`）。用户名/密码中的
+> `@ : / ? #` 等特殊字符请按 URI 规范以 `%XX` 百分号编码传入；重建内部
+> 连接串时会自动重新编码。query 中除 `collection` / `authSource` 外的
+> 驱动选项（如 `replicaSet`、`tls`、`readPreference`）会原样透传给
+> MongoDB 驱动，不会丢弃；与工具内置默认参数（连接池、超时等）同名时
+> 以用户指定为准。
 
 **方式二：独立参数**
 
@@ -267,12 +264,20 @@ tippecanoe-db \
 | `--mongo-batch-size` | 否 | 100 | 批量写入大小（10-1000） |
 | `--mongo-pool-size` | 否 | 10 | 连接池大小（上限 50） |
 | `--mongo-timeout` | 否 | 30000(ms) | 连接/读写超时 |
-| `--mongo-drop-collection` | 否 | 否 | 写入前删除集合，使用 insert 模式（性能更高） |
+| `--mongo-drop-collection` | 否 | 否 | 写入前删除集合，使用 insert 模式（性能更高）。drop 在瓦片写入线程启动前于主线程统一执行 |
 | `--mongo-no-indexes` | 否 | 否 | 不创建索引 |
 | `--mongo-no-metadata` | 否 | 否 | 默认会写入 `{collection}_metadata`；指定该参数后关闭 |
-| `--mongo-fail-on-discard` | 否 | 是 | 有瓦片被丢弃时返回非 0 退出码 |
+| `--mongo-fail-on-discard` | 否 | 是 | 有瓦片被丢弃或 MongoDB 写入/元数据错误时返回非 0 退出码（exit 122） |
 | `--mongo-no-fail-on-discard` | 否 | 否 | best-effort 模式：有丢弃仅告警，不作为失败退出 |
 
+> **重跑语义：** 不带 `--mongo-drop-collection` 重复写入时，已存在的瓦片
+> （重复键 E11000）视为幂等成功并计入 duplicate 统计，不作为失败；混合
+> 批次中仅失败项重试。
+>
+> **bytea 兼容：** PostGIS 连接建立后会话级执行 `SET bytea_output = hex`，
+> 旧服务器（默认 escape 格式）无需额外配置；连接串/列值中出现非标准
+> bytea 文本时按 escape 格式解析并计入解析错误。
+>
 > **注意：** MongoDB 存储的瓦片数据为 gzip 压缩格式，与 MBTiles 格式一致。读取时需先解压。
 
 #### 3.2.3 瓦片生成参数
@@ -525,7 +530,7 @@ tippecanoe-db \
 | maxzoom | int | 最大缩放级别 |
 | bounds | [4]double | 地理范围 [minlon, minlat, maxlon, maxlat] |
 | center | [3]double | 中心点 [lon, lat, z] |
-| vector_layers | string (JSON) | **v2.0 新增**：矢量图层描述及属性 schema |
+| vector_layers | string (JSON) | **v2.0 新增**：矢量图层描述及属性 schema；`id` 为表名或 SQL 别名，`description` 恒为空串（与上游 GeoJSON 路径一致） |
 | tilestats | string (JSON) | **v2.0 新增**：属性统计信息 |
 | attribution | string | 版权声明（如有） |
 | generator | string | 生成工具信息 |

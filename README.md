@@ -356,7 +356,7 @@ Parallel processing will also be automatic if the input file is in FlatGeobuf fo
 
 Any input/output combination is supported: geographic input (`EPSG:4326`/`EPSG:4490`, degrees) goes straight into the chosen grid, while `EPSG:3857` input (Web Mercator meters) is first converted back to longitude/latitude when the output grid is `EPSG:4490`. Since EPSG:4326 and EPSG:4490 are both longitude/latitude systems and numerically interchangeable for tiling purposes, the only true coordinate conversion happens on the 3857-to-4490 path.
 
-`tippecanoe-decode` recognizes equirectangular tilesets automatically from their `crs` metadata row; it can also be told explicitly with `-s EPSG:4490`.
+`tippecanoe-decode` recognizes equirectangular tilesets automatically from their `crs` metadata row (both whole-tileset and single-tile output); it can also be told explicitly with `-s EPSG:4490`. `tile-join` propagates the `crs` row and tile-matrix metadata of equirectangular inputs to its output and computes bounds on the same grid; joining equirectangular and Web Mercator tilesets is rejected (exit 101) because the tile grids do not align.
 
 ### Zoom levels
 
@@ -711,6 +711,26 @@ have their probability diffused, so that some of them will be drawn as a square 
 this minimum size and others will not be drawn at all, preserving the total area that
 all of them should have had together.
 
+## Checkpoint / resume (断点续做)
+
+Long-running jobs can be interrupted and resumed without restarting from scratch.
+
+- Start a fresh job with a checkpoint directory: `tippecanoe --checkpoint-dir=/path/ckpt ...`
+- Resume the same job later with a self-contained resume: `tippecanoe --resume=/path/ckpt`.
+  Do not pass `-o`/`-f` on resume; the output path and all tiling options
+  (zooms, buffer, gamma, simplification, drop strategies, prefilter/postfilter,
+  filters, attribute accumulation) are restored from the checkpoint state, so
+  resumed tiles are byte-identical to a single-shot run.
+- The job commits completed zoom levels as it goes and exits cleanly on
+  SIGTERM/SIGINT after finishing the current zoom.
+- Exit codes: `100` partial completion (some zooms committed, resume to continue),
+  `110` no zoom committed yet, `101` fingerprint mismatch (inputs/parameters changed
+  since the checkpoint), `121` checkpoint data verification failure or insufficient
+  disk space.
+- The checkpoint is bound to the machine it was created on: resuming with a
+  different CPU count or temp-file limit is rejected. Verify or inspect state
+  with `--checkpoint-status` / `--checkpoint-prune`.
+
 ## PostGIS Support
 
 This repository includes a customized `tippecanoe-db` workflow for reading directly from PostGIS and optionally writing MongoDB business output alongside MBTiles verification output.
@@ -719,21 +739,21 @@ This repository includes a customized `tippecanoe-db` workflow for reading direc
 
 ```bash
 tippecanoe-db \
-  --postgis "gis:postgres:password:localhost:5432" \
+  --postgis "postgresql://postgres:password@localhost:5432/gis" \
   --postgis-table roads \
   --postgis-geometry-field geom \
-  --mongo "tiles:roads:admin:password:localhost:27017:admin" \
+  --mongo "mongodb://admin:password@localhost:27017/tiles?collection=roads&authSource=admin" \
   -o roads.mbtiles \
   -Z5 -z10
 ```
 
 Notes:
 
-- Recommended PostGIS short form: `dbname[:user[:password[:host[:port]]]]`
-- Recommended Mongo short form: `dbname:collection[:username[:password[:host[:port[:auth_source]]]]]`
-- The legacy host-first connection format is still accepted for compatibility, but new examples use the short form above.
+- Connection strings support standard URI form only: `postgresql://[user:password@]host[:port]/dbname` and `mongodb://[user:password@]host[:port]/dbname?collection=...[&authSource=...]` (plus `mongodb+srv://`). Percent-encode special characters (`@ : / ? #`) in credentials. MongoDB query options other than `collection`/`authSource` (e.g. `replicaSet`, `tls`, `readPreference`) are passed through to the driver verbatim.
 - `--mongo` is business output; `-o` is MBTiles verification output
 - The default PostGIS attribute strategy now preserves source field order so MBTiles verification output matches native `tippecanoe` more closely by default
+- Re-running without `--mongo-drop-collection` treats already-present tiles (duplicate key E11000) as idempotent success instead of failures
+- MongoDB metadata write failures count toward the `--mongo-fail-on-discard` exit code (122)
 
 ### More Detail
 
