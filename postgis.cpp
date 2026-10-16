@@ -5,6 +5,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <algorithm>
+#include <cerrno>
 #include <climits>
 #include <cstdint>
 #include <chrono>
@@ -626,23 +627,39 @@ static ShardPlan prepare_shard_plan(PGconn *pgconn,
             }
 
             if (!has_range) {
+                // v3.4 (DB-S2): 边界用 FLOOR（向下取整）而不是 CAST AS bigint
+                // （四舍五入）——min=1.5 被取整为 2 时，低于下界的行（如
+                // key=1.7）不属于任何分片而静默丢失；FLOOR 保证
+                // min_k <= 实际最小值，无行遗漏。
+                // 注意 shard key 列经 to_jsonb(col)::text 投影后是 JSON 文本，
+                // 需先 CAST double precision 才能参与 FLOOR/比较。
                 std::string range_query =
                     "SELECT MIN(_k), MAX(_k) FROM ("
-                    "SELECT CAST(" + esc_key + " AS bigint) AS _k FROM (" + base_query + ") AS _range_base "
+                    "SELECT FLOOR(CAST(" + esc_key + " AS double precision)) AS _k FROM (" + base_query + ") AS _range_base "
                     "WHERE " + esc_key + " IS NOT NULL) AS _range_mm";
                 PGresult *range_res = PQexec(pgconn, range_query.c_str());
                 if (PQresultStatus(range_res) == PGRES_TUPLES_OK &&
                     PQntuples(range_res) > 0 &&
                     !PQgetisnull(range_res, 0, 0) &&
                     !PQgetisnull(range_res, 0, 1)) {
+                    errno = 0;
                     min_key = strtoll(PQgetvalue(range_res, 0, 0), NULL, 10);
+                    bool min_ok = (errno != ERANGE);
+                    errno = 0;
                     max_key = strtoll(PQgetvalue(range_res, 0, 1), NULL, 10);
-                    has_range = true;
+                    bool max_ok = (errno != ERANGE);
+                    if (min_ok && max_ok) {
+                        has_range = true;
+                    } else if (config.is_range_shard_mode()) {
+                        fprintf(stderr, "Thread %zu: range sharding key '%s' value out of range; use --postgis-shard-mode=key or auto\n",
+                                thread_id, config.shard_key.c_str());
+                    }
                     std::lock_guard<std::mutex> lock(shard_range_cache_mutex);
                     shard_range_cache[range_cache_key] = std::make_pair(min_key, max_key);
                 } else if (config.is_range_shard_mode()) {
                     const char *db_err = PQerrorMessage(pgconn);
-                    if (db_err != NULL && strstr(db_err, "invalid input syntax for type bigint") != NULL) {
+                    if (db_err != NULL && (strstr(db_err, "invalid input syntax") != NULL ||
+                                           strstr(db_err, "does not exist") != NULL)) {
                         fprintf(stderr, "Thread %zu: range sharding key '%s' is non-numeric; use --postgis-shard-mode=key or auto\n",
                                 thread_id, config.shard_key.c_str());
                     } else {
