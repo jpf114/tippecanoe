@@ -373,6 +373,9 @@ public:
     static size_t get_global_upsert_batches();
     static size_t get_global_insert_discarded_tiles();
     static size_t get_global_upsert_discarded_tiles();
+    // v3.4 (DB-S5): E11000 重复键（重跑/部分重试场景）= 数据已在库，幂等成功
+    static size_t get_global_duplicate_tiles();
+    static size_t get_global_duplicate_batches();
 
     void initialize_thread();
 
@@ -389,6 +392,9 @@ public:
     size_t getRetryExhaustedBatches() const { return total_retry_exhausted_batches.load(); }
     size_t getInsertBatches() const { return total_insert_batches.load(); }
     size_t getUpsertBatches() const { return total_upsert_batches.load(); }
+    // v3.4 (DB-S5)
+    size_t getDuplicateTiles() const { return total_duplicate_tiles.load(); }
+    size_t getDuplicateBatches() const { return total_duplicate_batches.load(); }
     size_t getTotalDiscardedTiles() const { return total_discarded_tiles.load(); }
     size_t getInsertDiscardedTiles() const { return total_insert_discarded_tiles.load(); }
     size_t getUpsertDiscardedTiles() const { return total_upsert_discarded_tiles.load(); }
@@ -440,6 +446,9 @@ private:
     std::atomic<size_t> total_retry_exhausted_batches{0};
     std::atomic<size_t> total_insert_batches{0};
     std::atomic<size_t> total_upsert_batches{0};
+    // v3.4 (DB-S5): E11000 幂等成功计数
+    std::atomic<size_t> total_duplicate_tiles{0};
+    std::atomic<size_t> total_duplicate_batches{0};
     std::atomic<size_t> total_insert_discarded_tiles{0};
     std::atomic<size_t> total_upsert_discarded_tiles{0};
     bool stats_merged_{false};
