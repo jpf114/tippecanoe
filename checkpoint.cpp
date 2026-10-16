@@ -241,7 +241,57 @@ void append_file_crc32(std::string const &path) {
 		perror(path.c_str());
 		exit(EXIT_WRITE);
 	}
+	// v3.4 (M3): fsync 使 CRC 与数据原子落盘——原先 CRC 追加不 fsync，
+	// 断电后数据完好但 CRC 丢失/部分写，verify 会误判整包损坏强制重跑
+	if (fsync(fileno(fp)) < 0) {
+		perror("fsync crc");
+	}
 	fclose(fp);
+}
+
+// v3.4 (CK-S5): 流式校验三类辅助 blob 的 CRC 尾（数据 = size-4 字节）。
+// 损坏时明确报错退出，避免静默恢复出错误的 skip_children/strategies/
+// layermaps 导致 resume 后输出错误瓦片。
+static void verify_aux_blob_crc(std::string const &path) {
+	struct stat st;
+	if (stat(path.c_str(), &st) != 0 || st.st_size <= (off_t) sizeof(uint32_t)) {
+		return;  // 文件不存在或过小：交给各自读取函数处理
+	}
+	off_t data_len = st.st_size - (off_t) sizeof(uint32_t);
+	init_crc32_table();
+	int fd = open(path.c_str(), O_RDONLY);
+	if (fd < 0) {
+		return;
+	}
+	uint32_t crc = 0xFFFFFFFF;
+	std::vector<char> buf(4 * 1024 * 1024);  // 4MB 固定缓冲
+	off_t remaining = data_len;
+	while (remaining > 0) {
+		ssize_t want = remaining < (off_t) buf.size() ? (ssize_t) remaining : (ssize_t) buf.size();
+		ssize_t n = read(fd, buf.data(), want);
+		if (n <= 0) {
+			close(fd);
+			fprintf(stderr, "%s: short read verifying %s\n", *av, path.c_str());
+			exit(EXIT_READ);
+		}
+		const unsigned char *p = (const unsigned char *) buf.data();
+		for (ssize_t i = 0; i < n; i++) {
+			crc = crc32_table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+		}
+		remaining -= n;
+	}
+	uint32_t stored = 0;
+	if (read(fd, &stored, sizeof(stored)) != (ssize_t) sizeof(stored)) {
+		close(fd);
+		fprintf(stderr, "%s: short read verifying %s\n", *av, path.c_str());
+		exit(EXIT_READ);
+	}
+	close(fd);
+	crc ^= 0xFFFFFFFF;
+	if (crc != stored) {
+		fprintf(stderr, "%s: checkpoint blob %s failed CRC verification; the checkpoint is damaged and cannot be resumed\n", *av, path.c_str());
+		exit(EXIT_CHECKPOINT);
+	}
 }
 
 // 写入 blob 文件（可选追加 CRC32 后缀）
@@ -797,7 +847,7 @@ static bool read_tilestat_entry(FILE *fp, std::string &attr_name, tilestat &ts) 
 	return true;
 }
 
-void write_layermaps_blob(std::string const &path, std::vector<std::map<std::string, layermap_entry>> const &layermaps) {
+void write_layermaps_blob(std::string const &path, std::vector<std::map<std::string, layermap_entry>> const &layermaps, bool append_crc) {
 	FILE *fp = fopen(path.c_str(), "wb");
 	if (fp == NULL) {
 		perror(path.c_str());
@@ -835,9 +885,17 @@ void write_layermaps_blob(std::string const &path, std::vector<std::map<std::str
 		}
 	}
 	fclose(fp);
+	// v3.4 (CK-S5): 追加 CRC 尾并 fsync，断电后读端可检出内容损坏
+	if (append_crc) {
+		append_file_crc32(path);
+	}
 }
 
-void read_layermaps_blob(std::string const &path, std::vector<std::map<std::string, layermap_entry>> &layermaps) {
+void read_layermaps_blob(std::string const &path, std::vector<std::map<std::string, layermap_entry>> &layermaps, bool check_crc) {
+	// v3.4 (CK-S5): 先校验 CRC 尾（损坏直接退出，不再静默部分解析）
+	if (check_crc) {
+		verify_aux_blob_crc(path);
+	}
 	FILE *fp = fopen(path.c_str(), "rb");
 	if (fp == NULL) {
 		return;
@@ -909,7 +967,7 @@ void read_layermaps_blob(std::string const &path, std::vector<std::map<std::stri
 // skip_children / strategies blob 读写（与之前版本完全一致）
 // ===========================================================================
 
-void write_skip_children_blob(std::string const &path, std::set<zxy> const &skip) {
+void write_skip_children_blob(std::string const &path, std::set<zxy> const &skip, bool append_crc) {
 	FILE *fp = fopen(path.c_str(), "wb");
 	if (fp == NULL) {
 		perror(path.c_str());
@@ -926,9 +984,18 @@ void write_skip_children_blob(std::string const &path, std::set<zxy> const &skip
 		fwrite(&y, sizeof(y), 1, fp);
 	}
 	fclose(fp);
+	// v3.4 (CK-S5): 追加 CRC 尾并 fsync，断电后读端可检出内容损坏
+	if (append_crc) {
+		append_file_crc32(path);
+	}
 }
 
-void read_skip_children_blob(std::string const &path, std::set<zxy> &skip) {
+void read_skip_children_blob(std::string const &path, std::set<zxy> &skip, bool check_crc) {
+	// v3.4 (CK-S5): 先校验 CRC 尾（损坏直接退出，避免静默产生错误的
+	// skip_children 集合导致 resume 后输出错误瓦片）
+	if (check_crc) {
+		verify_aux_blob_crc(path);
+	}
 	FILE *fp = fopen(path.c_str(), "rb");
 	if (fp == NULL) {
 		return;
@@ -940,15 +1007,21 @@ void read_skip_children_blob(std::string const &path, std::set<zxy> &skip) {
 	}
 	for (uint32_t i = 0; i < count; i++) {
 		int32_t z, x, y;
-		fread(&z, sizeof(z), 1, fp);
-		fread(&x, sizeof(x), 1, fp);
-		fread(&y, sizeof(y), 1, fp);
+		// v3.4 (CK-S5): 检查 fread 返回值——截断的文件原先会静默读入
+		// 垃圾值插入集合
+		if (fread(&z, sizeof(z), 1, fp) != 1 ||
+		    fread(&x, sizeof(x), 1, fp) != 1 ||
+		    fread(&y, sizeof(y), 1, fp) != 1) {
+			fprintf(stderr, "%s: warning: truncated skip_children blob (%u declared, %zu readable); remaining entries ignored\n",
+				*av, count, (size_t) i);
+			break;
+		}
 		skip.insert(zxy(z, x, y));
 	}
 	fclose(fp);
 }
 
-void write_strategies_blob(std::string const &path, std::vector<strategy> const &strategies) {
+void write_strategies_blob(std::string const &path, std::vector<strategy> const &strategies, bool append_crc) {
 	FILE *fp = fopen(path.c_str(), "wb");
 	if (fp == NULL) {
 		perror(path.c_str());
@@ -962,9 +1035,17 @@ void write_strategies_blob(std::string const &path, std::vector<strategy> const 
 		fwrite(fields, sizeof(fields), 1, fp);
 	}
 	fclose(fp);
+	// v3.4 (CK-S5): 追加 CRC 尾并 fsync，断电后读端可检出内容损坏
+	if (append_crc) {
+		append_file_crc32(path);
+	}
 }
 
-void read_strategies_blob(std::string const &path, std::vector<strategy> &strategies) {
+void read_strategies_blob(std::string const &path, std::vector<strategy> &strategies, bool check_crc) {
+	// v3.4 (CK-S5): 先校验 CRC 尾（损坏直接退出）
+	if (check_crc) {
+		verify_aux_blob_crc(path);
+	}
 	FILE *fp = fopen(path.c_str(), "rb");
 	if (fp == NULL) {
 		return;
@@ -1873,7 +1954,7 @@ void Session::snapshot_tiling_entry(int poolfd, size_t pool_size, long long cons
 	write_blob_with_crc(path_staging("pool_off.bin"), pool_off, sizeof(long long) * CPUS);
 	write_blob_with_crc(path_staging("initial_x.bin"), initial_x, sizeof(unsigned) * CPUS);
 	write_blob_with_crc(path_staging("initial_y.bin"), initial_y, sizeof(unsigned) * CPUS);
-	write_layermaps_blob(path_staging("layermaps.bin"), layermaps);
+	write_layermaps_blob(path_staging("layermaps.bin"), layermaps, aux_blobs_have_crc());
 	if (file_bbox != nullptr) {
 		write_blob_with_crc(path_staging("file_bbox.bin"), file_bbox, sizeof(long long) * 4);
 	}
@@ -2117,7 +2198,7 @@ bool Session::restore_tiling(TilingRestore &out) {
 		memcpy(out.initial_y.data(), raw.data(), copy_n);
 	}
 
-	read_layermaps_blob(path_blob("layermaps.bin"), out.layermaps);
+	read_layermaps_blob(path_blob("layermaps.bin"), out.layermaps, aux_blobs_have_crc());
 
 	std::string nodespath = path_blob("shared_nodes");
 	struct stat nst;
@@ -2149,8 +2230,8 @@ bool Session::restore_tiling(TilingRestore &out) {
 		out.shared_nodes_bloom.assign(bloom_data.begin(), bloom_data.end());
 	}
 
-	read_skip_children_blob(path_blob("skip_children.bin"), out.skip_children);
-	read_strategies_blob(path_blob("strategies.bin"), out.strategies);
+	read_skip_children_blob(path_blob("skip_children.bin"), out.skip_children, aux_blobs_have_crc());
+	read_strategies_blob(path_blob("strategies.bin"), out.strategies, aux_blobs_have_crc());
 
 	// 恢复 file_bbox / file_bbox1 / file_bbox2
 	for (int which = 0; which < 3; which++) {
@@ -2227,15 +2308,15 @@ void Session::on_zoom_complete(ZoomCompleteContext const &ctx) {
 	fprintf(stderr, "  [checkpoint on_zoom_complete zoom=%d] saved %d geom files, total=%lld bytes\n",
 		ctx.zoom, saved_count, (long long) total_geom);
 	if (ctx.skip_children != nullptr) {
-		write_skip_children_blob(path_staging("skip_children.bin"), *ctx.skip_children);
+		write_skip_children_blob(path_staging("skip_children.bin"), *ctx.skip_children, aux_blobs_have_crc());
 	}
 	if (ctx.strategies != nullptr) {
-		write_strategies_blob(path_staging("strategies.bin"), *ctx.strategies);
+		write_strategies_blob(path_staging("strategies.bin"), *ctx.strategies, aux_blobs_have_crc());
 	}
 	// v3.3: 保存累积了本 zoom tilestats 的 layermaps，保证 resume 后
 	// metadata 的 vector_layers / tilestats 与正常路径一致
 	if (ctx.layermaps != nullptr) {
-		write_layermaps_blob(path_staging("layermaps.bin"), *ctx.layermaps);
+		write_layermaps_blob(path_staging("layermaps.bin"), *ctx.layermaps, aux_blobs_have_crc());
 	}
 
 	// 原子替换: 先 rename staging → blobs

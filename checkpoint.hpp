@@ -22,7 +22,8 @@
 
 namespace checkpoint {
 
-constexpr int TIPPECANOE_CHECKPOINT_FORMAT = 3;  // v3: 纯文件系统方案 + CRC32 校验 + 磁盘空间检查
+constexpr int TIPPECANOE_CHECKPOINT_FORMAT = 4;  // v4: skip_children/strategies/layermaps 补 CRC 尾 + fsync
+                                                  // v3: 纯文件系统方案 + CRC32 校验 + 磁盘空间检查
                                                   // v2: 纯文件系统方案（JSON state），向后兼容
 
 // ---------------------------------------------------------------------------
@@ -319,6 +320,9 @@ class Session {
 
 	// v3 新增：CRC32 校验
 	bool blob_has_crc() const;  // 当前 state 是否启用 CRC（format_version >= 3）
+	// v3.4 (CK-S5): 三类辅助 blob（skip_children/strategies/layermaps）是否
+	// 启用 CRC 尾（format_version >= 4；旧 checkpoint 的这三类无 CRC，读取时跳过校验）
+	bool aux_blobs_have_crc() const { return state_.format_version >= 4; }
 	void write_blob_with_crc(std::string const &path, void const *data, size_t len);
 	// 读取整个 blob 文件（含 CRC 校验，返回 data 部分）
 	std::vector<unsigned char> read_blob_with_crc(std::string const &path);
