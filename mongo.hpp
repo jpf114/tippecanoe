@@ -126,7 +126,11 @@ struct mongo_config {
         return out;
     }
 
+// v3.4 (DB-S6): mongodb+srv 连接标志（驱动负责 DNS SRV 解析，URI 不得改写 scheme/端口）
+        bool is_srv = false;
+
     bool parse_connection_string(const std::string &conn_str) {
+        is_srv = false;
         if (conn_str.empty()) {
             fprintf(stderr, "Error: MongoDB connection string is empty\n");
             return false;
@@ -139,6 +143,7 @@ struct mongo_config {
         if (scheme_end != std::string::npos) {
             scheme = str.substr(0, scheme_end);
             for (auto &c : scheme) c = std::tolower(static_cast<unsigned char>(c));
+            is_srv = (scheme == "mongodb+srv");
             if (scheme != "mongodb" && scheme != "mongodb+srv") {
                 fprintf(stderr, "Error: MongoDB connection string must start with mongodb:// or mongodb+srv://\n");
                 fprintf(stderr, "Format: mongodb://[user:password@]host[:port]/dbname?collection=name[&authSource=src]\n");
@@ -255,13 +260,18 @@ struct mongo_config {
     }
 
     std::string uri() const {
-        std::string uri_str = "mongodb://";
+        // v3.4 (DB-S6): SRV 保留 mongodb+srv:// scheme 且不拼端口，否则 SRV 记录不被解析（Atlas 必失败）
+        std::string uri_str = is_srv ? "mongodb+srv://" : "mongodb://";
 
         if (!username.empty() && !password.empty()) {
             uri_str += username + ":" + password + "@";
         }
 
-        uri_str += host + ":" + std::to_string(port) + "/";
+        uri_str += host;
+        if (!is_srv) {
+            uri_str += ":" + std::to_string(port);
+        }
+        uri_str += "/";
 
         if (!dbname.empty()) {
             uri_str += dbname;
@@ -316,13 +326,17 @@ struct mongo_config {
     }
 
     std::string safe_uri() const {
-        std::string uri_str = "mongodb://";
+        std::string uri_str = is_srv ? "mongodb+srv://" : "mongodb://";
 
         if (!username.empty()) {
             uri_str += username + ":****@";
         }
 
-        uri_str += host + ":" + std::to_string(port) + "/" + dbname;
+        uri_str += host;
+        if (!is_srv) {
+            uri_str += ":" + std::to_string(port);
+        }
+        uri_str += "/" + dbname;
         return uri_str;
     }
 
