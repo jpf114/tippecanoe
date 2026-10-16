@@ -48,6 +48,25 @@ struct InputFileStat {
 	std::string content_hash;  // v3: 小文件（< 100MB）的 SHA-256 内容哈希，大文件为空
 };
 
+// v3.4: 切片选项持久化（CK-S4：自包含 resume 必须复现原作业的切片行为）。
+// 不参与指纹计算（normalized_cmd 已隐式包含这些选项）；旧 state.json 无
+// tiling_options 字段时解析保持默认值，与旧的"裸 resume 用默认值"行为一致。
+struct TilingOptions {
+	int buffer = 5;
+	double gamma = 0;
+	double droprate = 2.5;
+	int full_detail = -1;
+	int low_detail = 12;
+	int min_detail = 7;
+	double simplification = 1;
+	int maxzoom_simplification = -1;
+	std::string prefilter;                // --prefilter 实参（JS 源码），空表示未设置
+	std::string postfilter;               // --postfilter 实参
+	std::string filter_json;              // -J / -j 实参原文，空表示未设置
+	bool filter_expression_mode = false;  // true: -J（read_filter）；false: -j（parse_filter）
+	std::vector<std::string> accumulate_attributes;  // 每次 -E / --accumulate-attribute 的实参原文
+};
+
 struct FingerprintParams {
 	std::string command_line;
 	std::string output_mode;
@@ -62,6 +81,8 @@ struct FingerprintParams {
 	std::string name;          // -n / tilename
 	std::string description;   // -N
 	std::string attribution;   // -A
+	// v3.4: 切片选项（不参与指纹计算，仅用于持久化到 state.json）
+	TilingOptions tiling_options;
 };
 
 // 单个 zoom 的提交记录
@@ -127,6 +148,9 @@ struct CheckpointState {
 	// -p*/-a* 选项时指纹才能匹配，与旧行为一致）。
 	std::string prevent_str;     // prevent[i] != 0 的字符拼接
 	std::string additional_str;  // additional[i] != 0 的字符拼接
+
+	// --- v3.4 新增字段：切片选项（CK-S4，resume 时恢复） ---
+	TilingOptions tiling_options;
 };
 
 struct TilingRestore {
@@ -160,6 +184,9 @@ struct TilingRestore {
 	long long file_bbox[4] = {UINT_MAX, UINT_MAX, 0, 0};
 	long long file_bbox1[4] = {0xFFFFFFFF, 0xFFFFFFFF, 0, 0};
 	long long file_bbox2[4] = {0x1FFFFFFFF, 0xFFFFFFFF, 0x100000000, 0};
+
+	// v3.4: 原作业的切片选项（CK-S4，由 restore_tiling 从 state.json 填充）
+	TilingOptions tiling_options;
 
 	TilingRestore();
 	~TilingRestore();

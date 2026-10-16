@@ -1224,9 +1224,44 @@ std::pair<int, metadata> read_input(std::vector<source> &sources, char *fname, i
 		checkpoint::TilingRestore restored;
 		checkpoint_session->restore_tiling(restored);
 
+		// v3.4 (CK-S4): -E 恢复目标的存储，必须与本分支同生命周期（traverse_zooms 使用）
+		std::unordered_map<std::string, attribute_op> restored_attribute_accum;
+
 		maxzoom = restored.maxzoom;
 		minzoom = restored.minzoom;
 		basezoom = restored.basezoom;
+
+		// v3.4 (CK-S4): 恢复原作业的切片选项——裸 resume 必须自包含地复现
+		// 原作业的切片行为，否则续跑 zoom 用当前进程默认值，产物与原意不一致。
+		// 数值来自原作业 open_new 时的生效值（选项解析与 detail 调整之后）。
+		{
+			checkpoint::TilingOptions const &to = restored.tiling_options;
+			buffer = to.buffer;
+			gamma = to.gamma;
+			droprate = to.droprate;
+			full_detail = to.full_detail;
+			low_detail = to.low_detail;
+			min_detail = to.min_detail;
+			simplification = to.simplification;
+			maxzoom_simplification = to.maxzoom_simplification;
+			prefilter = to.prefilter.empty() ? NULL : to.prefilter.c_str();
+			postfilter = to.postfilter.empty() ? NULL : to.postfilter.c_str();
+			// filter / -E 一律以 state 为准（原作业未使用则置空），保证续跑 zoom
+			// 与原作业行为一致；不 json_free 旧 filter——它是 main 按值传入的
+			// 指针，main 退出时仍会释放，此处仅替换本函数的局部副本
+			if (!to.filter_json.empty()) {
+				filter = to.filter_expression_mode ? read_filter(to.filter_json.c_str())
+								   : parse_filter(to.filter_json.c_str());
+			} else {
+				filter = NULL;
+			}
+			restored_attribute_accum.clear();
+			for (std::string const &arg : to.accumulate_attributes) {
+				set_attribute_accum(restored_attribute_accum, arg.c_str(), av);
+			}
+			attribute_accum = &restored_attribute_accum;
+			fprintf(stderr, "%s: checkpoint: restored tiling options from checkpoint (self-contained resume)\n", *av);
+		}
 
 		if (restored.pool_off.size() < CPUS) {
 			restored.pool_off.resize(CPUS, 0);
@@ -3134,6 +3169,10 @@ int main(int argc, char **argv) {
 	int read_parallel = 0;
 	int files_open_at_start;
 	json_object *filter = NULL;
+	// v3.4 (CK-S4): 记录 filter / -E 的实参原文，供 checkpoint 持久化与 resume 恢复
+	const char *filter_raw = NULL;
+	bool filter_expression_mode = false;
+	std::vector<std::string> accumulate_args;
 
 	memsize = calc_memsize();
 
@@ -3652,10 +3691,14 @@ int main(int argc, char **argv) {
 
 		case 'J':
 			filter = read_filter(optarg);
+			filter_raw = optarg;
+			filter_expression_mode = true;
 			break;
 
 		case 'j':
 			filter = parse_filter(optarg);
+			filter_raw = optarg;
+			filter_expression_mode = false;
 			break;
 
 		case 'r':
@@ -3795,6 +3838,7 @@ int main(int argc, char **argv) {
 
 		case 'E':
 			set_attribute_accum(attribute_accum, optarg, argv);
+			accumulate_args.push_back(optarg);
 			break;
 
 		default: {
@@ -4147,6 +4191,21 @@ int main(int argc, char **argv) {
 	if (name != NULL) fingerprint.name = name;
 	if (description != NULL) fingerprint.description = description;
 	if (attribution != NULL) fingerprint.attribution = attribution;
+	// v3.4 (CK-S4): 持久化切片选项（此处为选项解析与 detail 调整后的生效值），
+	// bare resume 时恢复，保证续跑 zoom 与原作业切片行为一致
+	fingerprint.tiling_options.buffer = buffer;
+	fingerprint.tiling_options.gamma = gamma;
+	fingerprint.tiling_options.droprate = droprate;
+	fingerprint.tiling_options.full_detail = full_detail;
+	fingerprint.tiling_options.low_detail = low_detail;
+	fingerprint.tiling_options.min_detail = min_detail;
+	fingerprint.tiling_options.simplification = simplification;
+	fingerprint.tiling_options.maxzoom_simplification = maxzoom_simplification;
+	fingerprint.tiling_options.prefilter = prefilter != NULL ? prefilter : "";
+	fingerprint.tiling_options.postfilter = postfilter != NULL ? postfilter : "";
+	fingerprint.tiling_options.filter_json = filter_raw != NULL ? filter_raw : "";
+	fingerprint.tiling_options.filter_expression_mode = filter_expression_mode;
+	fingerprint.tiling_options.accumulate_attributes = accumulate_args;
 	std::vector<std::string> input_paths;
 	for (size_t a = 0; a < sources.size(); a++) {
 		if (!sources[a].file.empty()) {

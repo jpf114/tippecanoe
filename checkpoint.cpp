@@ -343,6 +343,16 @@ void jw_bool(std::string &out, const char *key, bool val, bool first = false) {
 	out += val ? "true" : "false";
 }
 
+void jw_dbl(std::string &out, const char *key, double val, bool first = false) {
+	if (!first) out += ",";
+	out += "\"";
+	out += key;
+	out += "\":";
+	char buf[64];
+	snprintf(buf, sizeof(buf), "%.17g", val);
+	out += buf;
+}
+
 // 序列化 CheckpointState 为 JSON 字符串
 std::string serialize_state(CheckpointState const &s) {
 	std::string j;
@@ -427,6 +437,30 @@ std::string serialize_state(CheckpointState const &s) {
 	// v3.3: prevent/additional 位图（resume 指纹校验需要）
 	jw_str(j, "prevent", s.prevent_str);
 	jw_str(j, "additional", s.additional_str);
+
+	// v3.4: 切片选项（CK-S4：bare resume 恢复原作业的切片行为）
+	j += ",\"tiling_options\":{";
+	jw_int(j, "buffer", s.tiling_options.buffer, true);
+	jw_dbl(j, "gamma", s.tiling_options.gamma);
+	jw_dbl(j, "droprate", s.tiling_options.droprate);
+	jw_int(j, "full_detail", s.tiling_options.full_detail);
+	jw_int(j, "low_detail", s.tiling_options.low_detail);
+	jw_int(j, "min_detail", s.tiling_options.min_detail);
+	jw_dbl(j, "simplification", s.tiling_options.simplification);
+	jw_int(j, "maxzoom_simplification", s.tiling_options.maxzoom_simplification);
+	jw_str(j, "prefilter", s.tiling_options.prefilter);
+	jw_str(j, "postfilter", s.tiling_options.postfilter);
+	jw_str(j, "filter_json", s.tiling_options.filter_json);
+	jw_bool(j, "filter_expression_mode", s.tiling_options.filter_expression_mode);
+	j += ",\"accumulate_attributes\":[";
+	for (size_t i = 0; i < s.tiling_options.accumulate_attributes.size(); i++) {
+		if (i > 0) j += ",";
+		j += "\"";
+		json_escape(s.tiling_options.accumulate_attributes[i], j);
+		j += "\"";
+	}
+	j += "]";
+	j += "}";
 
 	j += "}";
 	return j;
@@ -574,6 +608,44 @@ bool parse_state(std::string const &json_str, CheckpointState &out) {
 	if (v && v->type == JSON_STRING) out.prevent_str = v->value.string.string;
 	v = json_hash_get(root, "additional");
 	if (v && v->type == JSON_STRING) out.additional_str = v->value.string.string;
+
+	// v3.4: 切片选项（向后兼容：旧 state.json 没有该字段，保持默认值）
+	json_object *to = json_hash_get(root, "tiling_options");
+	if (to && to->type == JSON_HASH) {
+		v = json_hash_get(to, "buffer");
+		if (v && v->type == JSON_NUMBER) out.tiling_options.buffer = (int) v->value.number.number;
+		v = json_hash_get(to, "gamma");
+		if (v && v->type == JSON_NUMBER) out.tiling_options.gamma = v->value.number.number;
+		v = json_hash_get(to, "droprate");
+		if (v && v->type == JSON_NUMBER) out.tiling_options.droprate = v->value.number.number;
+		v = json_hash_get(to, "full_detail");
+		if (v && v->type == JSON_NUMBER) out.tiling_options.full_detail = (int) v->value.number.number;
+		v = json_hash_get(to, "low_detail");
+		if (v && v->type == JSON_NUMBER) out.tiling_options.low_detail = (int) v->value.number.number;
+		v = json_hash_get(to, "min_detail");
+		if (v && v->type == JSON_NUMBER) out.tiling_options.min_detail = (int) v->value.number.number;
+		v = json_hash_get(to, "simplification");
+		if (v && v->type == JSON_NUMBER) out.tiling_options.simplification = v->value.number.number;
+		v = json_hash_get(to, "maxzoom_simplification");
+		if (v && v->type == JSON_NUMBER) out.tiling_options.maxzoom_simplification = (int) v->value.number.number;
+		v = json_hash_get(to, "prefilter");
+		if (v && v->type == JSON_STRING) out.tiling_options.prefilter = v->value.string.string;
+		v = json_hash_get(to, "postfilter");
+		if (v && v->type == JSON_STRING) out.tiling_options.postfilter = v->value.string.string;
+		v = json_hash_get(to, "filter_json");
+		if (v && v->type == JSON_STRING) out.tiling_options.filter_json = v->value.string.string;
+		v = json_hash_get(to, "filter_expression_mode");
+		if (v && (v->type == JSON_TRUE || v->type == JSON_FALSE)) out.tiling_options.filter_expression_mode = (v->type == JSON_TRUE);
+		json_object *aa = json_hash_get(to, "accumulate_attributes");
+		if (aa && aa->type == JSON_ARRAY) {
+			for (size_t i = 0; i < aa->value.array.length; i++) {
+				json_object *item = aa->value.array.array[i];
+				if (item && item->type == JSON_STRING) {
+					out.tiling_options.accumulate_attributes.push_back(item->value.string.string);
+				}
+			}
+		}
+	}
 
 	json_free(root);
 	json_end(jp);
@@ -1685,6 +1757,8 @@ std::unique_ptr<Session> Session::open_new(const char *dir, bool force, Fingerpr
 	// v3.3: 持久化 prevent/additional 位图，resume 指纹校验时恢复
 	s->state_.prevent_str = encode_flags(params.prevent);
 	s->state_.additional_str = encode_flags(params.additional);
+	// v3.4: 持久化切片选项，bare resume 时恢复（CK-S4）
+	s->state_.tiling_options = params.tiling_options;
 
 	s->save_state_atomic();
 	return s;
@@ -1869,6 +1943,10 @@ bool Session::restore_tiling(TilingRestore &out) {
 	if (!can_resume_tiling()) {
 		return false;
 	}
+
+	// v3.4: 原作业的切片选项（CK-S4：read_input 的 resume 分支据此恢复
+	// buffer/gamma/detail/simplification/prefilter/postfilter/filter/-E）
+	out.tiling_options = state_.tiling_options;
 
 	struct stat pst;
 	std::string poolpath = path_blob("stringpool");
