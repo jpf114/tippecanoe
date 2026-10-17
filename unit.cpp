@@ -10,6 +10,7 @@
 #include "postgis.hpp"
 #include "mongo.hpp"
 #include "db_options.hpp"
+#include "options_table.hpp"
 #include <unistd.h>
 #include <limits.h>
 
@@ -191,6 +192,43 @@ TEST_CASE("PostGIS shard condition wraps outer query", "[postgis]") {
 	REQUIRE(wrapped.rfind("ORDER BY id) AS _subq WHERE " + shard) != std::string::npos);
 }
 
+static struct option t_main_opts[] = { MAIN_OPTIONS_TABLE(X_OPTION, GROUP_TITLE) };
+static struct option t_db_opts[] = { DB_OPTIONS_TABLE(X_OPTION, GROUP_TITLE) };
+
+TEST_CASE("main/db option tables are consistent (single source)", "[options]") {
+        // 表单一来源回归守护：COMMON 选项在两表同名同参；专属选项不串台
+        std::map<std::string, std::pair<int, int>> main_opts, db_opts;
+        for (size_t i = 0; t_main_opts[i].name != NULL; i++) {
+                main_opts[t_main_opts[i].name] = {(int) t_main_opts[i].has_arg, (int) t_main_opts[i].val};
+        }
+        for (size_t i = 0; t_db_opts[i].name != NULL; i++) {
+                db_opts[t_db_opts[i].name] = {(int) t_db_opts[i].has_arg, (int) t_db_opts[i].val};
+        }
+
+        const char *const main_only[] = {
+                "checkpoint-dir", "resume", "checkpoint-force", "checkpoint-status", "checkpoint-prune",
+                "layer", "named-layer", "read-parallel",
+                "drop-by-attribute-as-needed", "drop-by-attribute-order", NULL
+        };
+        for (auto const &kv : main_opts) {
+                auto dbit = db_opts.find(kv.first);
+                if (is_named_db_help_option(kv.first.c_str(), main_only)) {
+                        REQUIRE(dbit == db_opts.end());
+                } else if (dbit != db_opts.end()) {
+                        REQUIRE(dbit->second == kv.second);
+                }
+        }
+        for (auto const &kv : db_opts) {
+                if (main_opts.count(kv.first) != 0) {
+                        REQUIRE(!is_named_db_help_option(kv.first.c_str(), main_only));
+                }
+        }
+        // 重构时补齐到 db 的通用选项必须真正在两表中
+        for (char const *n : {"name", "attribution", "description", "output-projection"}) {
+                REQUIRE(main_opts.count(n) == 1);
+                REQUIRE(db_opts.count(n) == 1);
+        }
+}
 TEST_CASE("PostGIS short connection strings are rejected (DB-M3)", "[postgis]") {
         // 质检 DB-M3：短格式 dbname:user:pass 从未实现，连接串仅支持
         // postgresql:// URI。此用例锁定该结论，防止回归或文档复误。
