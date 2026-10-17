@@ -51,6 +51,8 @@ python3 tests/qa/gen_bigpoints.py /tmp/qa-fix/hugepoints.geojson 12000000
 | run_t6.sh | CK-S2 staging-dir 轮询触发 |
 | run_t7.sh | CK-S2 两阶段轮询精确命中 z0 提交窗口 |
 | run_p1db.sh | db P1 批：DB-S5 E11000 幂等 / DB-M1 SQL 模式 geom 泄漏 / DB-S8 混合 SRID 报错 / gc_test 回归 |
+| run_m15.sh | M15 投影：4490 线性网格 decode（单瓦片+整集）、3857 米制 decode 上游语义、交叉组合 prefilter、tile-join crs 透传与混合网格拒绝（exit 101）。数据自建 |
+| run_options_refactor.sh | 选项解析层重构：flag 绑定条目（-a@）、prevent 位标志、maindb 补齐的 --name/-N/-A/--output-projection、name 缺省回退、checkpoint 选项专属不串台。依赖 PostGIS TippTest.china；表一致性由 make unit 的 [options] 用例覆盖 |
 | cmp_tiles.py | mbtiles 瓦片网格与字节比对工具（脚本内复用） |
 
 ## 判定基线

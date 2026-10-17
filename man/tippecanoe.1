@@ -331,6 +331,30 @@ is necessary at each zoom level to make that zoom level's tiles work.
 If your features have a lot of attributes, use \fB\fC\-y\fR to keep only the ones you really need.
 .PP
 If your input is formatted as newline\-delimited GeoJSON, use \fB\fC\-P\fR to make input parsing a lot faster.
+.SS Checkpoint / resume
+.RS
+
+\fB\fC\-\-checkpoint\-dir\fR=\fIdir\fP: Run the job with a checkpoint directory.
+Completed zoom levels are committed as the job goes, so an interrupted job
+can be resumed instead of restarted.
+.PP
+\fB\fC\-\-resume\fR=\fIdir\fP: Resume a job from its checkpoint, self\-contained.
+Do not pass \fB\fC\-o\fR/\fB\fC\-f\fR on resume; the output path and all tiling options
+(zooms, buffer, gamma, simplification, drop strategies, prefilter/postfilter,
+filters, attribute accumulation) are restored from the checkpoint state, so
+resumed tiles are byte\-identical to a single\-shot run.
+.PP
+The job exits cleanly on SIGTERM/SIGINT after finishing the current zoom.
+Exit codes: 100 partial completion (some zooms committed, resume to continue),
+110 no zoom committed yet, 101 fingerprint mismatch (inputs or parameters
+changed since the checkpoint), 121 checkpoint data verification failure or
+insufficient disk space.
+.PP
+The checkpoint is bound to the machine it was created on: resuming with a
+different CPU count or temp\-file limit is rejected.
+Inspect state with \fB\fC\-\-checkpoint\-status\fR=\fIdir\fP and
+clean blobs with \fB\fC\-\-checkpoint\-prune\fR=\fIdir\fP;
+\fB\fC\-\-checkpoint\-force\fR overrides fingerprint checks.
 .SS Output tileset
 .RS
 .IP \(bu 2
@@ -401,6 +425,9 @@ Parallel processing will also be automatic if the input file is in FlatGeobuf fo
 .IP \(bu 2
 \fB\fC\-\-output\-projection=\fR\fIprojection\fP: Specify the projection of the output tile grid. Supported are \fB\fCEPSG:3857\fR (Web Mercator, the default) and \fB\fCEPSG:4490\fR (CGCS2000). \fB\fCEPSG:4490\fR output uses an equirectangular tile grid (2^z columns by 2^(z\-1) rows per zoom level, linear in latitude) instead of the Web Mercator grid, and records crs, tile_origin_upper_left_x, tile_origin_upper_left_y, and tile_dimension_zoom_0 metadata rows so consumers can identify the grid. If not specified, the output grid follows \fB\fC\-s\fR: \fB\fC\-s EPSG:4490\fR produces the equirectangular grid; any other \fB\fC\-s\fR keeps Web Mercator. Any input/output combination is supported: geographic input (\fB\fCEPSG:4326\fR/\fB\fCEPSG:4490\fR, degrees) goes straight into the chosen grid, while \fB\fCEPSG:3857\fR input (Web Mercator meters) is first converted back to longitude/latitude when the output grid is \fB\fCEPSG:4490\fR. \fB\fCtippecanoe\-decode\fR recognizes equirectangular tilesets automatically from their crs metadata row.
 .RE
+.PP
+\fB\fCtippecanoe\-decode\fR recognizes equirectangular tilesets automatically from their crs metadata row, in both whole\-tileset and single\-tile output; it can also be told explicitly with \fB\fC\-s EPSG:4490\fR.
+\fB\fCtile\-join\fR propagates the crs row and tile\-matrix metadata of equirectangular inputs to its output and computes bounds on the same grid; joining equirectangular and Web Mercator tilesets is rejected (exit 101) because the tile grids do not align.
 .SS Zoom levels
 .RS
 .IP \(bu 2
