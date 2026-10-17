@@ -1681,7 +1681,7 @@ std::pair<int, metadata> read_input(std::string &layername, const char *fname, i
 	std::atomic<unsigned> midx(0);
 	std::atomic<unsigned> midy(0);
 	std::vector<strategy> strategies;
-	int written = traverse_zooms(fd, size, stringpool, &midx, &midy, maxzoom, minzoom, outdb, outdir, buffer, fname, tmpdir, gamma, full_detail, low_detail, min_detail, pool_off, initial_x, initial_y, simplification, maxzoom_simplification, layermaps, prefilter, postfilter, attribute_accum, filter, strategies, iz, shared_nodes_map, nodepos, shared_nodes_bloom, basezoom, droprate, unidecode_data);
+	int written = traverse_zooms(fd, size, stringpool, &midx, &midy, maxzoom, minzoom, outdb, outdir, buffer, fname, tmpdir, gamma, full_detail, low_detail, min_detail, pool_off, initial_x, initial_y, simplification, maxzoom_simplification, layermaps, prefilter, postfilter, attribute_accum, filter, strategies, iz, shared_nodes_map, nodepos, shared_nodes_bloom, basezoom, droprate, unidecode_data, NULL, false);
 
 	if (maxzoom != written) {
 		if (written > minzoom) {
@@ -2499,6 +2499,8 @@ int maindb(int argc, char **argv) {
 	// read_input 内部会调用 traverse_zooms 进行瓦片写入
 	// v3.4 (M15 + 修订): tiling 进程中 prefilter/postfilter/plugin 的反投影
 	// 跟随输出网格（decode 进程保持默认 false，-s 声明瓦片坐标空间）
+	// v3.4 (副本收敛): 注入 MongoDB 附加写出 sink（tile-db.cpp 薄壳）
+	set_tile_db_output_sinks();
 	set_unproject_follows_output_grid(true);
 	std::string postgis_layer = postgis_cfg.effective_layer_name();
 	const char *read_input_name = name ? name : (out_mbtiles ? out_mbtiles : (out_dir ? out_dir : "mongo-output"));

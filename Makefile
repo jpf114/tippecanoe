@@ -82,7 +82,7 @@ LIBS = -L/usr/local/lib $(VCPKG_LIB)
 tippecanoe: geojson.o jsonpull/jsonpull.o tile.o pool.o mbtiles.o geometry.o projection.o memfile.o mvt.o serial.o main.o platform.o text.o dirtiles.o pmtiles_file.o plugin.o read_json.o write_json.o geobuf.o flatgeobuf.o evaluator.o geocsv.o csv.o geojson-loop.o json_logger.o visvalingam.o compression.o clip.o sort.o attribute.o thread.o shared_borders.o checkpoint.o clipper2/src/clipper.engine.o
 	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lm -lz -lsqlite3 -lpthread
 
-tippecanoe-db: geojson.o jsonpull/jsonpull.o tile-db.o pool.o mbtiles.o geometry.o projection.o memfile.o mvt.o serial.o maindb.o common_main.o platform.o text.o dirtiles.o plugin.o read_json.o write_json.o evaluator.o geojson-loop.o json_logger.o visvalingam.o compression.o clip.o sort.o attribute.o thread.o shared_borders.o postgis.o wkb_parser.o error_logger.o mongo.o postgis_manager.o mongo_manager.o clipper2/src/clipper.engine.o
+tippecanoe-db: geojson.o jsonpull/jsonpull.o tile.o tile-db.o pool.o mbtiles.o geometry.o projection.o memfile.o mvt.o serial.o maindb.o common_main.o platform.o text.o dirtiles.o pmtiles_file.o plugin.o read_json.o write_json.o evaluator.o geojson-loop.o json_logger.o visvalingam.o compression.o clip.o sort.o attribute.o thread.o shared_borders.o checkpoint.o postgis.o wkb_parser.o error_logger.o mongo.o postgis_manager.o mongo_manager.o clipper2/src/clipper.engine.o
 	$(CXX) $(PG) $(LIBS) $(PGIS_LIB) $(MONGO_CXX_INCLUDE) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(COMMON_LIBS) $(DB_EXTRA_LIBS)
 
 
@@ -127,7 +127,7 @@ mongo.o: mongo.cpp
 mongo_manager.o: mongo_manager.cpp
 	$(CXX) -MMD $(PG) $(PGIS_INCLUDE) $(INCLUDES) $(MONGO_CXX_INCLUDE) $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
 
-# Special rule for tile-db.o with MongoDB headers (includes mongo.hpp) - for tippecanoe-db only
+# Special rule for tile-db.o (thin output-sink shim; the tile loop lives in tile.o) with MongoDB headers (includes mongo.hpp) - for tippecanoe-db only
 tile-db.o: tile-db.cpp
 	$(CXX) -MMD $(PG) $(PGIS_INCLUDE) $(INCLUDES) $(MONGO_CXX_INCLUDE) $(FINAL_FLAGS) $(CXXFLAGS) -c -o $@ $<
 

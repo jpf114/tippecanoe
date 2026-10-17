@@ -15,6 +15,10 @@ upstream). Highlights:
 * Option parsing for `tippecanoe` / `tippecanoe-db` unified in
   `options_table.hpp` (single source; `tippecanoe-db` gained `--name`,
   `--description`, `--attribution`, `--output-projection`).
+* The tile-writing loop exists once again as a single source (`tile.cpp`):
+  `tile-db.cpp` shrank from 3463 lines to a thin output-sink shim, and
+  `tippecanoe-db` now injects its MongoDB write/erase/cleanup through
+  output-sink hooks.
 * Quality-assurance fixes from the branch QA pass: checkpoint state/blob
   integrity, directory-metadata overwrite, per-zoom commit cleanup, JSON
   attribute fidelity parity between PostGIS and GeoJSON paths, batch byte

@@ -1,6 +1,6 @@
 # 立项方案：tile.cpp / tile-db.cpp 双份瓦片循环副本收敛
 
-> 状态：**立项待批**（本文档只做方案，不含实现）。
+> 状态：**已批准并实施**（2026-10-17，见 git log；实施结果与方案的差异：hook 顺序对齐原 tile-db——write 先 Mongo 后本地且 skipped 检查在锁外、erase 先本地后 Mongo；tippecanoe-db 额外链接 tile.o/checkpoint.o/pmtiles_file.o）。
 > 起草：2026-10-17，基于 feature/combined @ 5054408 的实测 diff。
 > 背景：《架构复核》2.4 与遗留事项审计确认的最大的剩余复制债——
 > 比 maindb 选项解析层（已于 5054408 收敛）范围更大、风险更高。

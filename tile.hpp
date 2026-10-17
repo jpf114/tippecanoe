@@ -67,6 +67,15 @@ struct strategy {
 
 // long long write_tile(char **geom, char *stringpool, unsigned *file_bbox, int z, unsigned x, unsigned y, int detail, int min_detail, int basezoom, sqlite3 *outdb, const char *outdir, double droprate, int buffer, const char *fname, FILE **geomfile, int file_minzoom, int file_maxzoom, double todo, char *geomstart, long long along, double gamma, int nlayers, std::atomic<strategy> *strategy);
 
+// v3.4 (副本收敛): 瓦片输出 sink——tippecanoe-db 注入 MongoDB 附加写出；
+// tippecanoe 保持 NULL（直写 mbtiles/dir，行为不变）。
+// 契约：write 在每瓦片 skipped 检查通过后、db_lock 之前调用（先 Mongo 后本地，
+// 与原 tile-db 顺序一致）；erase 在每 zoom 回滚时调用；cleanup 在工作线程
+// 收尾调用。sink 不得持有 db_lock（Mongo 走线程本地 writer）。
+extern void (*tile_output_sink)(int z, unsigned tx, unsigned ty, const std::string &compressed);
+extern void (*tile_erase_zoom_sink)(int z);
+extern void (*tile_thread_cleanup_sink)();
+
 int traverse_zooms(int *geomfd, off_t *geom_size, char *stringpool, std::atomic<unsigned> *midx, std::atomic<unsigned> *midy, int &maxzoom, int minzoom, sqlite3 *outdb, const char *outdir, int buffer, const char *fname, const char *tmpdir, double gamma, int full_detail, int low_detail, int min_detail, long long *pool_off, unsigned *initial_x, unsigned *initial_y, double simplification, double maxzoom_simplification, std::vector<std::map<std::string, layermap_entry> > &layermap, const char *prefilter, const char *postfilter, std::unordered_map<std::string, attribute_op> const *attribute_accum, struct json_object *filter, std::vector<strategy> &strategies, int iz, struct node *shared_nodes_map, size_t nodepos, std::string const &shared_nodes_bloom, int basezoom, double droprate, std::vector<std::string> const &unidecode_data, std::string const *drop_by_attribute_as_needed_attribute, bool drop_by_attribute_descending, std::set<zxy> const *initial_skip_children = nullptr, checkpoint::Session *session = nullptr, bool initial_compressed = false);
 
 int manage_gap(unsigned long long index, unsigned long long *previndex, double scale, double gamma, double *gap);

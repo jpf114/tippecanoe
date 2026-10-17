@@ -56,6 +56,11 @@ extern "C" {
 
 #include "plugin.hpp"
 
+// v3.4 (副本收敛): 瓦片输出 sink（见 tile.hpp 契约注释）。默认 NULL。
+void (*tile_output_sink)(int z, unsigned tx, unsigned ty, const std::string &compressed) = NULL;
+void (*tile_erase_zoom_sink)(int z) = NULL;
+void (*tile_thread_cleanup_sink)() = NULL;
+
 #define CMD_BITS 3
 
 // Offset coordinates to keep them positive
@@ -3010,14 +3015,20 @@ long long write_tile(decompressor *geoms, std::atomic<long long> *geompos_in, ch
 					detail_reduced++;
 				}
 			} else {
-				if (pthread_mutex_lock(&db_lock) != 0) {
-					perror("pthread_mutex_lock");
-					exit(EXIT_PTHREAD);
-				}
-
+				// v3.4 (副本收敛): 检查/sink 在锁外、直写在锁内——与原 tile-db
+				// 的 write_tile_outputs 结构一致（Mongo 无锁走线程本地 writer，
+				// db_lock 只保护 mbtiles/dir 直写）
 				if (skipped > 0 || too_many_bytes || too_many_features) {
 					fprintf(stderr, "Can't happen: writing tile even though we skipped\n");
 					exit(EXIT_IMPOSSIBLE);
+				}
+				if (tile_output_sink != NULL) {
+					tile_output_sink(z, tx, ty, compressed);
+				}
+
+				if (pthread_mutex_lock(&db_lock) != 0) {
+					perror("pthread_mutex_lock");
+					exit(EXIT_PTHREAD);
 				}
 
 				if (outdb != NULL) {
@@ -3203,6 +3214,9 @@ void *run_thread(void *vargs) {
 		}
 	}
 
+		if (tile_thread_cleanup_sink != NULL) {
+			tile_thread_cleanup_sink();
+		}
 	arg->running--;
 	return err_or_null;
 }
@@ -3505,6 +3519,9 @@ int traverse_zooms(int *geomfd, off_t *geom_size, char *global_stringpool, std::
 				} else if (outdir != NULL) {
 					dir_erase_zoom(outdir, z);
 				}
+						if (tile_erase_zoom_sink != NULL) {
+							tile_erase_zoom_sink(z);
+						}
 			} else {
 				break;
 			}
