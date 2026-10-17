@@ -31,6 +31,11 @@ struct projection *get_output_projection(void);
 void project_input(double ix, double iy, int zoom, long long *ox, long long *oy);
 // Unproject output-grid tile coordinates to longitude/latitude.
 void unproject_output_ll(long long ix, long long iy, int zoom, double *ox, double *oy);
+// v3.4: layer_to_geojson 反投影模式开关。默认 false（decode：-s 声明瓦片
+// 坐标空间，projection->unproject）；tiling 进程进入 read_input 前设 true
+// （prefilter/postfilter/plugin 反投影跟随输出网格）。
+void set_unproject_follows_output_grid(bool b);
+bool unproject_follows_output_grid(void);
 // If the output grid is equirectangular, fill TileMatrixSet metadata and
 // return true; return false for the standard Web Mercator grid.
 bool output_tile_matrix_meta(const char **crs, double *origin_x, double *origin_y, double *z0_dim);

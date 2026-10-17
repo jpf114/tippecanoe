@@ -326,6 +326,21 @@ void unproject_output_ll(long long ix, long long iy, int zoom, double *ox, doubl
 	}
 }
 
+// v3.4 (M15 + 修订): layer_to_geojson 的反投影模式开关。
+//   false（默认）：decode 场景——-s 是用户对瓦片坐标空间的显式声明
+//     （-s EPSG:3857 输出米制坐标，上游 golden 语义）。
+//   true：tiling 场景（tippecanoe / tippecanoe-db 进入 read_input 前设置）——
+//     瓦片坐标位于输出网格，反投影跟随 --output-projection。
+static std::atomic<bool> follows_output_grid(false);
+
+void set_unproject_follows_output_grid(bool b) {
+	follows_output_grid.store(b, std::memory_order_release);
+}
+
+bool unproject_follows_output_grid(void) {
+	return follows_output_grid.load(std::memory_order_acquire);
+}
+
 bool output_tile_matrix_meta(const char **crs, double *origin_x, double *origin_y, double *z0_dim) {
 	if (!output_grid_is_linear()) {
 		return false;

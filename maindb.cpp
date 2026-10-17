@@ -2702,6 +2702,9 @@ int maindb(int argc, char **argv) {
 	}
 	// 2. 调用 read_input() 读取 PostGIS 数据并写入瓦片
 	// read_input 内部会调用 traverse_zooms 进行瓦片写入
+	// v3.4 (M15 + 修订): tiling 进程中 prefilter/postfilter/plugin 的反投影
+	// 跟随输出网格（decode 进程保持默认 false，-s 声明瓦片坐标空间）
+	set_unproject_follows_output_grid(true);
 	std::string postgis_layer = postgis_cfg.effective_layer_name();
 	const char *read_input_name = out_mbtiles ? out_mbtiles : (out_dir ? out_dir : "mongo-output");
 	DEBUG_LOG("Layer configuration: %s", postgis_layer.c_str());

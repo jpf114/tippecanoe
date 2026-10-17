@@ -398,14 +398,19 @@ void layer_to_geojson(mvt_layer const &layer, unsigned z, unsigned x, unsigned y
 				long long wy = wscale * y + (wscale / layer.extent) * py;
 
 				double lat, lon;
-				// v3.4 (M15): 反投影必须跟随输出网格（output_grid_is_linear），
-				// 而非输入投影。-s 与 --output-projection 交叉组合（如
-				// -s EPSG:3857 --output-projection EPSG:4490）时，瓦片坐标
-				// 位于等经纬线性网格上，用 projection->unproject（输入投影）
-				// 会得到错误的经纬度，殃及 prefilter/postfilter（tile.cpp）与
-				// 属性过滤（plugin.cpp）。decode 路径不受影响：它按 crs 元数据
-				// 设置投影后，两者等价。
-				unproject_output_ll(wx, wy, 32, &lon, &lat);
+				// v3.4 (M15 + 修订): 反投影模式由进程场景决定——
+				//  - tiling（tippecanoe / tippecanoe-db 的 prefilter/postfilter、
+				//    plugin 属性过滤）：瓦片坐标位于输出网格，须用
+				//    unproject_output_ll 跟随 --output-projection；
+				//  - decode（tippecanoe-decode）：-s 是用户对瓦片坐标空间的
+				//    显式声明（-s EPSG:3857 期望米制输出，上游 golden 语义），
+				//    必须用 projection->unproject。
+				// 详见 set_unproject_follows_output_grid。
+				if (unproject_follows_output_grid()) {
+					unproject_output_ll(wx, wy, 32, &lon, &lat);
+				} else {
+					projection->unproject(wx, wy, 32, &lon, &lat);
+				}
 
 				ops.push_back(lonlat(op, lon, lat, px, py));
 			} else {

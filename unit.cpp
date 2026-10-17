@@ -184,35 +184,28 @@ TEST_CASE("PostGIS shard condition wraps outer query", "[postgis]") {
 	std::string shard = "(abs(hashtext(ctid::text)) % 4) = 1";
 	std::string wrapped = PostGISReader::build_sharded_query(base, shard);
 
-	REQUIRE(wrapped == "SELECT * FROM (" + base + ") AS _shard_src WHERE " + shard);
-	REQUIRE(wrapped.find("WHERE type = 'highway' ORDER BY id) AS _subq") != std::string::npos);
-	REQUIRE(wrapped.find("_shard_src WHERE " + shard) != std::string::npos);
+	// v3.4 (DB-S1): 分片条件直接追加到内层 WHERE（ctid 等系统列在外层子查询
+	// 结果集中不可见，旧的外包裹语义已废弃）
+	REQUIRE(wrapped == base + " WHERE " + shard);
+	REQUIRE(wrapped.find("SELECT * FROM (") == std::string::npos);  // 无外层包裹
+	REQUIRE(wrapped.rfind("ORDER BY id) AS _subq WHERE " + shard) != std::string::npos);
 }
 
-TEST_CASE("PostGIS short connection string keeps advanced fields optional", "[postgis]") {
-	postgis_config cfg;
-	REQUIRE(cfg.parse_connection_string("gis"));
-	REQUIRE(cfg.dbname == "gis");
-	REQUIRE(cfg.host == "localhost");
-	REQUIRE(cfg.port == "5432");
-	REQUIRE(cfg.user.empty());
-	REQUIRE(cfg.password.empty());
+TEST_CASE("PostGIS short connection strings are rejected (DB-M3)", "[postgis]") {
+        // 质检 DB-M3：短格式 dbname:user:pass 从未实现，连接串仅支持
+        // postgresql:// URI。此用例锁定该结论，防止回归或文档复误。
+        postgis_config cfg;
+        REQUIRE_FALSE(cfg.parse_connection_string("gis"));
+        REQUIRE_FALSE(cfg.parse_connection_string("gis:alice:secret"));
 
-	postgis_config auth_cfg;
-	REQUIRE(auth_cfg.parse_connection_string("gis:alice:secret"));
-	REQUIRE(auth_cfg.dbname == "gis");
-	REQUIRE(auth_cfg.user == "alice");
-	REQUIRE(auth_cfg.password == "secret");
-	REQUIRE(auth_cfg.host == "localhost");
-	REQUIRE(auth_cfg.port == "5432");
-
-	postgis_config legacy_cfg;
-	REQUIRE(legacy_cfg.parse_connection_string("db.example.com:5433:gis:alice:secret"));
-	REQUIRE(legacy_cfg.host == "db.example.com");
-	REQUIRE(legacy_cfg.port == "5433");
-	REQUIRE(legacy_cfg.dbname == "gis");
-	REQUIRE(legacy_cfg.user == "alice");
-	REQUIRE(legacy_cfg.password == "secret");
+        // URI 格式（含凭据）正常解析
+        postgis_config uri_cfg;
+        REQUIRE(uri_cfg.parse_connection_string("postgresql://alice:secret@db.example.com:5433/gis"));
+        REQUIRE(uri_cfg.dbname == "gis");
+        REQUIRE(uri_cfg.host == "db.example.com");
+        REQUIRE(uri_cfg.port == "5433");
+        REQUIRE(uri_cfg.user == "alice");
+        REQUIRE(uri_cfg.password == "secret");
 }
 
 TEST_CASE("PostGIS normalize centralizes runtime defaults", "[postgis]") {

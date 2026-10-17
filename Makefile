@@ -71,6 +71,9 @@ VCPKG_LIB = -L$(VCPKG_INSTALLED)/lib
 MONGO_CXX_INCLUDE = -I$(VCPKG_INSTALLED)/include/libmongoc-1.0 -I$(VCPKG_INSTALLED)/include/bson-1.0 -I$(VCPKG_INSTALLED)/include/bsoncxx/v_noabi -I$(VCPKG_INSTALLED)/include/mongocxx/v_noabi
 PGIS_INCLUDE = $(VCPKG_INCLUDE) -I$(VCPKG_INSTALLED)/include/postgresql
 PGIS_LIB = $(VCPKG_LIB)
+# unit 链接的 PostGIS 静态辅助库；本机 vcpkg libpq 无 libpgcommon/libpgport 时
+# 可命令行覆盖：make unit UNIT_PG_LIBS=
+UNIT_PG_LIBS ?= -lpgcommon -lpgport
 COMMON_LIBS = -lm -lz -lsqlite3 -lpthread
 DB_EXTRA_LIBS = -lpq -lpgcommon -lpgport $(VCPKG_INSTALLED)/lib/libmongocxx-static.a $(VCPKG_INSTALLED)/lib/libbsoncxx-static.a $(VCPKG_INSTALLED)/lib/libmongoc2.a $(VCPKG_INSTALLED)/lib/libbson2.a $(VCPKG_INSTALLED)/lib/libutf8proc.a -lssl -lcrypto -lresolv -lz
 INCLUDES = $(VCPKG_INCLUDE) -I. -Iclipper2/include
@@ -96,7 +99,7 @@ tippecanoe-json-tool: jsontool.o jsonpull/jsonpull.o csv.o text.o geojson-loop.o
 	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lm -lz -lsqlite3 -lpthread
 
 unit: unit.o text.o sort.o mvt.o projection.o clip.o attribute.o jsonpull/jsonpull.o evaluator.o read_json.o postgis.o wkb_parser.o error_logger.o serial.o geometry.o visvalingam.o clipper2/src/clipper.engine.o
-	$(CXX) $(PG) $(LIBS) $(PGIS_LIB) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(COMMON_LIBS) -lpq -lpgcommon -lpgport -lssl -lcrypto -lresolv -lsqlite3
+	$(CXX) $(PG) $(LIBS) $(PGIS_LIB) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(COMMON_LIBS) -lpq $(UNIT_PG_LIBS) -lssl -lcrypto -lresolv -lsqlite3
 
 tippecanoe-overzoom: overzoom.o mvt.o clip.o evaluator.o jsonpull/jsonpull.o text.o attribute.o read_json.o projection.o read_json.o clipper2/src/clipper.engine.o
 	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lm -lz -lsqlite3 -lpthread
@@ -752,7 +755,7 @@ checkpoint-test: tippecanoe
 	grep -q '"description":"MetaDesc"' /tmp/tippecanoe-checkpoint-metadata/cp/state.json
 	grep -q '"attribution":"MetaAttr"' /tmp/tippecanoe-checkpoint-metadata/cp/state.json
 	# Resume
-	./tippecanoe -q --resume=/tmp/tippecanoe-checkpoint-metadata/cp
+	TIPPECANOE_MAX_THREADS=1 ./tippecanoe -q --resume=/tmp/tippecanoe-checkpoint-metadata/cp
 	# mbtiles metadata must match baseline
 	test "$$(sqlite3 /tmp/tippecanoe-checkpoint-metadata/out.mbtiles 'SELECT value FROM metadata WHERE name='"'"'name'"'"';')" = "MetaName"
 	test "$$(sqlite3 /tmp/tippecanoe-checkpoint-metadata/out.mbtiles 'SELECT value FROM metadata WHERE name='"'"'description'"'"';')" = "MetaDesc"

@@ -4288,6 +4288,9 @@ int main(int argc, char **argv) {
 		}
 	}
 
+	// v3.4 (M15 + 修订): tiling 进程中 prefilter/postfilter/plugin 的反投影
+	// 跟随输出网格（decode 进程保持默认 false，-s 声明瓦片坐标空间）
+	set_unproject_follows_output_grid(true);
 	auto input_ret = read_input(sources, name ? name : out_mbtiles ? out_mbtiles
 								       : out_dir,
 				    maxzoom, minzoom, basezoom, basezoom_marker_width, outdb, out_dir, &exclude, &include, exclude_all, filter, droprate, buffer, tmpdir, gamma, read_parallel, forcetable, attribution, gamma != 0, file_bbox, file_bbox1, file_bbox2, prefilter, postfilter, description, guess_maxzoom, guess_cluster_maxzoom, &attribute_types, argv[0], &attribute_accum, attribute_descriptions, commandline, minimum_maxzoom, checkpoint_session.get());
