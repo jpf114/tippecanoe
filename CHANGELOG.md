@@ -1,31 +1,3 @@
-# Custom builds (2026-10)
-
-Tippecanoe customizations maintained on `feature/combined` (source branches
-`feature/checkpoint-resume` and `feature/db` are frozen; `main` stays with
-upstream). Highlights:
-
-* Checkpoint / resume for long jobs (`--checkpoint-dir`, self-contained
-  `--resume`, zoom-level commits, CRC/power-loss verification, fingerprint
-  guards). Documented in the man page and README.
-* `tippecanoe-db`: read directly from PostGIS, optional MongoDB business
-  output alongside MBTiles verification output (URI-only connection strings,
-  E11000 idempotent re-runs, `SET bytea_output = hex` compatibility).
-* EPSG:4490 (CGCS2000) equirectangular tile grid: `--output-projection`,
-  crs metadata rows, decode/tile-join awareness, mixed-grid rejection.
-* Option parsing for `tippecanoe` / `tippecanoe-db` unified in
-  `options_table.hpp` (single source; `tippecanoe-db` gained `--name`,
-  `--description`, `--attribution`, `--output-projection`).
-* The tile-writing loop exists once again as a single source (`tile.cpp`):
-  `tile-db.cpp` shrank from 3463 lines to a thin output-sink shim, and
-  `tippecanoe-db` now injects its MongoDB write/erase/cleanup through
-  output-sink hooks.
-* Quality-assurance fixes from the branch QA pass: checkpoint state/blob
-  integrity, directory-metadata overwrite, per-zoom commit cleanup, JSON
-  attribute fidelity parity between PostGIS and GeoJSON paths, batch byte
-  limits for MongoDB writes, drop-before-write barrier, and more.
-* Regression suites under `tests/qa/`; upstream `make test` kept green.
-
-
 # 2.80.0
 
 * Remove undocumented command-line options

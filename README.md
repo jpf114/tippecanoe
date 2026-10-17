@@ -1,7 +1,7 @@
 tippecanoe
 ==========
 
-Builds [vector tilesets](https://github.com/mapbox/vector-tile-spec/) from large (or small) collections of [GeoJSON](http://geojson.org/), [FlatGeobuf](https://github.com/flatgeobuf/flatgeobuf), [CSV](https://en.wikipedia.org/wiki/Comma-separated_values) features, or directly from [PostGIS](https://postgis.net/) databases,
+Builds [vector tilesets](https://github.com/mapbox/vector-tile-spec/) from large (or small) collections of [GeoJSON](http://geojson.org/), [FlatGeobuf](https://github.com/flatgeobuf/flatgeobuf), or [CSV](https://en.wikipedia.org/wiki/Comma-separated_values) features,
 [like these](MADE_WITH.md).
 
 This is the official home of Tippecanoe, developed and actively maintained by [Erica Fischer](https://github.com/e-n-f) at [Felt](https://felt.com). 
@@ -49,17 +49,6 @@ $ cd tippecanoe
 $ make -j
 $ make install
 ```
-
-To produce a fully static build (no runtime dependency on shared libraries):
-
-```sh
-$ make LDFLAGS=-static -j
-```
-
-This repository keeps two ready-to-run build variants:
-
- * `build/dynamic/`: dynamically linked binaries (default `make` output)
- * `build/static/`: statically linked binaries (`make LDFLAGS=-static` output)
 
 See [Development](#development) below for how to upgrade your
 C++ compiler or install prerequisite packages if you get
@@ -322,7 +311,6 @@ If your input is formatted as newline-delimited GeoJSON, use `-P` to make input 
  * _name_`.json.gz` or _name_`.geojson.gz`: Read the named gzipped GeoJSON input file into a layer called _name_.
  * _name_`.fgb`: Read the named FlatGeobuf input file into a layer called _name_.
  * _name_`.csv`: Read the named CSV input file into a layer called _name_.
- * **PostGIS database**: Read spatial data directly from a PostGIS database using the `--postgis` option or related parameters. See [PostGIS support](#postgis-support) below for details.
  * `-l` _name_ or `--layer=`_name_: Use the specified layer name instead of deriving a name from the input filename or output tileset. If there are multiple input files
    specified, the files are all merged into the single named layer, even if they try to specify individual names with `-L`.
  * `-L` _name_`:`_file.json_ or `--named-layer=`_name_`:`_file.json_: Specify layer names for individual files. If your shell supports it, you can use a subshell redirect like `-L` _name_`:<(cat dir/*.json)` to specify a layer name for the output of streamed input.
@@ -349,14 +337,9 @@ than at all newlines.
 
 Parallel processing will also be automatic if the input file is in FlatGeobuf format.
 
-### Input and output projections
+### Projection of input
 
- * `-s` _projection_ or `--projection=`_projection_: Specify the projection of the input data. Currently supported are `EPSG:4326` (WGS84, the default), `EPSG:4490` (CGCS2000), and `EPSG:3857` (Web Mercator). In general you should use WGS84 for your input files if at all possible.
- * `--output-projection=`_projection_: Specify the projection of the output tile grid. Supported are `EPSG:3857` (Web Mercator, the default) and `EPSG:4490` (CGCS2000). `EPSG:4490` output uses an equirectangular tile grid (2^z columns by 2^(z-1) rows per zoom level, linear in latitude) instead of the Web Mercator grid, and records `crs`, `tile_origin_upper_left_x`, `tile_origin_upper_left_y`, and `tile_dimension_zoom_0` metadata rows so consumers can identify the grid. If not specified, the output grid follows `-s`: `-s EPSG:4490` produces the equirectangular grid; any other `-s` keeps Web Mercator.
-
-Any input/output combination is supported: geographic input (`EPSG:4326`/`EPSG:4490`, degrees) goes straight into the chosen grid, while `EPSG:3857` input (Web Mercator meters) is first converted back to longitude/latitude when the output grid is `EPSG:4490`. Since EPSG:4326 and EPSG:4490 are both longitude/latitude systems and numerically interchangeable for tiling purposes, the only true coordinate conversion happens on the 3857-to-4490 path.
-
-`tippecanoe-decode` recognizes equirectangular tilesets automatically from their `crs` metadata row (both whole-tileset and single-tile output); it can also be told explicitly with `-s EPSG:4490`. `tile-join` propagates the `crs` row and tile-matrix metadata of equirectangular inputs to its output and computes bounds on the same grid; joining equirectangular and Web Mercator tilesets is rejected (exit 101) because the tile grids do not align.
+ * `-s` _projection_ or `--projection=`_projection_: Specify the projection of the input data. Currently supported are `EPSG:4326` (WGS84, the default) and `EPSG:3857` (Web Mercator). In general you should use WGS84 for your input files if at all possible.
 
 ### Zoom levels
 
@@ -711,151 +694,30 @@ have their probability diffused, so that some of them will be drawn as a square 
 this minimum size and others will not be drawn at all, preserving the total area that
 all of them should have had together.
 
-## Checkpoint / resume (断点续做)
+Features in the same tile that share the same type and attributes are coalesced
+together into a single geometry if you use `--coalesce`. You are strongly encouraged to use `-x` to exclude
+any unnecessary attributes to reduce wasted file size.
 
-Long-running jobs can be interrupted and resumed without restarting from scratch.
-
-- Start a fresh job with a checkpoint directory: `tippecanoe --checkpoint-dir=/path/ckpt ...`
-- Resume the same job later with a self-contained resume: `tippecanoe --resume=/path/ckpt`.
-  Do not pass `-o`/`-f` on resume; the output path and all tiling options
-  (zooms, buffer, gamma, simplification, drop strategies, prefilter/postfilter,
-  filters, attribute accumulation) are restored from the checkpoint state, so
-  resumed tiles are byte-identical to a single-shot run.
-- The job commits completed zoom levels as it goes and exits cleanly on
-  SIGTERM/SIGINT after finishing the current zoom.
-- Exit codes: `100` partial completion (some zooms committed, resume to continue),
-  `110` no zoom committed yet, `101` fingerprint mismatch (inputs/parameters changed
-  since the checkpoint), `121` checkpoint data verification failure or insufficient
-  disk space.
-- The checkpoint is bound to the machine it was created on: resuming with a
-  different CPU count or temp-file limit is rejected. Verify or inspect state
-  with `--checkpoint-status` / `--checkpoint-prune`.
-
-## PostGIS Support
-
-This repository includes a customized `tippecanoe-db` workflow for reading directly from PostGIS and optionally writing MongoDB business output alongside MBTiles verification output.
-
-### tippecanoe-db Quick Start
-
-```bash
-tippecanoe-db \
-  --postgis "postgresql://postgres:password@localhost:5432/gis" \
-  --postgis-table roads \
-  --postgis-geometry-field geom \
-  --mongo "mongodb://admin:password@localhost:27017/tiles?collection=roads&authSource=admin" \
-  -o roads.mbtiles \
-  -Z5 -z10
-```
-
-Notes:
-
-- Connection strings support standard URI form only: `postgresql://[user:password@]host[:port]/dbname` and `mongodb://[user:password@]host[:port]/dbname?collection=...[&authSource=...]` (plus `mongodb+srv://`). Percent-encode special characters (`@ : / ? #`) in credentials. MongoDB query options other than `collection`/`authSource` (e.g. `replicaSet`, `tls`, `readPreference`) are passed through to the driver verbatim.
-- `--mongo` is business output; `-o` is MBTiles verification output
-- The default PostGIS attribute strategy now preserves source field order so MBTiles verification output matches native `tippecanoe` more closely by default
-- Re-running without `--mongo-drop-collection` treats already-present tiles (duplicate key E11000) as idempotent success instead of failures
-- MongoDB metadata write failures count toward the `--mongo-fail-on-discard` exit code (122)
-
-### More Detail
-
-Use these commands to inspect the current CLI surface:
-
-```bash
-tippecanoe-db --help
-tippecanoe-db --help-advanced
-```
-
-The maintained database workflow guide is [docs/user_guide.md](docs/user_guide.md). Historical design and test notes live under [docs](docs).
+If a tile is larger than 500K, it will try encoding that tile at progressively
+lower resolutions before failing if it still doesn't fit.
 
 Development
 -----------
 
-Tippecanoe uses system libraries for the core binaries. `tippecanoe-db` and `unit`
-build against vendored third-party sources in `third_party/` (PostgreSQL libpq,
-mongo-c-driver, mongo-cxx-driver) — no network access, vcpkg, or other package
-manager is required on the build machine.
-Rebuilding the manpage uses md2man (`gem install md2man`).
+Requires sqlite3 and zlib (should already be installed on MacOS). Rebuilding the manpage
+uses md2man (`gem install md2man`).
 
-Install build tools (Linux):
+Linux:
 
-    sudo apt-get install gcc g++ make git cmake
+    sudo apt-get install gcc g++ make libsqlite3-dev zlib1g-dev
 
-### Build the vendored libraries (tippecanoe-db dependencies)
+Then build:
 
-Run once per machine, from the repository root. Sources are already in the tree;
-this compiles them into `third_party/_install/` (fully offline, static):
+    make
 
-```sh
-./third_party/build_all.sh          # JOBS=8 ./third_party/build_all.sh to control parallelism
-```
+and perhaps
 
-Then build everything:
-
-```sh
-make all-db                         # core binaries + tippecanoe-db
-make test                           # full test suite (incl. checkpoint-test)
-```
-
-The Makefile automatically uses the vendored libraries when
-`third_party/_install/pg/lib/libpq.a` exists, and falls back to vcpkg otherwise
-(legacy workflow below).
-
-### Legacy: vcpkg-based build (fallback)
-
-Install vcpkg and required libraries:
-
-```sh
-git clone https://github.com/microsoft/vcpkg.git "$HOME/vcpkg"
-"$HOME/vcpkg/bootstrap-vcpkg.sh"
-"$HOME/vcpkg/vcpkg" install sqlite3 zlib libpq mongo-cxx-driver
-```
-
-Then build from this repository:
-
-```sh
-make VCPKG_ROOT="$HOME/vcpkg"
-```
-
-To install binaries:
-
-```sh
-make VCPKG_ROOT="$HOME/vcpkg" install
-```
-
-If you need a non-default triplet, pass `VCPKG_TRIPLET`, for example:
-
-```sh
-make VCPKG_ROOT="$HOME/vcpkg" VCPKG_TRIPLET=x64-linux
-```
-
-On Linux, `x64-linux-dynamic` can be simpler for runtime linkage of `tippecanoe-db`
-dependencies (`libpq`, `mongocxx`, `bsoncxx`, OpenSSL):
-
-```sh
-make VCPKG_ROOT="$HOME/vcpkg" VCPKG_TRIPLET=x64-linux-dynamic -j tippecanoe-db
-```
-
-Run `tippecanoe-db` with the matching vcpkg runtime library path:
-
-```sh
-LD_LIBRARY_PATH="$HOME/vcpkg/installed/x64-linux-dynamic/lib:$HOME/vcpkg/installed/x64-linux-dynamic/debug/lib:${LD_LIBRARY_PATH}" \
-./tippecanoe-db [options]
-```
-
-Example (PostGIS input + MongoDB output):
-
-```sh
-LD_LIBRARY_PATH="$HOME/vcpkg/installed/x64-linux-dynamic/lib:$HOME/vcpkg/installed/x64-linux-dynamic/debug/lib:${LD_LIBRARY_PATH}" \
-./tippecanoe-db \
-  --postgis "TippTest:postgres:pg:localhost:5432" \
-  --postgis-table china \
-  --postgis-geometry-field geom \
-  --mongo "test:china:admin:admin:localhost:27017:admin" \
-  -o china.mbtiles \
-  -z12 -Z5
-```
-
-The build now resolves third-party headers and libraries from vcpkg instead of
-system paths such as `/usr/include/postgresql` or `/usr/local/include`.
+    make install
 
 Tippecanoe now requires features from the 2011 C++ standard. If your compiler is older than
 that, you will need to install a newer one. On MacOS, updating to the latest XCode should
@@ -1048,7 +910,7 @@ resolutions.
 
 ### Options
 
- * `-s` _projection_ or `--projection=`*projection*: Specify the projection of the tileset grid. Currently supported are EPSG:4326 (WGS84, the default), EPSG:4490 (CGCS2000), and EPSG:3857 (Web Mercator). EPSG:4490 tilesets (equirectangular grid) are also detected automatically from the `crs` metadata row.
+ * `-s` _projection_ or `--projection=`*projection*: Specify the projection of the output data. Currently supported are EPSG:4326 (WGS84, the default) and EPSG:3857 (Web Mercator).
  * `-z` _maxzoom_ or `--maximum-zoom=`*maxzoom*: Specify the highest zoom level to decode from the tileset
  * `-Z` _minzoom_ or `--minimum-zoom=`*minzoom*: Specify the lowest zoom level to decode from the tileset
  * `-l` _layer_ or `--layer=`*layer*: Decode only layers with the specified names. (Multiple `-l` options can be specified.)
