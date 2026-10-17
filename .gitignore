@@ -57,3 +57,6 @@ node_modules
 test-data/
 /bin
 
+
+# compiler artifacts
+a.out
