@@ -1,0 +1,16 @@
+# vendor 三方库构建产物不入库（源码入库，构建现场生成）
+# build_all.sh 的树外构建目录与安装目录：
+build/
+_install/
+# PostgreSQL configure 生成物（in-tree 构建体系）：
+postgresql-18.0/config.log
+postgresql-18.0/config.status
+postgresql-18.0/config.cache
+postgresql-18.0/GNUmakefile
+postgresql-18.0/Makefile
+postgresql-18.0/src/Makefile.global
+postgresql-18.0/src/Makefile.port
+postgresql-18.0/src/include/pg_config.h
+postgresql-18.0/src/include/pg_config_ext.h
+postgresql-18.0/src/include/pg_config_os.h
+postgresql-18.0/src/include/stamp*

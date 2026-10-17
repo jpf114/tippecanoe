@@ -62,7 +62,34 @@ PG=
 H = $(wildcard *.h) $(wildcard *.hpp)
 C = $(wildcard *.c) $(wildcard *.cpp)
 
-# v3.4 合流: vcpkg 供 tippecanoe-db/unit 的 PostgreSQL/MongoDB 依赖；tippecanoe 仍为系统库
+# ===== 三方库依赖来源（v3.5 vendor 化）=====
+# tippecanoe-db/unit 的 PostgreSQL/MongoDB 依赖默认来自 third_party/ 内置源码
+# （先跑 third_party/build_all.sh 现场编译，产物在 third_party/_install/），
+# 目标环境无需网络、无需 vcpkg。third_party/_install 不存在时回退 vcpkg（过渡兼容）。
+# tippecanoe 本体不受影响，始终使用系统库。
+VENDOR_DIR ?= third_party/_install
+
+ifneq ($(wildcard $(VENDOR_DIR)/pg/lib/libpq.a),)
+
+# --- vendor 模式（third_party/_install 由 build_all.sh 生成）---
+# include 布局/宏以各库 pkgconfig 的 Cflags 为准（mongocxx v_noabi + 顶层基点；
+# c-driver 1.29 为 libmongoc-1.0/libbson-1.0 布局）；静态库需
+# BSONCXX/MONGOCXX/BSON/MONGOC_STATIC 四宏。
+MONGO_CXX_INCLUDE = -DBSONCXX_STATIC -DMONGOCXX_STATIC -DBSON_STATIC -DMONGOC_STATIC -I$(VENDOR_DIR)/mongocxx/include/bsoncxx/v_noabi -I$(VENDOR_DIR)/mongocxx/include/mongocxx/v_noabi -I$(VENDOR_DIR)/mongocxx/include -I$(VENDOR_DIR)/mongoc/include/libmongoc-1.0 -I$(VENDOR_DIR)/mongoc/include/libbson-1.0
+PGIS_INCLUDE = -I$(VENDOR_DIR)/pg/include -Ithird_party/postgresql-18.0/src/interfaces/libpq
+PGIS_LIB = -L$(VENDOR_DIR)/pg/lib
+# PG18 静态链接 libpq: 公开编码符号在 libpgcommon_shlib.a（libpgcommon.a 只导出 _private 版本）
+UNIT_PG_LIBS ?= -l:libpgcommon_shlib.a -l:libpgport.a
+DB_PQ_LIB = -l:libpq.a
+UNIT_SSL_LIBS =
+COMMON_LIBS = -lm -lz -lsqlite3 -lpthread
+DB_EXTRA_LIBS = $(PGIS_LIB) -L$(VENDOR_DIR)/mongoc/lib -L$(VENDOR_DIR)/mongocxx/lib -l:libmongocxx-static.a -l:libbsoncxx-static.a -l:libmongoc-static-1.0.a -l:libbson-static-1.0.a $(DB_PQ_LIB) $(UNIT_PG_LIBS) -lresolv -lrt -lz
+INCLUDES = -I. -Iclipper2/include
+LIBS = -L/usr/local/lib
+
+else
+
+# --- vcpkg 模式（vendor 未构建时的过渡回退）---
 VCPKG_ROOT ?= $(HOME)/vcpkg
 VCPKG_TRIPLET ?= x64-linux
 VCPKG_INSTALLED := $(VCPKG_ROOT)/installed/$(VCPKG_TRIPLET)
@@ -74,10 +101,14 @@ PGIS_LIB = $(VCPKG_LIB)
 # unit 链接的 PostGIS 静态辅助库；本机 vcpkg libpq 无 libpgcommon/libpgport 时
 # 可命令行覆盖：make unit UNIT_PG_LIBS=
 UNIT_PG_LIBS ?= -lpgcommon -lpgport
+DB_PQ_LIB = -lpq
+UNIT_SSL_LIBS = -lssl -lcrypto
 COMMON_LIBS = -lm -lz -lsqlite3 -lpthread
 DB_EXTRA_LIBS = -lpq -lpgcommon -lpgport $(VCPKG_INSTALLED)/lib/libmongocxx-static.a $(VCPKG_INSTALLED)/lib/libbsoncxx-static.a $(VCPKG_INSTALLED)/lib/libmongoc2.a $(VCPKG_INSTALLED)/lib/libbson2.a $(VCPKG_INSTALLED)/lib/libutf8proc.a -lssl -lcrypto -lresolv -lz
 INCLUDES = $(VCPKG_INCLUDE) -I. -Iclipper2/include
 LIBS = -L/usr/local/lib $(VCPKG_LIB)
+
+endif
 
 tippecanoe: geojson.o jsonpull/jsonpull.o tile.o pool.o mbtiles.o geometry.o projection.o memfile.o mvt.o serial.o main.o platform.o text.o dirtiles.o pmtiles_file.o plugin.o read_json.o write_json.o geobuf.o flatgeobuf.o evaluator.o geocsv.o csv.o geojson-loop.o json_logger.o visvalingam.o compression.o clip.o sort.o attribute.o thread.o shared_borders.o checkpoint.o clipper2/src/clipper.engine.o
 	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lm -lz -lsqlite3 -lpthread
@@ -99,7 +130,7 @@ tippecanoe-json-tool: jsontool.o jsonpull/jsonpull.o csv.o text.o geojson-loop.o
 	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lm -lz -lsqlite3 -lpthread
 
 unit: unit.o text.o sort.o mvt.o projection.o clip.o attribute.o jsonpull/jsonpull.o evaluator.o read_json.o postgis.o wkb_parser.o error_logger.o serial.o geometry.o visvalingam.o clipper2/src/clipper.engine.o
-	$(CXX) $(PG) $(LIBS) $(PGIS_LIB) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(COMMON_LIBS) -lpq $(UNIT_PG_LIBS) -lssl -lcrypto -lresolv -lsqlite3
+	$(CXX) $(PG) $(LIBS) $(PGIS_LIB) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(COMMON_LIBS) $(DB_PQ_LIB) $(UNIT_PG_LIBS) $(UNIT_SSL_LIBS) -lresolv -lsqlite3
 
 tippecanoe-overzoom: overzoom.o mvt.o clip.o evaluator.o jsonpull/jsonpull.o text.o attribute.o read_json.o projection.o read_json.o clipper2/src/clipper.engine.o
 	$(CXX) $(PG) $(LIBS) $(FINAL_FLAGS) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) -lm -lz -lsqlite3 -lpthread

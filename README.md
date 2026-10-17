@@ -769,12 +769,37 @@ The maintained database workflow guide is [docs/user_guide.md](docs/user_guide.m
 Development
 -----------
 
-Tippecanoe now builds against dependencies provided by vcpkg.
+Tippecanoe uses system libraries for the core binaries. `tippecanoe-db` and `unit`
+build against vendored third-party sources in `third_party/` (PostgreSQL libpq,
+mongo-c-driver, mongo-cxx-driver) — no network access, vcpkg, or other package
+manager is required on the build machine.
 Rebuilding the manpage uses md2man (`gem install md2man`).
 
 Install build tools (Linux):
 
-    sudo apt-get install gcc g++ make git curl zip unzip tar pkg-config
+    sudo apt-get install gcc g++ make git cmake
+
+### Build the vendored libraries (tippecanoe-db dependencies)
+
+Run once per machine, from the repository root. Sources are already in the tree;
+this compiles them into `third_party/_install/` (fully offline, static):
+
+```sh
+./third_party/build_all.sh          # JOBS=8 ./third_party/build_all.sh to control parallelism
+```
+
+Then build everything:
+
+```sh
+make all-db                         # core binaries + tippecanoe-db
+make test                           # full test suite (incl. checkpoint-test)
+```
+
+The Makefile automatically uses the vendored libraries when
+`third_party/_install/pg/lib/libpq.a` exists, and falls back to vcpkg otherwise
+(legacy workflow below).
+
+### Legacy: vcpkg-based build (fallback)
 
 Install vcpkg and required libraries:
 
